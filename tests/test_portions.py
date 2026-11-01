@@ -71,6 +71,13 @@ class EffectiveTest(PortionsCase):
         self.assertIsNone(result["portions"])
         self.assertIsNone(result["recipeServings"])
 
+    def test_text_only_entry_has_no_portions(self):
+        self.set_default(2)
+        entry = {"id": 9, "date": "2026-11-04", "recipeId": None, "recipeScale": 1.0, "recipe": None,
+                 "title": "Restjes: chili (van maandag)"}
+        self.assertEqual(portions.effective(entry, None),
+                         {"portions": None, "scale": 1.0, "source": "unknown", "recipeServings": None})
+
     def test_entry_without_recipe_scale_is_unsupported(self):
         self.set_default(2)
         result = portions.effective(plan_entry(scale=None), {"recipeServings": 4})

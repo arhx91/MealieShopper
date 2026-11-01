@@ -182,6 +182,47 @@ class RouteTest(unittest.TestCase):
         self.assertEqual([item["portions"]["source"] for item in week], ["default", "set", "unknown"])
         self.assertEqual(week[0]["portions"]["scale"], 0.5)
 
+    def test_text_only_entry_goes_through_the_week_and_the_basket(self):
+        # De weekplanner schrijft maaltijden zonder recept ("Restjes: ..."); Mealie geeft dan "recipe": null.
+        plan = [
+            {"id": 1, "date": "2026-11-03", "recipeId": "r1", "recipeScale": 1.0, "recipe": {"id": "r1", "slug": "chili"}},
+            {"id": 2, "date": "2026-11-04", "recipeId": None, "recipeScale": 1.0, "recipe": None,
+             "title": "Restjes: chili (van maandag)"},
+        ]
+        recipe = {"id": "r1", "slug": "chili", "recipeServings": 4,
+                  "recipeIngredient": [line("ui", "stuks", 4, "4 stuks ui")]}
+        auth.set_setting(portions.SETTING_DEFAULT, "2")
+        with mock.patch.object(mealie, "get_meal_plan", return_value=plan), \
+                mock.patch.object(mealie, "get_recipe", return_value=recipe) as get_recipe, \
+                mock.patch.object(mealie, "_image_path", return_value=None):
+            week = mealie.get_meal_plan_with_recipes("2026-11-03", "2026-11-09")
+        get_recipe.assert_called_once_with("chili")
+        leftovers = week[1]
+        self.assertIsNone(leftovers["recipeDetail"])
+        self.assertEqual(leftovers["title"], "Restjes: chili (van maandag)")
+        self.assertEqual(leftovers["portions"], {"portions": None, "scale": 1.0, "source": "unknown", "recipeServings": None})
+
+        expected = [{"query": "ui", "display": "2 stuks ui", "quantity": 2.0, "unit": "stuks"}]
+        with mock.patch.object(ingredients, "current_lang", return_value="nl"):
+            self.assertEqual(week_ingredients.basket_lines(week, scale_of=lambda e: e["portions"]["scale"]), expected)
+        posted = self.client.post("/api/mealplan/ingredients", json={"entries": week})
+        self.assertEqual(posted.status_code, 200, posted.get_json())
+        self.assertEqual(posted.get_json()["items"], expected)
+
+    def test_route_buys_junk_portions_unscaled(self):
+        junk = ["x", 5, [0.5], {"scale": -1}, {"scale": 0}, {"scale": "2"}, {"scale": True}, {"scale": None}, {}]
+        entries = [{**entry(line("ui", "stuks", 4, "4 stuks ui")), "portions": value} for value in junk]
+        response = self.client.post("/api/mealplan/ingredients", json={"entries": entries})
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertEqual(response.get_json()["items"][0]["quantity"], 4 * len(junk))
+        # NaN en oneindig kunnen niet als gewone JSON mee; die zet Flask's parser om naar float.
+        for text in ("NaN", "Infinity", "-Infinity"):
+            body = '{"entries": [{"recipeDetail": {"recipeIngredient": [{"food": {"name": "ui"}, "quantity": 4}]}, ' \
+                   '"portions": {"scale": %s}}]}' % text
+            response = self.client.post("/api/mealplan/ingredients", data=body, content_type="application/json")
+            self.assertEqual(response.status_code, 200, text)
+            self.assertEqual(response.get_json()["items"][0]["quantity"], 4, text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -512,14 +512,13 @@ def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str,
     # Late import: portions gebruikt zelf dit module om porties naar Mealie te schrijven.
     from . import portions
 
+    def recipe_of(entry: dict[str, Any]) -> dict[str, Any]:
+        # Een maaltijd zonder recept ("Restjes: ...", alleen tekst) heeft in Mealie "recipe": null.
+        recipe = entry.get("recipe")
+        return recipe if isinstance(recipe, dict) else {}
+
     entries = get_meal_plan(start_date, end_date)
-    slugs = sorted(
-        {
-            entry.get("recipe", {}).get("slug")
-            for entry in entries
-            if entry.get("recipe", {}).get("slug")
-        }
-    )
+    slugs = sorted({recipe_of(entry).get("slug") for entry in entries if recipe_of(entry).get("slug")})
 
     recipe_map: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -532,7 +531,7 @@ def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str,
 
     result = []
     for entry in entries:
-        recipe = entry.get("recipe") or {}
+        recipe = recipe_of(entry)
         enriched = dict(entry)
         detail = recipe_map.get(recipe.get("slug"))
         enriched["recipeDetail"] = detail
