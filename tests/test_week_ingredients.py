@@ -67,6 +67,26 @@ class BasketLinesTest(unittest.TestCase):
         self.assertEqual(lines[0]["quantity"], 1)
         self.assertEqual(lines[0]["display"], "Een snufje peper")
 
+    def test_line_without_food_never_merges_with_a_food_of_the_same_name(self):
+        # Een tekstregel "zout" (Mealie's standaard 1) en het ingrediënt zout (2, zonder eenheid) zijn verschillende
+        # regels; samen gaven ze 3 of 2, afhankelijk van de volgorde, en een tekst die niet bij het aantal paste.
+        text, food = line(quantity=1, display="zout"), line("zout", quantity=2, display="2 zout")
+        for order in ((text, food), (food, text)):
+            lines = week_ingredients.basket_lines([entry(*order)])
+            self.assertEqual(
+                sorted((l["query"], l["display"], l["quantity"]) for l in lines),
+                [("zout", "2 zout", 2), ("zout", "zout", 1)],
+                order,
+            )
+
+    def test_first_line_without_quantity_takes_the_later_quantity(self):
+        # De eerste regel heeft geen aantal, een latere wel: de som is het bekende aantal en de tekst volgt die som.
+        lines = week_ingredients.basket_lines([
+            entry(line("ui", "stuks", display="ui")),
+            entry(line("ui", "stuks", 2, "2 stuks ui")),
+        ])
+        self.assertEqual(lines, [{"query": "ui", "display": "2 stuks ui", "quantity": 2, "unit": "stuks"}])
+
     def test_entries_without_recipe_are_skipped(self):
         self.assertEqual(week_ingredients.basket_lines([{"title": "Uit eten"}]), [])
 

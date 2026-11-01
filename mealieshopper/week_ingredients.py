@@ -3,7 +3,8 @@
 Twee regels met hetzelfde ingrediënt en dezelfde eenheid worden één regel met de som van de aantallen
 ("2 stuks ui" en "1 stuks ui" wordt "3 stuks ui"). Een andere eenheid blijft een eigen regel. Een regel
 zonder ingrediënt (die Mealie niet analyseerde) heeft als aantal alleen Mealie's standaard; die tellen we
-niet op maar houden we één keer, met de tekst als sleutel.
+niet op maar houden we één keer, met de tekst als sleutel. Die sleutels staan los van die van de ingrediënten:
+een tekstregel "zout" valt nooit samen met het ingrediënt zout.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ def basket_lines(
     `scale_of(entry)` geeft de factor voor de aantallen van een maaltijd; alleen regels met een ingrediënt
     worden geschaald. De volgorde is die van de eerste keer dat een regel voorkomt.
     """
-    lines: dict[tuple[str, str], dict[str, Any]] = {}
+    lines: dict[tuple[str, ...], dict[str, Any]] = {}
     for entry in entries or []:
         recipe = entry.get("recipeDetail") if isinstance(entry, dict) else None
         if not isinstance(recipe, dict):
@@ -46,7 +47,8 @@ def basket_lines(
             display = str(ingredient.get("display") or "").strip()
             if not food and not display:
                 continue
-            key = (food.lower(), unit.lower()) if food else (display.lower(), "")
+            # Eigen sleutelruimtes: een tekstregel en een ingrediënt met dezelfde naam blijven twee regels.
+            key = ("food", food.lower(), unit.lower()) if food else ("text", display.lower())
             quantity = _number(ingredient.get("quantity"))
             if food and quantity is not None:
                 if scale is None:
