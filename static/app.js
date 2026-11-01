@@ -527,6 +527,115 @@ function renderIngredientsPanel(items) {
   renderStoreChoice();
 }
 
+// Porties per maaltijd (zie portions.py): "[−] 4 porties [+]" onder het aantal ingrediënten, met daaronder
+// "recept: <opbrengst> · <herkomst>". Een maaltijd zonder recept krijgt niets; een Mealie zonder recipeScale ook niet.
+const MIN_PORTIONS = 1;
+const MAX_PORTIONS = 12;
+const PORTIONS_SOURCE_LABELS = { set: "plan.portions_set", default: "plan.portions_default", recipe: "plan.portions_recipe" };
+let mealPortionsBusy = false; // één wijziging tegelijk; klikken in de tussentijd tellen niet
+
+function clampPortions(value) {
+  return Math.min(MAX_PORTIONS, Math.max(MIN_PORTIONS, value));
+}
+
+function mealPortionsHtml(entry) {
+  const portions = entry.portions;
+  const hasRecipe = Boolean(entry.recipe && (entry.recipeId || entry.recipe.id));
+  if (!hasRecipe || !portions || portions.source === "unsupported") return "";
+  const id = escapeHtml(String(entry.id ?? ""));
+  const button = (attribute, label, sign, target, disabled) =>
+    `<button class="meal-portions__button" type="button" ${attribute}="${id}" data-portions-target="${target}" aria-label="${escapeHtml(label)}"${disabled ? " disabled" : ""}>${sign}</button>`;
+  if (portions.source === "unknown") {
+    // Het recept zegt niet voor hoeveel personen het is: niet te schalen, dus de knoppen staan uit.
+    return `
+      <div class="meal-portions">
+        ${button("data-portions-minus", t("plan.portions_less"), "\u2212", MIN_PORTIONS, true)}
+        <span class="meal-portions__value meal-portions__value--unknown">${escapeHtml(t("plan.portions_unknown"))}</span>
+        ${button("data-portions-plus", t("plan.portions_more"), "+", MIN_PORTIONS, true)}
+      </div>`;
+  }
+  // Het getal kan buiten 1-12 liggen als iemand in Mealie zelf een factor zette; we tonen het zoals het is.
+  const count = Number(portions.portions) || 0;
+  const label = PORTIONS_SOURCE_LABELS[portions.source];
+  const recipeLine = [
+    portions.recipeServings ? t("plan.portions_yield", { count: I18N.formatNumber(portions.recipeServings) }) : "",
+    label ? t(label) : "",
+  ].filter(Boolean).join(" \u00b7 ");
+  return `
+    <div class="meal-portions">
+      ${button("data-portions-minus", t("plan.portions_less"), "\u2212", clampPortions(count - 1), count <= MIN_PORTIONS)}
+      <span class="meal-portions__value${portions.source === "default" ? " meal-portions__value--default" : ""}">${escapeHtml(tn("plan.portions", count))}</span>
+      ${button("data-portions-plus", t("plan.portions_more"), "+", clampPortions(count + 1), count >= MAX_PORTIONS)}
+    </div>
+    <small class="meal-portions__source">${escapeHtml(recipeLine)}${
+      portions.source === "set"
+        ? ` <button class="link-button meal-portions__reset" type="button" data-portions-reset="${id}">${escapeHtml(t("plan.portions_reset"))}</button>`
+        : ""
+    }</small>`;
+}
+
+// Na een wijziging klopt de bewaarde week niet meer (MEAL_PLAN_TTL_MS is een half uur): die gaat weg, en de week
+// komt opnieuw uit Mealie, zodat de kaart en de boodschappenlijst meteen de nieuwe aantallen tonen.
+// Een week die de gebruiker intussen verliet, of die hij zelf opnieuw laadt, tekenen we niet: dat doet loadMealPlan.
+async function reloadWeekAfterPortions(week) {
+  const request = mealPlanRequest;
+  const entries = await fetchMealPlan(week);
+  if (request !== mealPlanRequest || week.start !== getWeekBounds(state.weekOffset).start) return;
+  state.entries = entries;
+  renderMealPlan(entries);
+}
+
+async function changeMealPortions(week, write) {
+  if (mealPortionsBusy) return;
+  mealPortionsBusy = true;
+  message("#planner-message", "");
+  // De knoppen staan uit tot de week terug is; daarna tekent renderMealPlan ze opnieuw.
+  document.querySelectorAll("#meal-days .meal-portions button, #meal-days [data-portions-reset]").forEach((button) => {
+    button.disabled = true;
+  });
+  try {
+    await write();
+  } catch (error) {
+    // Mislukt (ook een fout van Mealie): de kaart houdt het oude aantal en we tonen de melding van de server.
+    if (state.entries && week.start === getWeekBounds(state.weekOffset).start) renderMealPlan(state.entries);
+    message("#planner-message", error.message);
+  } finally {
+    mealPortionsBusy = false;
+  }
+}
+
+async function setMealPortions(entryId, portions) {
+  const week = getWeekBounds(state.weekOffset);
+  await changeMealPortions(week, async () => {
+    await jsonFetch(`/api/mealplan/${encodeURIComponent(entryId)}/portions`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ portions }),
+    });
+    mealPlanCache.delete(week.start);
+    await reloadWeekAfterPortions(week);
+  });
+}
+
+async function resetMealPortions(entryId) {
+  const week = getWeekBounds(state.weekOffset);
+  await changeMealPortions(week, async () => {
+    await jsonFetch(`/api/mealplan/${encodeURIComponent(entryId)}/portions`, { method: "DELETE" });
+    mealPlanCache.delete(week.start);
+    await reloadWeekAfterPortions(week);
+  });
+}
+
+$("#meal-days").addEventListener("click", (event) => {
+  const step = event.target.closest("[data-portions-minus], [data-portions-plus]");
+  if (step && !step.disabled) {
+    setMealPortions(step.dataset.portionsMinus ?? step.dataset.portionsPlus, Number(step.dataset.portionsTarget));
+    return;
+  }
+  const reset = event.target.closest("[data-portions-reset]");
+  if (reset && !reset.disabled) resetMealPortions(reset.dataset.portionsReset);
+});
+
 function renderMealPlan(entries) {
   const byDay = {};
   for (const entry of entries) {
@@ -558,6 +667,7 @@ function renderMealPlan(entries) {
                         ? `<small>${escapeHtml(tn("plan.ingredients_count", entry.recipeDetail.recipeIngredient.length))}</small>`
                         : ""
                     }
+                    ${mealPortionsHtml(entry)}
                   </div>
                 </div>
               `

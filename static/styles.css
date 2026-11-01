@@ -1793,6 +1793,61 @@ select.input {
   padding-left: 42px;
 }
 
+/* Weekmenu: porties per maaltijd, "[−] 4 porties [+]" onder het aantal ingrediënten */
+.meal-portions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.meal-portions__button {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.meal-portions__button:hover:not(:disabled) {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.meal-portions__button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.meal .meal-portions__value {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: none;
+}
+
+.meal .meal-portions__value--default,
+.meal .meal-portions__value--unknown {
+  color: var(--muted);
+}
+
+.meal .meal-portions__value--unknown {
+  font-weight: 400;
+}
+
+.meal-portions__source .meal-portions__reset {
+  min-height: 0;
+  padding: 0 0 0 4px;
+  font-size: 13px;
+}
+
 /* Weekmenu: het plaatje uit Mealie links van de maaltijd */
 .meal--with-image {
   display: flex;

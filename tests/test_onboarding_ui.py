@@ -65,6 +65,50 @@ class MarkupTest(unittest.TestCase):
             self.assertTrue(key in NL, f"{key} ontbreekt in nl.js")
             self.assertTrue(key in en, f"{key} ontbreekt in en.js")
 
+    @staticmethod
+    def function_body(name):
+        match = re.search(rf"^(?:async\s+)?function\s+{name}\s*\(.*?^\}}", APP_JS, re.M | re.S)
+        return match.group(0) if match else ""
+
+    def test_meal_cards_have_a_portions_stepper(self):
+        render = self.function_body("renderMealPlan")
+        self.assertIn("mealPortionsHtml", render, "renderMealPlan tekent de knoppen voor de porties")
+        stepper = self.function_body("mealPortionsHtml")
+        for needle in ("data-portions-minus", "data-portions-plus", "aria-label", "data-portions-reset"):
+            self.assertIn(needle, stepper, needle)
+        for needle in ("data-portions-minus", "data-portions-plus", "aria-label"):
+            self.assertIn(needle, APP_JS, needle)
+        # Alleen bij "set" een link terug naar de standaard; bij "unsupported" niets; zonder recept niets.
+        self.assertIn('"unsupported"', stepper)
+        self.assertIn('"unknown"', stepper)
+        self.assertIn("meal-portions", CSS)
+
+    def test_portion_changes_drop_the_week_cache(self):
+        # Review Focus 5: na een wijziging tonen kaart en lijst meteen de nieuwe aantallen, niet de bewaarde week.
+        for name in ("setMealPortions", "resetMealPortions"):
+            body = self.function_body(name)
+            self.assertTrue(body, f"{name} ontbreekt")
+            self.assertIn("mealPlanCache.delete", body, name)
+            self.assertIn("/portions", body, name)
+        self.assertIn('method: "PUT"', self.function_body("setMealPortions"))
+        self.assertIn('method: "DELETE"', self.function_body("resetMealPortions"))
+
+    def test_portion_labels_exist_in_both_languages(self):
+        en = dictionary("en")
+        for key in ("plan.portions", "plan.portions_set", "plan.portions_default", "plan.portions_recipe",
+                    "plan.portions_unknown", "plan.portions_reset"):
+            # "plan.portions" is een meervoudsvorm (tn): "1 portie", "4 porties".
+            self.assertTrue(key in NL or f"{key}.one" in NL, f"{key} ontbreekt in nl.js")
+            self.assertTrue(key in en or f"{key}.one" in en, f"{key} ontbreekt in en.js")
+        self.assertEqual(NL["plan.portions_set"], "ingesteld")
+        self.assertEqual(NL["plan.portions_default"], "standaard")
+        self.assertEqual(NL["plan.portions_recipe"], "recept")
+        self.assertEqual(NL["plan.portions_unknown"], "recept zonder porties")
+        self.assertEqual(en["plan.portions_set"], "set")
+        self.assertEqual(en["plan.portions_default"], "default")
+        self.assertEqual(en["plan.portions_recipe"], "recipe")
+        self.assertEqual(en["plan.portions_unknown"], "recipe without servings")
+
     def test_scripts_load_in_order(self):
         self.assertLess(HTML.index("app.js"), HTML.index("onboarding.js"))
 
