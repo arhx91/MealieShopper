@@ -5,7 +5,7 @@ import json
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from flask import Flask, Response, jsonify, make_response, redirect, render_template, request
+from flask import Flask, Response, g, jsonify, make_response, redirect, render_template, request
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 from . import audit, auth, mcp, oauth, server_settings
@@ -226,6 +226,7 @@ def register_routes(app: Flask, base_url: Callable[[], str]) -> None:
         if not identity:
             audit.mcp_rejected(401, "unauthorized", header_present=bool(token))
             return unauthorized(bool(token))
+        g.mcp_identity = identity  # voor tools die bijhouden wie iets wijzigde (set_meal_portions)
         version = request.headers.get("Mcp-Protocol-Version")
         if version and version not in mcp.SUPPORTED_PROTOCOLS:
             audit.mcp_rejected(400, f"unsupported protocol {version}")

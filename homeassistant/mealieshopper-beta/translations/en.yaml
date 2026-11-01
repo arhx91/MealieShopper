@@ -29,6 +29,9 @@ configuration:
   offers_sync_hour:
     name: Hour of the daily offers run
     description: The hour of the day (0 to 23) at which the offers are fetched. Default 5.
+  default_portions:
+    name: Default portions
+    description: How many people (1 to 12) a meal counts for in the week menu and the basket when nobody set its portions. Optional; empty means off (then the recipe applies). The value in the app (Settings > System) takes precedence.
   mcp:
     name: MCP server for AI assistants
     description: Start value of the MCP server (on by default, when login is on). The switch in the app (Profile > AI apps) takes precedence.

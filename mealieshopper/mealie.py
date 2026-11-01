@@ -446,6 +446,40 @@ def get_meal_plan(start_date: str, end_date: str) -> list[dict[str, Any]]:
     return response.json().get("items", [])
 
 
+def get_plan_entry(entry_id: str) -> dict[str, Any]:
+    """Eén maaltijd uit het weekmenu, zoals Mealie die bewaart (met recipeScale en de samenvatting van het recept)."""
+    ensure_configured()
+    try:
+        response = requests.get(
+            f"{mealie_url()}/api/households/mealplans/{entry_id}", headers=auth_headers(), timeout=30
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Maaltijd ophalen mislukt ({exc.__class__.__name__})") from exc
+    if not response.ok:
+        raise RuntimeError(f"Maaltijd ophalen mislukt ({response.status_code}): {response.text}")
+    return response.json()
+
+
+def set_plan_entry_scale(entry_id: str, scale: float) -> dict[str, Any]:
+    """Zet de factor (recipeScale) van één maaltijd in Mealie en geef de maaltijd terug zoals Mealie die nu bewaart.
+
+    Mealie wil bij het bijwerken de hele maaltijd (UpdatePlanEntry: onder meer date, id, groupId en userId); daarom halen
+    we haar eerst op en sturen we haar terug met alleen een andere recipeScale. Een fout of time-out wordt een
+    RuntimeError, zodat de aanroeper niets onthoudt van een wijziging die niet gelukt is.
+    """
+    entry = get_plan_entry(entry_id)
+    body = {**entry, "recipeScale": scale}
+    try:
+        response = requests.put(
+            f"{mealie_url()}/api/households/mealplans/{entry_id}", headers=auth_headers(), json=body, timeout=30
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Porties opslaan in Mealie mislukt ({exc.__class__.__name__})") from exc
+    if not response.ok:
+        raise RuntimeError(f"Porties opslaan in Mealie mislukt ({response.status_code}): {response.text}")
+    return response.json()
+
+
 def _fetch_recipe(slug: str) -> dict[str, Any]:
     response = requests.get(
         f"{mealie_url()}/api/recipes/{slug}",
@@ -470,14 +504,21 @@ def _image_path(recipe: dict[str, Any] | None) -> str | None:
 
 
 def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """Het weekmenu met per maaltijd het hele recept (`recipeDetail`), een afbeelding en de porties die gelden.
+
+    Maaltijden met hetzelfde recept delen één `recipeDetail`; de porties (`portions`, zie portions.effective) staan per
+    maaltijd, zodat het mandje elke maaltijd met haar eigen factor rekent zonder het gedeelde recept te wijzigen.
+    """
+    # Late import: portions gebruikt zelf dit module om porties naar Mealie te schrijven.
+    from . import portions
+
+    def recipe_of(entry: dict[str, Any]) -> dict[str, Any]:
+        # Een maaltijd zonder recept ("Restjes: ...", alleen tekst) heeft in Mealie "recipe": null.
+        recipe = entry.get("recipe")
+        return recipe if isinstance(recipe, dict) else {}
+
     entries = get_meal_plan(start_date, end_date)
-    slugs = sorted(
-        {
-            entry.get("recipe", {}).get("slug")
-            for entry in entries
-            if entry.get("recipe", {}).get("slug")
-        }
-    )
+    slugs = sorted({recipe_of(entry).get("slug") for entry in entries if recipe_of(entry).get("slug")})
 
     recipe_map: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -490,11 +531,12 @@ def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str,
 
     result = []
     for entry in entries:
-        recipe = entry.get("recipe") or {}
+        recipe = recipe_of(entry)
         enriched = dict(entry)
         detail = recipe_map.get(recipe.get("slug"))
         enriched["recipeDetail"] = detail
         enriched["imageUrl"] = _image_path(detail) or _image_path(recipe)
+        enriched["portions"] = portions.effective(entry, detail)
         result.append(enriched)
     return result
 

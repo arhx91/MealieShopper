@@ -29,6 +29,9 @@ configuration:
   offers_sync_hour:
     name: Uur van de dagelijkse aanbiedingenrun
     description: Het uur van de dag (0 tot 23) waarop de aanbiedingen worden opgehaald. Standaard 5.
+  default_portions:
+    name: Standaard porties
+    description: Voor hoeveel personen (1 tot 12) een maaltijd in het weekmenu en het mandje telt als niemand haar porties instelde. Optioneel; leeg betekent uit (dan geldt het recept). De waarde in de app (Instellingen > Systeem) gaat voor.
   mcp:
     name: MCP-server voor AI-assistenten
     description: Beginwaarde van de MCP-server (standaard aan, als inloggen aanstaat). De schakelaar in de app (Profiel > AI-apps) gaat voor.

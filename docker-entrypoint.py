@@ -28,6 +28,7 @@ OPTION_ENV = {
     "picnic_country_code": "PICNIC_COUNTRY_CODE",
     "offers_schedule": "MEALIESHOPPER_OFFERS_SCHEDULE",
     "offers_sync_hour": "MEALIESHOPPER_OFFERS_SYNC_HOUR",
+    "default_portions": "MEALIESHOPPER_DEFAULT_PORTIONS",
     "mcp": "MEALIESHOPPER_MCP",
     "update_check": "MEALIESHOPPER_UPDATE_CHECK",
     "audit_log": "MEALIESHOPPER_AUDIT_LOG",

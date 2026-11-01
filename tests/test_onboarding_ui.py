@@ -38,6 +38,117 @@ class MarkupTest(unittest.TestCase):
         for needle in ('id="password-form"', 'id="pw-current"', 'autocomplete="new-password"', 'id="mfa-panel"', 'id="credentials-list"'):
             self.assertIn(needle, security, needle)
 
+    def test_week_ingredients_come_from_the_server(self):
+        # De server telt gedeelde ingrediënten op; de browser hield vroeger alleen het eerste aantal.
+        self.assertNotIn("function aggregateIngredients", APP_JS)
+        self.assertIn("/api/mealplan/ingredients", APP_JS)
+        # De browser stuurt de maaltijden mee waaruit de dagkaarten zijn getekend.
+        self.assertRegex(APP_JS, r'jsonFetch\("/api/mealplan/ingredients", \{\s*method: "POST"')
+
+    def test_system_tab_has_the_default_portions_field(self):
+        system = HTML[HTML.index('id="settings-system"'):HTML.index('id="backup-box"')]
+        field = re.search(r'<input[^>]*id="default-portions"[^>]*>', system)
+        self.assertIsNotNone(field, "het veld #default-portions staat niet bij Systeem")
+        for needle in ('type="number"', 'min="1"', 'max="12"'):
+            self.assertIn(needle, field.group(0), needle)
+        self.assertIn('id="default-portions-save"', system)
+        system_js = (ROOT / "static" / "system.js").read_text(encoding="utf-8")
+        self.assertRegex(system_js, r'jsonFetch\("/api/server-settings", \{\s*method: "PUT"')
+        self.assertIn("defaultPortions", system_js)
+        self.assertIn("loadDefaultPortions", APP_JS, "het tabblad Systeem laadt de instelling")
+
+    def test_default_portions_labels_exist_in_both_languages(self):
+        en = dictionary("en")
+        for key in ("system.portions_title", "system.portions_intro", "system.portions_label", "system.portions_save",
+                    "system.portions_saved", "system.portions_note_setting", "system.portions_note_env",
+                    "system.portions_note_off"):
+            self.assertTrue(key in NL, f"{key} ontbreekt in nl.js")
+            self.assertTrue(key in en, f"{key} ontbreekt in en.js")
+
+    @staticmethod
+    def function_body(name):
+        match = re.search(rf"^(?:async\s+)?function\s+{name}\s*\(.*?^\}}", APP_JS, re.M | re.S)
+        return match.group(0) if match else ""
+
+    def test_meal_cards_have_a_portions_stepper(self):
+        render = self.function_body("renderMealPlan")
+        self.assertIn("mealPortionsHtml", render, "renderMealPlan tekent de knoppen voor de porties")
+        stepper = self.function_body("mealPortionsHtml")
+        for needle in ("data-portions-minus", "data-portions-plus", "aria-label", "data-portions-reset"):
+            self.assertIn(needle, stepper, needle)
+        for needle in ("data-portions-minus", "data-portions-plus", "aria-label"):
+            self.assertIn(needle, APP_JS, needle)
+        # Alleen bij "set" een link terug naar de standaard; bij "unsupported" niets; zonder recept niets.
+        self.assertIn('"unsupported"', stepper)
+        self.assertIn('"unknown"', stepper)
+        self.assertIn("meal-portions", CSS)
+
+    def test_portion_changes_drop_the_week_cache(self):
+        # Review Focus 5: na een wijziging tonen kaart en lijst meteen de nieuwe aantallen, niet de bewaarde week.
+        for name in ("setMealPortions", "resetMealPortions"):
+            body = self.function_body(name)
+            self.assertTrue(body, f"{name} ontbreekt")
+            self.assertIn("mealPlanCache.delete", body, name)
+            self.assertIn("/portions", body, name)
+        self.assertIn('method: "PUT"', self.function_body("setMealPortions"))
+        self.assertIn('method: "DELETE"', self.function_body("resetMealPortions"))
+
+    def test_portion_changes_drop_the_basket_check_list(self):
+        # Na een gelukte wijziging klopt een open controlelijst van het mandje niet meer: die gaat weg, net als in
+        # loadMealPlan, en een voorbeeld dat nog liep van vóór de wijziging vult het mandje niet meer.
+        for name in ("setMealPortions", "resetMealPortions"):
+            body = self.function_body(name)
+            self.assertIn("dropCartReview()", body, name)
+            self.assertLess(body.index("jsonFetch"), body.index("dropCartReview()"), f"{name}: pas na een gelukte wijziging")
+            self.assertLess(body.index("dropCartReview()"), body.index("reloadWeekAfterPortions"), name)
+        # Een andere week tonen (bladeren, sync, nieuwe standaard) maakt een voorbeeld dat nog liep ook ongeldig.
+        load = self.function_body("loadMealPlan")
+        self.assertIn("dropCartReview()", load)
+        self.assertLess(load.index("dropCartReview()"), load.index("cachedMealPlan(week)"))
+        drop = self.function_body("dropCartReview")
+        self.assertIn("cartGeneration++", drop)
+        self.assertIn('$("#cart-result").innerHTML = ""', drop)
+        self.assertRegex(APP_JS, re.compile(r"^let cartGeneration = 0;", re.M))
+        add = self.function_body("addToCart")
+        self.assertIn("const generation = ++cartGeneration;", add)
+        # Na het wachten op de server: een oud voorbeeld (in het gelukte en het mislukte pad) tekent niets.
+        self.assertEqual(add.count("if (generation !== cartGeneration) return;"), 2, add)
+        self.assertLess(add.index("await jsonFetch"), add.index("if (generation !== cartGeneration) return;"))
+
+    def test_default_portions_rejects_text_instead_of_clearing(self):
+        # Tekst in een type=number-veld geeft value "" (badInput); dat mag de standaard niet stil uitzetten.
+        system_js = (ROOT / "static" / "system.js").read_text(encoding="utf-8")
+        save = re.search(r"^async function saveDefaultPortions\(.*?^\}", system_js, re.M | re.S).group(0)
+        self.assertIn("validity.badInput", save)
+        self.assertLess(save.index("validity.badInput"), save.index("jsonFetch"))
+        self.assertRegex(save, r'validity\.badInput[^;]*\)\s*\{\s*message\("#default-portions-message", t\("system\.portions_invalid"\)\);\s*return;')
+
+    def test_portion_labels_exist_in_both_languages(self):
+        en = dictionary("en")
+        for key in ("plan.portions", "plan.portions_set", "plan.portions_default", "plan.portions_recipe",
+                    "plan.portions_unknown", "plan.portions_reset"):
+            # "plan.portions" is een meervoudsvorm (tn): "1 portie", "4 porties".
+            self.assertTrue(key in NL or f"{key}.one" in NL, f"{key} ontbreekt in nl.js")
+            self.assertTrue(key in en or f"{key}.one" in en, f"{key} ontbreekt in en.js")
+        self.assertEqual(NL["plan.portions_set"], "ingesteld")
+        self.assertEqual(NL["plan.portions_default"], "standaard")
+        self.assertEqual(NL["plan.portions_recipe"], "recept")
+        self.assertEqual(NL["plan.portions_unknown"], "recept zonder porties")
+        self.assertEqual(en["plan.portions_set"], "set")
+        self.assertEqual(en["plan.portions_default"], "default")
+        self.assertEqual(en["plan.portions_recipe"], "recipe")
+        self.assertEqual(en["plan.portions_unknown"], "recipe without servings")
+
+    def test_unknown_yield_card_names_a_scale_from_mealie(self):
+        # Een recept zonder opbrengst met een factor uit Mealie: de knoppen blijven uit, de kaart noemt de factor.
+        body = self.function_body("mealPortionsHtml")
+        unknown = body[body.index('portions.source === "unknown"'):body.index("const count")]
+        self.assertIn('t("plan.portions_scale_mealie", { factor: I18N.formatNumber(portions.scale) })', unknown)
+        self.assertIn("portions.scale !== 1", unknown)
+        en = dictionary("en")
+        self.assertEqual(NL["plan.portions_scale_mealie"], "\u00d7{factor} uit Mealie")
+        self.assertEqual(en["plan.portions_scale_mealie"], "\u00d7{factor} from Mealie")
+
     def test_scripts_load_in_order(self):
         self.assertLess(HTML.index("app.js"), HTML.index("onboarding.js"))
 
