@@ -2,7 +2,8 @@
 
 Streamable HTTP, zonder sessies en zonder streams: elk JSON-RPC-verzoek is een POST dat direct een
 JSON-antwoord krijgt. De tools lezen (weekmenu, recepten zoeken, AH-lijstjes en -producten), kunnen een
-recept in Mealie importeren en een onjuiste koppeling tussen ingrediënt en aanbieding melden (verbergen, ongedaan te maken). Er is bewust geen tool die het AH-, Picnic- of Jumbo-mandje vult
+recept in Mealie importeren, de porties van één geplande maaltijd instellen en een onjuiste koppeling tussen ingrediënt
+en aanbieding melden (verbergen, ongedaan te maken). Er is bewust geen tool die het AH-, Picnic- of Jumbo-mandje vult
 of iets verwijdert.
 
 Toegang loopt via OAuth (zie oauth.py). De server staat alleen aan als de app zelf inloggen
@@ -16,7 +17,9 @@ import json
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from . import ah, ah_lists, offers, ah_orders, ah_recipes, auth, jumbo, jumbo_lists, jumbo_orders, jumbo_recipes, mealie, picnic, picnic_orders, picnic_recipes, server_settings
+from flask import g, has_app_context
+
+from . import ah, ah_lists, offers, ah_orders, ah_recipes, auth, jumbo, jumbo_lists, jumbo_orders, jumbo_recipes, mealie, picnic, picnic_orders, picnic_recipes, portions, server_settings
 
 LATEST_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -56,6 +59,23 @@ def _text(value: Any, limit: int = 300) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+def _has_recipe(entry: dict[str, Any]) -> bool:
+    """Een maaltijd met een recept; "Restjes: ..." (alleen tekst) heeft in Mealie "recipe": null."""
+    recipe = entry.get("recipe")
+    return isinstance(recipe, dict) and bool(entry.get("recipeId") or recipe.get("id"))
+
+
+def _portions_fields(entry_id: Any, effective: dict[str, Any] | None, has_recipe: bool = True) -> dict[str, Any]:
+    """De porties van één maaltijd voor de assistent; portionsSource is set, default, recipe, unknown, unsupported of none."""
+    effective = effective if isinstance(effective, dict) else {}
+    return {
+        "entryId": str(entry_id) if entry_id not in (None, "") else None,
+        "portions": effective.get("portions") if has_recipe else None,
+        "portionsSource": (effective.get("source") or "unknown") if has_recipe else "none",
+        "recipeServings": effective.get("recipeServings") if has_recipe else None,
+    }
+
+
 def tool_week_menu(args: dict[str, Any]) -> Any:
     start = _parse_date(args.get("start_date"), _monday(datetime.date.today()))
     days = max(1, min(14, int(args.get("days") or 7)))
@@ -77,6 +97,7 @@ def tool_week_menu(args: dict[str, Any]) -> Any:
                     for item in detail.get("recipeIngredient") or []
                     if item.get("display") or item.get("note")
                 ],
+                **_portions_fields(entry.get("id"), entry.get("portions"), _has_recipe(entry)),
             }
         )
     return {"from": start.isoformat(), "to": end.isoformat(), "meals": meals}
@@ -464,6 +485,24 @@ def tool_import_recipe(args: dict[str, Any]) -> Any:
     return {"slug": slug, "mealieUrl": mealie.recipe_page_url(slug)}
 
 
+def _mcp_username() -> str:
+    """De gebruiker achter het token van deze aanvraag (mcp_http zet die in g); zonder aanvraag "onbekend"."""
+    identity = g.get("mcp_identity") if has_app_context() else None
+    return str((identity or {}).get("username") or "onbekend")
+
+
+def tool_set_meal_portions(args: dict[str, Any]) -> Any:
+    entry_id = _text(args.get("entry_id"), 100)
+    if not entry_id:
+        raise ToolError("Geef entry_id op (het entryId uit get_week_menu)")
+    try:
+        effective = portions.set_portions(entry_id, args.get("portions"), "mcp:" + _mcp_username())
+    except (ValueError, RuntimeError) as exc:
+        # ValueError: de vraag kan niet (geen recept, geen opbrengst, buiten 1-12); RuntimeError: Mealie faalde.
+        raise ToolError(str(exc) or "Porties opslaan mislukt") from None
+    return _portions_fields(entry_id, effective)
+
+
 def _copy_note(synced: str | None) -> str:
     return f"Uit de lokale kopie van {synced[:16].replace('T', ' ')} (UTC)." if synced else "Nog niet gesynchroniseerd: de kopie is leeg. De eigenaar synchroniseert onder AH Items > Bestellingen."
 
@@ -537,7 +576,13 @@ READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": T
 
 TOOLS: dict[str, dict[str, Any]] = {
     "get_week_menu": {
-        "description": "Het weekmenu uit Mealie: per dag en maaltijd het recept, de link en de ingrediënten. Standaard de huidige week (maandag t/m zondag).",
+        "description": (
+            "Het weekmenu uit Mealie: per dag en maaltijd het recept, de link en de ingrediënten (zoals in het recept, niet geschaald), "
+            "en de porties: entryId (voor set_meal_portions), portions (voor hoeveel personen MealieShopper boodschappen doet), "
+            "recipeServings (wat het recept opbrengt) en portionsSource: set (bewust ingesteld), default (de standaard van het huishouden), "
+            "recipe (de opbrengst van het recept), unknown (het recept zegt niet voor hoeveel personen), unsupported (deze Mealie bewaart "
+            "geen porties) of none (maaltijd zonder recept). Standaard de huidige week (maandag t/m zondag)."
+        ),
         "inputSchema": _schema(
             {
                 "start_date": {"type": "string", "description": "Eerste dag, JJJJ-MM-DD. Standaard de maandag van deze week."},
@@ -817,6 +862,22 @@ TOOLS: dict[str, dict[str, Any]] = {
         "annotations": {"title": "Recept importeren in Mealie", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
         "handler": tool_import_recipe,
     },
+    "set_meal_portions": {
+        "description": (
+            "Stel in voor hoeveel personen (1 tot en met 12) één geplande maaltijd in het weekmenu is. Verandert alleen de porties van die ene "
+            "maaltijd (in Mealie de recipeScale); het vult nooit een mandje en verwijdert niets. Gebruik het entryId uit get_week_menu. "
+            "Werkt niet bij een maaltijd zonder recept of bij een recept dat niet zegt voor hoeveel personen het is."
+        ),
+        "inputSchema": _schema(
+            {
+                "entry_id": {"type": "string", "description": "Het entryId van de maaltijd uit get_week_menu."},
+                "portions": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Het aantal porties, 1 tot en met 12."},
+            },
+            ["entry_id", "portions"],
+        ),
+        "annotations": {"title": "Porties instellen", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+        "handler": tool_set_meal_portions,
+    },
 }
 
 
@@ -890,7 +951,8 @@ def handle_message(message: Any) -> dict[str, Any] | None:
                     "MealieShopper koppelt Mealie aan Albert Heijn, Picnic en Jumbo. Gebruik de tools om het weekmenu, "
                     "recepten, AH-lijstjes, AH-producten, het AH-mandje, bestellingen en kassabonnen te bekijken "
                     "(die laatste drie komen uit een lokale kopie met een tijdstip), Picnic-producten, -favorieten, -mandje, -leveringen, -bezorgmomenten en -recepten "
-                    "en Jumbo-producten en -mandje live te bekijken en om een recept in Mealie te importeren. "
+                    "en Jumbo-producten en -mandje live te bekijken, om een recept in Mealie te importeren en om de porties "
+                    "van een geplande maaltijd in te stellen. "
                     "Het AH-mandje vullen kan niet via deze server, en het Picnic- en Jumbo-mandje ook niet."
                 ),
             },

@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 os.environ["PASSKEY_AUTH_ENABLED"] = "false"
 
-from mealieshopper import ah, ah_lists, ah_recipes, auth, auth_password, mcp, mealie, oauth, picnic, picnic_recipes  # noqa: E402
+from mealieshopper import ah, ah_lists, ah_recipes, auth, auth_password, mcp, mealie, oauth, picnic, picnic_recipes, portions  # noqa: E402
 from mealieshopper.app import create_app  # noqa: E402
 
 PASSWORD = "koffie-met-melk-42"
@@ -508,13 +508,13 @@ class ProtocolTest(McpTestCase):
                              "search_picnic_products", "get_picnic_basket", "list_picnic_deliveries", "get_picnic_delivery", "list_picnic_orders", "get_picnic_order",
                              "list_picnic_delivery_slots", "list_picnic_recipes", "list_picnic_favorites", "search_jumbo_products", "get_jumbo_basket", "get_jumbo_list", "list_jumbo_lists",
                          "list_jumbo_orders", "get_jumbo_order", "search_jumbo_recipes", "list_jumbo_recipe_lists", "get_jumbo_recipe_list", "get_jumbo_recipe",
-                         "review_offer_matches", "report_offer_mismatch", "list_offer_mismatches"})
+                         "review_offer_matches", "report_offer_mismatch", "list_offer_mismatches", "set_meal_portions"})
         for name, tool in tools.items():
             self.assertEqual(tool["inputSchema"]["type"], "object", name)
             self.assertFalse(tool["inputSchema"]["additionalProperties"], name)
             self.assertTrue(tool["description"], name)
             self.assertIs(tool["annotations"]["destructiveHint"], False, name)
-        self.assertEqual([n for n, t in tools.items() if not t["annotations"]["readOnlyHint"]], ["report_offer_mismatch", "import_recipe_to_mealie"])
+        self.assertEqual([n for n, t in tools.items() if not t["annotations"]["readOnlyHint"]], ["report_offer_mismatch", "import_recipe_to_mealie", "set_meal_portions"])
         self.assertIs(tools["report_offer_mismatch"]["annotations"]["idempotentHint"], True, "dezelfde melding twee keer is dezelfde melding")
         # Geen enkele tool vult het mandje of verwijdert iets.
         # De tools die over het mandje of bestellingen gaan, lezen alleen; er is geen tool die iets toevoegt, wijzigt of verwijdert.
@@ -709,6 +709,53 @@ class ToolsTest(McpTestCase):
         self.assertEqual(data["meals"][1]["url"], "https://mealie.example/g/home/r/pasta")
         self.assertEqual(data["meals"][1]["ingredients"], ["400 g spaghetti", "peper"])
 
+    def test_week_menu_returns_entry_ids_and_portions(self):
+        entries = [
+            {"id": 7, "date": "2026-10-19", "entryType": "dinner", "recipeId": "r1", "recipe": {"id": "r1", "name": "Pasta", "slug": "pasta"},
+             "recipeDetail": {"recipeIngredient": []}, "portions": {"portions": 2, "scale": 0.5, "source": "default", "recipeServings": 4.0}},
+            {"id": 8, "date": "2026-10-20", "entryType": "dinner", "recipeId": "r2", "recipe": {"id": "r2", "name": "Soep", "slug": "soep"},
+             "recipeDetail": {"recipeIngredient": []}, "portions": {"portions": None, "scale": 1.0, "source": "unknown", "recipeServings": None}},
+            {"id": 9, "date": "2026-10-21", "entryType": "dinner", "title": "Restjes: chili", "recipeId": None, "recipe": None, "recipeDetail": None,
+             "portions": {"portions": None, "scale": 1.0, "source": "unknown", "recipeServings": None}},
+            {"id": 10, "date": "2026-10-22", "entryType": "dinner", "recipeId": "r3", "recipe": {"id": "r3", "name": "Stoof", "slug": "stoof"},
+             "recipeDetail": {"recipeIngredient": []}, "portions": {"portions": 6, "scale": 1.5, "source": "set", "recipeServings": 4.0}},
+        ]
+        with mock.patch.object(mealie, "get_meal_plan_with_recipes", return_value=entries), mock.patch.object(mealie, "mealie_url", return_value="https://mealie.example"), \
+                mock.patch.object(mealie, "group_slug", return_value="home"):
+            meals = self.data("get_week_menu", {"start_date": "2026-10-19", "days": 7})["meals"]
+        pick = [(m["entryId"], m["portions"], m["portionsSource"], m["recipeServings"]) for m in meals]
+        self.assertEqual(pick, [("7", 2, "default", 4.0), ("8", None, "unknown", None), ("9", None, "none", None), ("10", 6, "set", 4.0)])
+
+    def test_set_meal_portions_calls_portions_with_mcp_user(self):
+        answer = {"portions": 3, "scale": 0.75, "source": "set", "recipeServings": 4.0}
+        with mock.patch.object(portions, "set_portions", return_value=answer) as write:
+            data = self.data("set_meal_portions", {"entry_id": "7", "portions": 3})
+        write.assert_called_once_with("7", 3, "mcp:admin")
+        self.assertEqual(data, {"entryId": "7", "portions": 3, "portionsSource": "set", "recipeServings": 4.0})
+
+    def test_set_meal_portions_maps_value_error_to_tool_error(self):
+        with mock.patch.object(portions, "set_portions", side_effect=ValueError("Kies 1 tot en met 12 porties.")):
+            result = self.call(self.token, "set_meal_portions", {"entry_id": "7", "portions": 13})
+        self.assertTrue(result["isError"])
+        self.assertEqual(self.text(result), "Kies 1 tot en met 12 porties.")
+        # Een storing bij Mealie bereikt de planner ook als toolfout, met de melding.
+        with mock.patch.object(portions, "set_portions", side_effect=RuntimeError("Porties opslaan in Mealie mislukt (500): kapot")):
+            result = self.call(self.token, "set_meal_portions", {"entry_id": "7", "portions": 3})
+        self.assertTrue(result["isError"])
+        self.assertEqual(self.text(result), "Porties opslaan in Mealie mislukt (500): kapot")
+        with mock.patch.object(portions, "set_portions", side_effect=AssertionError("niet aanroepen")):
+            self.assertTrue(self.call(self.token, "set_meal_portions", {"portions": 3})["isError"])
+
+    def test_set_meal_portions_is_described_honestly(self):
+        tool = next(t for t in mcp.all_tool_descriptors() if t["name"] == "set_meal_portions")
+        self.assertEqual(tool["annotations"], {"title": "Porties instellen", "readOnlyHint": False, "destructiveHint": False,
+                                               "idempotentHint": True, "openWorldHint": True})
+        schema = tool["inputSchema"]
+        self.assertEqual(set(schema["required"]), {"entry_id", "portions"})
+        self.assertEqual(schema["properties"]["entry_id"]["type"], "string")
+        self.assertEqual((schema["properties"]["portions"]["type"], schema["properties"]["portions"]["minimum"],
+                          schema["properties"]["portions"]["maximum"]), ("integer", 1, 12))
+
     def test_week_menu_defaults_to_this_week_and_validates(self):
         with mock.patch.object(mealie, "get_meal_plan_with_recipes", return_value=[]) as plan:
             self.data("get_week_menu")
@@ -825,6 +872,16 @@ class ToolSwitchTest(McpTestCase):
         self.assertNotIn("get_week_menu", self.listed())
         self.assertIn("get_ah_list", self.listed())
         result = self.call(self.token, "get_week_menu")
+        self.assertTrue(result["isError"])
+        self.assertIn("uitgezet", result["content"][0]["text"])
+
+    def test_set_meal_portions_can_be_switched_off(self):
+        self.assertIn("set_meal_portions", {tool["name"] for tool in mcp.tool_descriptors()})
+        self.switch("set_meal_portions", False)
+        self.assertNotIn("set_meal_portions", {tool["name"] for tool in mcp.tool_descriptors()})
+        self.assertNotIn("set_meal_portions", self.listed())
+        with mock.patch.object(portions, "set_portions", side_effect=AssertionError("niet aanroepen")):
+            result = self.call(self.token, "set_meal_portions", {"entry_id": "7", "portions": 3})
         self.assertTrue(result["isError"])
         self.assertIn("uitgezet", result["content"][0]["text"])
 
