@@ -533,6 +533,8 @@ const MIN_PORTIONS = 1;
 const MAX_PORTIONS = 12;
 const PORTIONS_SOURCE_LABELS = { set: "plan.portions_set", default: "plan.portions_default", recipe: "plan.portions_recipe" };
 let mealPortionsBusy = false; // één wijziging tegelijk; klikken in de tussentijd tellen niet
+// Telt op bij elke gelukte wijziging van porties: een voorbeeld van het mandje dat daarvóór begon, is verouderd.
+let cartGeneration = 0;
 
 function clampPortions(value) {
   return Math.min(MAX_PORTIONS, Math.max(MIN_PORTIONS, value));
@@ -604,6 +606,13 @@ async function changeMealPortions(week, write) {
   }
 }
 
+// Een open controlelijst van het mandje rekent nog met de oude porties: weg ermee (zoals loadMealPlan doet), en
+// een voorbeeld dat nog onderweg is, tekent niets meer (zie addToCart).
+function dropCartReview() {
+  cartGeneration++;
+  $("#cart-result").innerHTML = "";
+}
+
 async function setMealPortions(entryId, portions) {
   const week = getWeekBounds(state.weekOffset);
   await changeMealPortions(week, async () => {
@@ -612,6 +621,7 @@ async function setMealPortions(entryId, portions) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ portions }),
     });
+    dropCartReview();
     mealPlanCache.delete(week.start);
     await reloadWeekAfterPortions(week);
   });
@@ -621,6 +631,7 @@ async function resetMealPortions(entryId) {
   const week = getWeekBounds(state.weekOffset);
   await changeMealPortions(week, async () => {
     await jsonFetch(`/api/mealplan/${encodeURIComponent(entryId)}/portions`, { method: "DELETE" });
+    dropCartReview();
     mealPlanCache.delete(week.start);
     await reloadWeekAfterPortions(week);
   });
@@ -1161,6 +1172,7 @@ async function addToCart() {
   button.disabled = true;
   button.textContent = t("cart.searching");
   $("#cart-result").innerHTML = "";
+  const generation = ++cartGeneration;
   try {
     const preview = await jsonFetch(`/api/${currentStore().api}/cart/preview`, {
       method: "POST",
@@ -1168,6 +1180,8 @@ async function addToCart() {
       // Het aantal verpakkingen rekent de server uit met de verpakkingsgrootte van de winkel.
       body: JSON.stringify({ items }),
     });
+    // Intussen veranderden de porties (dropCartReview): deze aantallen kloppen niet meer, dus niets tekenen.
+    if (generation !== cartGeneration) return;
     const rows = preview.items || [];
     // Het mandje gaat nooit zonder controle vol: ook zonder twijfel toont de lijst eerst wat erin komt.
     if (!rows.some((row) => row.candidates.length)) {
@@ -1176,6 +1190,7 @@ async function addToCart() {
       renderCartReview(rows);
     }
   } catch (error) {
+    if (generation !== cartGeneration) return;
     $("#cart-result").innerHTML = `<div class="message error">${escapeHtml(error.message)}</div>`;
   } finally {
     button.disabled = false;

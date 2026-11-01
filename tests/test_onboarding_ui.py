@@ -93,6 +93,32 @@ class MarkupTest(unittest.TestCase):
         self.assertIn('method: "PUT"', self.function_body("setMealPortions"))
         self.assertIn('method: "DELETE"', self.function_body("resetMealPortions"))
 
+    def test_portion_changes_drop_the_basket_check_list(self):
+        # Na een gelukte wijziging klopt een open controlelijst van het mandje niet meer: die gaat weg, net als in
+        # loadMealPlan, en een voorbeeld dat nog liep van vóór de wijziging vult het mandje niet meer.
+        for name in ("setMealPortions", "resetMealPortions"):
+            body = self.function_body(name)
+            self.assertIn("dropCartReview()", body, name)
+            self.assertLess(body.index("jsonFetch"), body.index("dropCartReview()"), f"{name}: pas na een gelukte wijziging")
+            self.assertLess(body.index("dropCartReview()"), body.index("reloadWeekAfterPortions"), name)
+        drop = self.function_body("dropCartReview")
+        self.assertIn("cartGeneration++", drop)
+        self.assertIn('$("#cart-result").innerHTML = ""', drop)
+        self.assertRegex(APP_JS, re.compile(r"^let cartGeneration = 0;", re.M))
+        add = self.function_body("addToCart")
+        self.assertIn("const generation = ++cartGeneration;", add)
+        # Na het wachten op de server: een oud voorbeeld (in het gelukte en het mislukte pad) tekent niets.
+        self.assertEqual(add.count("if (generation !== cartGeneration) return;"), 2, add)
+        self.assertLess(add.index("await jsonFetch"), add.index("if (generation !== cartGeneration) return;"))
+
+    def test_default_portions_rejects_text_instead_of_clearing(self):
+        # Tekst in een type=number-veld geeft value "" (badInput); dat mag de standaard niet stil uitzetten.
+        system_js = (ROOT / "static" / "system.js").read_text(encoding="utf-8")
+        save = re.search(r"^async function saveDefaultPortions\(.*?^\}", system_js, re.M | re.S).group(0)
+        self.assertIn("validity.badInput", save)
+        self.assertLess(save.index("validity.badInput"), save.index("jsonFetch"))
+        self.assertRegex(save, r'validity\.badInput[^;]*\)\s*\{\s*message\("#default-portions-message", t\("system\.portions_invalid"\)\);\s*return;')
+
     def test_portion_labels_exist_in_both_languages(self):
         en = dictionary("en")
         for key in ("plan.portions", "plan.portions_set", "plan.portions_default", "plan.portions_recipe",

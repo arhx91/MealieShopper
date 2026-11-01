@@ -161,9 +161,15 @@ async function loadDefaultPortions() {
 
 async function saveDefaultPortions(event) {
   const button = event.currentTarget;
-  const raw = $("#default-portions").value.trim();
-  const value = raw === "" ? null : Number(raw);
+  const input = $("#default-portions");
   message("#default-portions-message", "");
+  // Tekst in een getalveld geeft value "" (badInput): niet als leeg opslaan, want dat zet de standaard stil uit.
+  if (input.validity.badInput) {
+    message("#default-portions-message", t("system.portions_invalid"));
+    return;
+  }
+  const raw = input.value.trim();
+  const value = raw === "" ? null : Number(raw);
   if (value !== null && !(Number.isInteger(value) && value >= 1 && value <= 12)) {
     message("#default-portions-message", t("system.portions_invalid"));
     return;
