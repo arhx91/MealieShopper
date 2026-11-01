@@ -284,7 +284,12 @@ class WritePortionsTest(PortionsCase):
         self.assertEqual(reset.get_json()["source"], "recipe")
 
         self.mock_mealie(mealie_entry(), put_status=500)
-        failed = self.client.put("/api/mealplan/7/portions", json={"portions": 2})
+        # De 424 schrijft een waarschuwing in de log; hier vangen we die op, zodat de testuitvoer schoon blijft.
+        with self.assertLogs(self.client.application.logger, level="WARNING") as logs:
+            failed = self.client.put("/api/mealplan/7/portions", json={"portions": 2})
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("Porties opslaan in Mealie mislukt", logs.output[0])
+        self.assertIn("500", logs.output[0])
         self.assertEqual(failed.status_code, 424)
         self.assertIn("error", failed.get_json())
 
