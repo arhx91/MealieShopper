@@ -11,12 +11,16 @@ Niet ingesteld en geen standaard: de opbrengst van het recept, zoals vroeger.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import closing
 from os import environ
 from typing import Any
 
-from . import auth
+from . import auth, mealie
+from .i18n import tr
+
+log = logging.getLogger(__name__)
 
 SETTING_DEFAULT = "DEFAULT_PORTIONS"
 ENV_DEFAULT = "MEALIESHOPPER_DEFAULT_PORTIONS"
@@ -129,3 +133,60 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
     if default is not None:
         return {"portions": default, "scale": default / servings, "source": "default", "recipeServings": servings}
     return {"portions": round(servings), "scale": 1.0, "source": "recipe", "recipeServings": servings}
+
+
+def _writable(entry_id: str) -> tuple[dict[str, Any], dict[str, Any], float]:
+    """De maaltijd, de samenvatting van haar recept en de opbrengst; een ValueError als de porties niet te zetten zijn.
+
+    De opbrengst komt uit de samenvatting van het recept in de maaltijd (RecipeSummary heeft recipeServings en
+    recipeYieldQuantity), dus er is geen tweede aanvraag voor het hele recept nodig.
+    """
+    entry = mealie.get_plan_entry(entry_id)
+    recipe = entry.get("recipe") if isinstance(entry.get("recipe"), dict) else None
+    if not recipe or not _recipe_id(entry, recipe):
+        raise ValueError(tr("Deze maaltijd heeft geen recept.", "This meal has no recipe."))
+    if "recipeScale" not in entry:
+        raise ValueError(tr(
+            "Deze versie van Mealie bewaart geen porties per maaltijd (recipeScale ontbreekt).",
+            "This version of Mealie does not store portions per meal (recipeScale is missing).",
+        ))
+    servings = recipe_yield(recipe)
+    if servings is None:
+        raise ValueError(tr(
+            "Het recept zegt niet voor hoeveel personen het is; vul dat eerst in Mealie in.",
+            "The recipe does not say how many people it serves; fill that in in Mealie first.",
+        ))
+    return entry, recipe, servings
+
+
+def _after_write(updated: Any, entry: dict[str, Any], recipe: dict[str, Any]) -> dict[str, Any]:
+    """`effective` van de maaltijd zoals Mealie haar teruggaf; zonder recept in het antwoord de samenvatting van ervoor."""
+    updated = updated if isinstance(updated, dict) else entry
+    summary = updated.get("recipe") if isinstance(updated.get("recipe"), dict) else recipe
+    return effective(updated, summary)
+
+
+def set_portions(entry_id: str, portions: int, set_by: str) -> dict[str, Any]:
+    """Zet de porties van één maaltijd: recipeScale = porties / opbrengst in Mealie, en daarna de markering.
+
+    De markering komt pas na een gelukte PUT; een fout van Mealie (RuntimeError) laat alles zoals het was.
+    """
+    if isinstance(portions, bool) or not isinstance(portions, int) or not MIN_PORTIONS <= portions <= MAX_PORTIONS:
+        raise ValueError(tr(
+            f"Kies {MIN_PORTIONS} tot en met {MAX_PORTIONS} porties.",
+            f"Choose {MIN_PORTIONS} to {MAX_PORTIONS} portions.",
+        ))
+    entry, recipe, servings = _writable(entry_id)
+    updated = mealie.set_plan_entry_scale(entry_id, portions / servings)
+    mark(str(entry_id), _recipe_id(entry, recipe), str(entry.get("date") or ""), set_by)
+    log.info("Porties van maaltijd %s op %d gezet door %s", entry_id, portions, set_by)
+    return _after_write(updated, entry, recipe)
+
+
+def reset(entry_id: str, set_by: str) -> dict[str, Any]:
+    """Terug naar de standaard: recipeScale = 1.0 in Mealie en de markering weg. Zonder standaard geldt het recept."""
+    entry, recipe, _ = _writable(entry_id)
+    updated = mealie.set_plan_entry_scale(entry_id, 1.0)
+    unmark(str(entry_id))
+    log.info("Porties van maaltijd %s teruggezet door %s", entry_id, set_by)
+    return _after_write(updated, entry, recipe)

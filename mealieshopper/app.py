@@ -11,7 +11,7 @@ import requests
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from . import about, ah, ai_match, ai_review, ah_explore, audit, backup, ah_lists, ah_orders, ah_recipes, auth_password, factory_reset, hellofresh, jumbo, jumbo_explore, jumbo_lists, jumbo_orders, jumbo_recipes, marleyspoon, mcp_http, mealie, mealie_images, offers, offers_schedule, onboarding, picnic, picnic_explore, picnic_orders, picnic_recipes, profile, server_settings, updates, users, week_ingredients
+from . import about, ah, ai_match, ai_review, ah_explore, audit, backup, ah_lists, ah_orders, ah_recipes, auth_password, factory_reset, hellofresh, jumbo, jumbo_explore, jumbo_lists, jumbo_orders, jumbo_recipes, marleyspoon, mcp_http, mealie, mealie_images, offers, offers_schedule, onboarding, picnic, picnic_explore, picnic_orders, picnic_recipes, portions, profile, server_settings, updates, users, week_ingredients
 from . import auth, deals
 from .i18n import tr
 
@@ -134,6 +134,30 @@ def create_app() -> Flask:
         if not isinstance(entries, list):
             return jsonify({"error": tr("entries (een lijst met maaltijden) is verplicht", "entries (a list of meals) is required")}), 400
         return jsonify({"items": week_ingredients.basket_lines(entries)})
+
+    def portions_set_by() -> str:
+        user = auth.current_user()
+        return "user:" + (user["username"] if user else "anonymous")  # zonder inloggen is er geen gebruiker
+
+    def portions_answer(write):
+        # 400: de vraag kan niet (geen recept, geen opbrengst, buiten 1-12); 424: Mealie zelf faalde.
+        try:
+            return jsonify(write())
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            app.logger.warning("Porties opslaan in Mealie mislukt: %s", exc)
+            return jsonify({"error": str(exc) or tr("Porties opslaan mislukt", "Could not save the portions")}), 424
+
+    @app.put("/api/mealplan/<entry_id>/portions")
+    def mealplan_set_portions(entry_id):
+        body = request.get_json(silent=True)
+        value = body.get("portions") if isinstance(body, dict) else None
+        return portions_answer(lambda: portions.set_portions(entry_id, value, portions_set_by()))
+
+    @app.delete("/api/mealplan/<entry_id>/portions")
+    def mealplan_reset_portions(entry_id):
+        return portions_answer(lambda: portions.reset(entry_id, portions_set_by()))
 
     @app.get("/api/ah/search")
     def ah_search():

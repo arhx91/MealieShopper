@@ -446,6 +446,40 @@ def get_meal_plan(start_date: str, end_date: str) -> list[dict[str, Any]]:
     return response.json().get("items", [])
 
 
+def get_plan_entry(entry_id: str) -> dict[str, Any]:
+    """Eén maaltijd uit het weekmenu, zoals Mealie die bewaart (met recipeScale en de samenvatting van het recept)."""
+    ensure_configured()
+    try:
+        response = requests.get(
+            f"{mealie_url()}/api/households/mealplans/{entry_id}", headers=auth_headers(), timeout=30
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Maaltijd ophalen mislukt ({exc.__class__.__name__})") from exc
+    if not response.ok:
+        raise RuntimeError(f"Maaltijd ophalen mislukt ({response.status_code}): {response.text}")
+    return response.json()
+
+
+def set_plan_entry_scale(entry_id: str, scale: float) -> dict[str, Any]:
+    """Zet de factor (recipeScale) van één maaltijd in Mealie en geef de maaltijd terug zoals Mealie die nu bewaart.
+
+    Mealie wil bij het bijwerken de hele maaltijd (UpdatePlanEntry: onder meer date, id, groupId en userId); daarom halen
+    we haar eerst op en sturen we haar terug met alleen een andere recipeScale. Een fout of time-out wordt een
+    RuntimeError, zodat de aanroeper niets onthoudt van een wijziging die niet gelukt is.
+    """
+    entry = get_plan_entry(entry_id)
+    body = {**entry, "recipeScale": scale}
+    try:
+        response = requests.put(
+            f"{mealie_url()}/api/households/mealplans/{entry_id}", headers=auth_headers(), json=body, timeout=30
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Porties opslaan in Mealie mislukt ({exc.__class__.__name__})") from exc
+    if not response.ok:
+        raise RuntimeError(f"Porties opslaan in Mealie mislukt ({response.status_code}): {response.text}")
+    return response.json()
+
+
 def _fetch_recipe(slug: str) -> dict[str, Any]:
     response = requests.get(
         f"{mealie_url()}/api/recipes/{slug}",
