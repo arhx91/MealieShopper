@@ -11,7 +11,7 @@ import requests
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from . import about, ah, ai_match, ai_review, ah_explore, audit, backup, ah_lists, ah_orders, ah_recipes, auth_password, factory_reset, hellofresh, jumbo, jumbo_explore, jumbo_lists, jumbo_orders, jumbo_recipes, marleyspoon, mcp_http, mealie, mealie_images, offers, offers_schedule, onboarding, picnic, picnic_explore, picnic_orders, picnic_recipes, profile, server_settings, updates, users
+from . import about, ah, ai_match, ai_review, ah_explore, audit, backup, ah_lists, ah_orders, ah_recipes, auth_password, factory_reset, hellofresh, jumbo, jumbo_explore, jumbo_lists, jumbo_orders, jumbo_recipes, marleyspoon, mcp_http, mealie, mealie_images, offers, offers_schedule, onboarding, picnic, picnic_explore, picnic_orders, picnic_recipes, profile, server_settings, updates, users, week_ingredients
 from . import auth, deals
 from .i18n import tr
 
@@ -123,6 +123,21 @@ def create_app() -> Flask:
         except Exception as exc:
             app.logger.exception("Mealplan error")
             return jsonify({"error": str(exc) or tr("Fout bij ophalen weekmenu", "Could not load the week menu")}), 424
+
+    @app.get("/api/mealplan/ingredients")
+    def mealplan_ingredients():
+        # De boodschappenlijst van de week, met gedeelde ingrediënten opgeteld (zie week_ingredients.py).
+        start = request.args.get("start")
+        end = request.args.get("end")
+        if not start or not end:
+            return jsonify({"error": tr("start en end parameters zijn verplicht", "The start and end parameters are required")}), 400
+
+        try:
+            entries = mealie.get_meal_plan_with_recipes(start, end)
+        except Exception as exc:
+            app.logger.exception("Mealplan ingredients error")
+            return jsonify({"error": str(exc) or tr("Fout bij ophalen weekmenu", "Could not load the week menu")}), 424
+        return jsonify({"items": week_ingredients.basket_lines(entries)})
 
     @app.get("/api/ah/search")
     def ah_search():

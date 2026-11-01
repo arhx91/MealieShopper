@@ -38,6 +38,11 @@ class MarkupTest(unittest.TestCase):
         for needle in ('id="password-form"', 'id="pw-current"', 'autocomplete="new-password"', 'id="mfa-panel"', 'id="credentials-list"'):
             self.assertIn(needle, security, needle)
 
+    def test_week_ingredients_come_from_the_server(self):
+        # De server telt gedeelde ingrediënten op; de browser hield vroeger alleen het eerste aantal.
+        self.assertNotIn("function aggregateIngredients", APP_JS)
+        self.assertIn("/api/mealplan/ingredients", APP_JS)
+
     def test_scripts_load_in_order(self):
         self.assertLess(HTML.index("app.js"), HTML.index("onboarding.js"))
 

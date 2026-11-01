@@ -1,6 +1,7 @@
 const state = {
   weekOffset: 0,
   entries: null,
+  weekIngredients: [], // de boodschappenlijst van de getoonde week, van /api/mealplan/ingredients
   planAutoLoaded: false, // het weekmenu is na het koppelen van Mealie eenmaal vanzelf geladen
   auth: null,
   credentials: [],
@@ -478,19 +479,47 @@ function formatDate(dateStr) {
   return `${weekdayShort(date)} ${date.getDate()} ${monthShort(date)}`;
 }
 
-function aggregateIngredients(entries) {
-  const seen = new Set();
-  const result = [];
-  for (const entry of entries || []) {
-    for (const ingredient of entry.recipeDetail?.recipeIngredient || []) {
-      const key = ingredient.food?.name || ingredient.display;
-      if (key && !seen.has(key.toLowerCase())) {
-        seen.add(key.toLowerCase());
-        result.push(ingredient);
-      }
-    }
+// De boodschappenlijst van de week komt van de server: die telt gedeelde ingrediënten op (zie week_ingredients.py).
+// Elke regel heeft al de vorm die /api/<winkel>/cart/preview verwacht.
+function fetchWeekIngredients(week) {
+  return jsonFetch(`/api/mealplan/ingredients?start=${week.start}&end=${week.end}`).then((data) => data.items || []);
+}
+
+let weekIngredientsRequest = 0;
+
+async function loadWeekIngredients() {
+  const week = getWeekBounds(state.weekOffset);
+  const request = ++weekIngredientsRequest;
+  // Alleen het laatste verzoek telt, en alleen zolang zijn week nog getoond wordt.
+  const current = () => request === weekIngredientsRequest && week.start === getWeekBounds(state.weekOffset).start;
+  state.weekIngredients = [];
+  try {
+    const items = await fetchWeekIngredients(week);
+    if (!current()) return;
+    state.weekIngredients = items;
+    renderIngredientsPanel(items);
+  } catch (error) {
+    if (current()) message("#planner-message", error.message);
   }
-  return result;
+}
+
+function renderIngredientsPanel(items) {
+  $("#ingredients-panel").innerHTML = items.length
+    ? `
+      <div class="box ingredients">
+        <h2>${escapeHtml(t("plan.all_ingredients", { count: I18N.formatNumber(items.length) }))}</h2>
+        <ul>
+          ${items.map((item) => `<li>${escapeHtml(item.display || "-")}</li>`).join("")}
+        </ul>
+        <div class="toolbar ingredients__actions">
+          <span id="cart-store-slot"></span>
+          <button class="button" id="add-cart">${escapeHtml(cartButtonLabel())}</button>
+        </div>
+      </div>
+    `
+    : "";
+  $("#add-cart")?.addEventListener("click", addToCart);
+  renderStoreChoice();
 }
 
 function renderMealPlan(entries) {
@@ -534,28 +563,15 @@ function renderMealPlan(entries) {
     )
     .join("");
 
-  const ingredients = aggregateIngredients(entries);
+  $("#ingredients-panel").innerHTML = "";
   if (!entries.length) {
-    $("#ingredients-panel").innerHTML = "";
+    weekIngredientsRequest++; // een lijst die nog onderweg is, hoort bij een andere week
+    state.weekIngredients = [];
     message("#planner-message", t("plan.none_planned"), "success");
+    renderStoreChoice();
     return;
   }
-  $("#ingredients-panel").innerHTML = ingredients.length
-    ? `
-      <div class="box ingredients">
-        <h2>${escapeHtml(t("plan.all_ingredients", { count: I18N.formatNumber(ingredients.length) }))}</h2>
-        <ul>
-          ${ingredients.map((item) => `<li>${escapeHtml(item.display || item.food?.name || "-")}</li>`).join("")}
-        </ul>
-        <div class="toolbar ingredients__actions">
-          <span id="cart-store-slot"></span>
-          <button class="button" id="add-cart">${escapeHtml(cartButtonLabel())}</button>
-        </div>
-      </div>
-    `
-    : "";
-  $("#add-cart")?.addEventListener("click", addToCart);
-  renderStoreChoice();
+  loadWeekIngredients();
 }
 
 // Een weekmenu verandert zelden: elke week wordt na het ophalen bewaard, zodat bladeren door de weken direct gaat.
@@ -1024,8 +1040,8 @@ function renderCartReview(rows) {
 }
 
 async function addToCart() {
-  const ingredients = aggregateIngredients(state.entries);
-  if (!ingredients.length) return;
+  const items = state.weekIngredients || [];
+  if (!items.length) return;
   const button = $("#add-cart");
   button.disabled = true;
   button.textContent = t("cart.searching");
@@ -1034,15 +1050,8 @@ async function addToCart() {
     const preview = await jsonFetch(`/api/${currentStore().api}/cart/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        items: ingredients.map((ingredient) => ({
-          query: ingredient.food?.name || ingredient.display,
-          display: ingredient.display || ingredient.food?.name || "",
-          // Het aantal verpakkingen rekent de server uit met de verpakkingsgrootte van AH.
-          quantity: ingredient.quantity ?? null,
-          unit: ingredient.unit?.name || ingredient.unit?.abbreviation || null,
-        })),
-      }),
+      // Het aantal verpakkingen rekent de server uit met de verpakkingsgrootte van de winkel.
+      body: JSON.stringify({ items }),
     });
     const rows = preview.items || [];
     // Het mandje gaat nooit zonder controle vol: ook zonder twijfel toont de lijst eerst wat erin komt.
