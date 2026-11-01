@@ -746,6 +746,16 @@ class ToolsTest(McpTestCase):
         with mock.patch.object(portions, "set_portions", side_effect=AssertionError("niet aanroepen")):
             self.assertTrue(self.call(self.token, "set_meal_portions", {"portions": 3})["isError"])
 
+    def test_set_meal_portions_rejects_a_crafted_entry_id_before_asking_mealie(self):
+        # Zonder nabootsing van portions: de echte controle moet vóór elke aanvraag aan Mealie staan.
+        with mock.patch.object(mealie.requests, "get") as get, mock.patch.object(mealie.requests, "put") as put:
+            for entry_id in ("../../users/self", "1?x=", "%2F"):
+                result = self.call(self.token, "set_meal_portions", {"entry_id": entry_id, "portions": 3})
+                self.assertTrue(result["isError"], entry_id)
+                self.assertIn("maaltijd", self.text(result))
+        get.assert_not_called()
+        put.assert_not_called()
+
     def test_set_meal_portions_is_described_honestly(self):
         tool = next(t for t in mcp.all_tool_descriptors() if t["name"] == "set_meal_portions")
         self.assertEqual(tool["annotations"], {"title": "Porties instellen", "readOnlyHint": False, "destructiveHint": False,

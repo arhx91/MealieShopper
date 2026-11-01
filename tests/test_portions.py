@@ -236,6 +236,36 @@ class WritePortionsTest(PortionsCase):
             portions.set_portions("7", 2, "user:helmer")
         self.put.assert_not_called()
 
+    def test_rejects_a_crafted_entry_id_before_asking_mealie(self):
+        # Het nummer komt in het pad naar Mealie; ".." of "?" zou een ander Mealie-adres raken met ons token.
+        self.mock_mealie(mealie_entry())
+        for entry_id in ("../../users/self", "..", "1?x=", "%2F", "7/../8", "", None, "a" * 65):
+            with self.assertRaises(ValueError, msg=repr(entry_id)):
+                portions.set_portions(entry_id, 2, "user:helmer")
+            with self.assertRaises(ValueError, msg=repr(entry_id)):
+                portions.reset(entry_id, "user:helmer")
+        self.get.assert_not_called()
+        self.put.assert_not_called()
+
+    def test_accepts_numeric_and_uuid_entry_ids(self):
+        uuid = "3f2a1b4c-9d8e-4f7a-b6c5-0123456789ab"
+        for entry_id in (7, "7", uuid):
+            self.mock_mealie(mealie_entry(scale=1.0, servings=4))
+            result = portions.set_portions(entry_id, 2, "user:helmer")
+            self.assertEqual(result["portions"], 2, repr(entry_id))
+            self.assertEqual(self.get.call_args.args[0], f"{URL}/api/households/mealplans/{entry_id}")
+            portions.reset(entry_id, "user:helmer")
+
+    def test_route_rejects_a_crafted_entry_id_with_400(self):
+        self.mock_mealie(mealie_entry())
+        for path in ("/api/mealplan/%2E%2E/portions", "/api/mealplan/1%3Fx%3D/portions"):
+            put = self.client.put(path, json={"portions": 2})
+            self.assertEqual(put.status_code, 400, path)
+            self.assertIn("error", put.get_json())
+            self.assertEqual(self.client.delete(path).status_code, 400, path)
+        self.get.assert_not_called()
+        self.put.assert_not_called()
+
     def test_routes_return_effective_and_map_errors(self):
         self.mock_mealie(mealie_entry(scale=1.0, servings=4))
         ok = self.client.put("/api/mealplan/7/portions", json={"portions": 2})

@@ -12,6 +12,7 @@ Niet ingesteld en geen standaard: de opbrengst van het recept, zoals vroeger.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from contextlib import closing
 from os import environ
@@ -27,6 +28,9 @@ ENV_DEFAULT = "MEALIESHOPPER_DEFAULT_PORTIONS"
 MIN_PORTIONS = 1
 MAX_PORTIONS = 12
 SCALE_TOLERANCE = 1e-6  # een recipeScale zo dicht bij 1.0 geldt als "niet ingesteld"
+# Het nummer van een maaltijd komt in het pad naar Mealie. Alleen letters, cijfers en "-" (een getal of een UUID):
+# ".." of "?" zou anders een ander adres bij Mealie raken, met het token van MealieShopper.
+ENTRY_ID_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meal_portions_set (
@@ -146,6 +150,14 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
     return {"portions": round(servings), "scale": 1.0, "source": "recipe", "recipeServings": servings}
 
 
+def _checked_entry_id(entry_id: Any) -> str:
+    """Het nummer van een maaltijd als tekst; een ValueError als het geen getal of UUID kan zijn (vóór elke aanvraag)."""
+    text = "" if entry_id is None or isinstance(entry_id, bool) else str(entry_id)
+    if not ENTRY_ID_PATTERN.fullmatch(text):
+        raise ValueError(tr("Onbekende maaltijd.", "Unknown meal."))
+    return text
+
+
 def _writable(entry_id: str) -> tuple[dict[str, Any], dict[str, Any], float]:
     """De maaltijd, de samenvatting van haar recept en de opbrengst; een ValueError als de porties niet te zetten zijn.
 
@@ -187,6 +199,7 @@ def set_portions(entry_id: str, portions: int, set_by: str) -> dict[str, Any]:
             f"Kies {MIN_PORTIONS} tot en met {MAX_PORTIONS} porties.",
             f"Choose {MIN_PORTIONS} to {MAX_PORTIONS} portions.",
         ))
+    entry_id = _checked_entry_id(entry_id)
     entry, recipe, servings = _writable(entry_id)
     updated = mealie.set_plan_entry_scale(entry_id, portions / servings)
     mark(str(entry_id), _recipe_id(entry, recipe), str(entry.get("date") or ""), set_by)
@@ -196,6 +209,7 @@ def set_portions(entry_id: str, portions: int, set_by: str) -> dict[str, Any]:
 
 def reset(entry_id: str, set_by: str) -> dict[str, Any]:
     """Terug naar de standaard: recipeScale = 1.0 in Mealie en de markering weg. Zonder standaard geldt het recept."""
+    entry_id = _checked_entry_id(entry_id)
     entry, recipe, _ = _writable(entry_id)
     updated = mealie.set_plan_entry_scale(entry_id, 1.0)
     unmark(str(entry_id))
