@@ -42,6 +42,8 @@ class MarkupTest(unittest.TestCase):
         # De server telt gedeelde ingrediënten op; de browser hield vroeger alleen het eerste aantal.
         self.assertNotIn("function aggregateIngredients", APP_JS)
         self.assertIn("/api/mealplan/ingredients", APP_JS)
+        # De browser stuurt de maaltijden mee waaruit de dagkaarten zijn getekend.
+        self.assertRegex(APP_JS, r'jsonFetch\("/api/mealplan/ingredients", \{\s*method: "POST"')
 
     def test_scripts_load_in_order(self):
         self.assertLess(HTML.index("app.js"), HTML.index("onboarding.js"))

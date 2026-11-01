@@ -90,27 +90,21 @@ class RouteTest(unittest.TestCase):
 
     def test_route_returns_summed_lines(self):
         entries = [entry(line("Ui", "stuks", 2, "2 stuks Ui")), entry(line("Ui", "stuks", 1, "1 stuks Ui"))]
-        with mock.patch.object(mealie, "get_meal_plan_with_recipes", return_value=entries) as get:
-            response = self.client.get("/api/mealplan/ingredients?start=2026-11-02&end=2026-11-08")
+        with mock.patch.object(mealie, "get_meal_plan_with_recipes") as get:
+            response = self.client.post("/api/mealplan/ingredients", json={"entries": entries})
         self.assertEqual(response.status_code, 200)
-        get.assert_called_once_with("2026-11-02", "2026-11-08")
+        get.assert_not_called()  # de lijst komt uit de getoonde maaltijden, niet opnieuw uit Mealie
         self.assertEqual(
             response.get_json(),
             {"items": [{"query": "Ui", "display": "3 stuks Ui", "quantity": 3, "unit": "stuks"}]},
         )
 
-    def test_route_needs_both_dates(self):
-        with mock.patch.object(mealie, "get_meal_plan_with_recipes") as get:
-            response = self.client.get("/api/mealplan/ingredients?start=2026-11-02")
-        self.assertEqual(response.status_code, 400)
-        get.assert_not_called()
-
-    def test_route_reports_a_mealie_error_as_424(self):
-        with mock.patch.object(mealie, "get_meal_plan_with_recipes", side_effect=RuntimeError("Mealie weg")), \
-                self.assertLogs("mealieshopper.app", "ERROR"):
-            response = self.client.get("/api/mealplan/ingredients?start=2026-11-02&end=2026-11-08")
-        self.assertEqual(response.status_code, 424)
-        self.assertEqual(response.get_json()["error"], "Mealie weg")
+    def test_route_needs_a_list_of_entries(self):
+        for body in ({}, {"entries": None}, {"entries": "geen lijst"}, {"entries": {"title": "x"}}):
+            response = self.client.post("/api/mealplan/ingredients", json=body)
+            self.assertEqual(response.status_code, 400, body)
+            self.assertIn("error", response.get_json())
+        self.assertEqual(self.client.post("/api/mealplan/ingredients", data="geen json").status_code, 400)
 
 
 if __name__ == "__main__":

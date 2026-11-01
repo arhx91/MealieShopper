@@ -124,19 +124,15 @@ def create_app() -> Flask:
             app.logger.exception("Mealplan error")
             return jsonify({"error": str(exc) or tr("Fout bij ophalen weekmenu", "Could not load the week menu")}), 424
 
-    @app.get("/api/mealplan/ingredients")
+    @app.post("/api/mealplan/ingredients")
     def mealplan_ingredients():
         # De boodschappenlijst van de week, met gedeelde ingrediënten opgeteld (zie week_ingredients.py).
-        start = request.args.get("start")
-        end = request.args.get("end")
-        if not start or not end:
-            return jsonify({"error": tr("start en end parameters zijn verplicht", "The start and end parameters are required")}), 400
-
-        try:
-            entries = mealie.get_meal_plan_with_recipes(start, end)
-        except Exception as exc:
-            app.logger.exception("Mealplan ingredients error")
-            return jsonify({"error": str(exc) or tr("Fout bij ophalen weekmenu", "Could not load the week menu")}), 424
+        # De browser stuurt de maaltijden mee waaruit hij de dagkaarten tekende, zodat lijst en kaarten
+        # altijd gelijk zijn en een bewaarde week Mealie niet opnieuw vraagt.
+        body = request.get_json(silent=True)
+        entries = body.get("entries") if isinstance(body, dict) else None
+        if not isinstance(entries, list):
+            return jsonify({"error": tr("entries (een lijst met maaltijden) is verplicht", "entries (a list of meals) is required")}), 400
         return jsonify({"items": week_ingredients.basket_lines(entries)})
 
     @app.get("/api/ah/search")

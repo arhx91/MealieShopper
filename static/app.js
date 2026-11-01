@@ -480,21 +480,26 @@ function formatDate(dateStr) {
 }
 
 // De boodschappenlijst van de week komt van de server: die telt gedeelde ingrediënten op (zie week_ingredients.py).
-// Elke regel heeft al de vorm die /api/<winkel>/cart/preview verwacht.
-function fetchWeekIngredients(week) {
-  return jsonFetch(`/api/mealplan/ingredients?start=${week.start}&end=${week.end}`).then((data) => data.items || []);
+// We sturen de maaltijden mee waaruit de dagkaarten zijn getekend: zo horen lijst en kaarten altijd bij elkaar,
+// en kost een bewaarde week geen nieuwe vraag aan Mealie. Elke regel heeft al de vorm die /api/<winkel>/cart/preview verwacht.
+function fetchWeekIngredients(entries) {
+  return jsonFetch("/api/mealplan/ingredients", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entries }),
+  }).then((data) => data.items || []);
 }
 
 let weekIngredientsRequest = 0;
 
-async function loadWeekIngredients() {
+async function loadWeekIngredients(entries) {
   const week = getWeekBounds(state.weekOffset);
   const request = ++weekIngredientsRequest;
   // Alleen het laatste verzoek telt, en alleen zolang zijn week nog getoond wordt.
   const current = () => request === weekIngredientsRequest && week.start === getWeekBounds(state.weekOffset).start;
   state.weekIngredients = [];
   try {
-    const items = await fetchWeekIngredients(week);
+    const items = await fetchWeekIngredients(entries);
     if (!current()) return;
     state.weekIngredients = items;
     renderIngredientsPanel(items);
@@ -571,7 +576,7 @@ function renderMealPlan(entries) {
     renderStoreChoice();
     return;
   }
-  loadWeekIngredients();
+  loadWeekIngredients(entries);
 }
 
 // Een weekmenu verandert zelden: elke week wordt na het ophalen bewaard, zodat bladeren door de weken direct gaat.
