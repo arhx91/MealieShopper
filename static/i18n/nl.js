@@ -952,7 +952,7 @@ I18N.add("nl", {
   "update.how": "Haal de nieuwste image op (<code>ghcr.io/helmerznl/mealieshopper:latest</code>) en start de container opnieuw. Je gegevens staan in de data-map en blijven bewaard.",
   "settings.tab.system": "Systeem",
   "system.portions_title": "Standaard porties",
-  "system.portions_intro": "Voor hoeveel personen je meestal kookt. Een maaltijd waarvan niemand de porties heeft ingesteld, rekent in het weekmenu en in het mandje met dit aantal. Mealie zelf verandert niet. Leeg betekent uit, tenzij de omgeving een standaard geeft: dan geldt wat het recept opbrengt.",
+  "system.portions_intro": "Voor hoeveel personen je meestal kookt. Een maaltijd waarvan niemand de porties heeft ingesteld, rekent in het weekmenu en in het mandje met dit aantal. Mealie zelf verandert niet. Leeg betekent uit. Geeft de omgeving een standaard, dan geldt die. Anders geldt wat het recept opbrengt.",
   "system.portions_label": "Porties per maaltijd (1 tot en met 12)",
   "system.portions_save": "Opslaan",
   "system.portions_saved": "Opgeslagen. Het weekmenu rekent nu met deze instelling.",

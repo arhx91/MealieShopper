@@ -101,6 +101,10 @@ class MarkupTest(unittest.TestCase):
             self.assertIn("dropCartReview()", body, name)
             self.assertLess(body.index("jsonFetch"), body.index("dropCartReview()"), f"{name}: pas na een gelukte wijziging")
             self.assertLess(body.index("dropCartReview()"), body.index("reloadWeekAfterPortions"), name)
+        # Een andere week tonen (bladeren, sync, nieuwe standaard) maakt een voorbeeld dat nog liep ook ongeldig.
+        load = self.function_body("loadMealPlan")
+        self.assertIn("dropCartReview()", load)
+        self.assertLess(load.index("dropCartReview()"), load.index("cachedMealPlan(week)"))
         drop = self.function_body("dropCartReview")
         self.assertIn("cartGeneration++", drop)
         self.assertIn('$("#cart-result").innerHTML = ""', drop)

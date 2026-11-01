@@ -606,8 +606,8 @@ async function changeMealPortions(week, write) {
   }
 }
 
-// Een open controlelijst van het mandje rekent nog met de oude porties: weg ermee (zoals loadMealPlan doet), en
-// een voorbeeld dat nog onderweg is, tekent niets meer (zie addToCart).
+// Een open controlelijst van het mandje hoort bij een oude week of oude porties: weg ermee, en een voorbeeld
+// dat nog onderweg is, tekent niets meer (zie addToCart). Ook bij elke nieuwe weekweergave (loadMealPlan).
 function dropCartReview() {
   cartGeneration++;
   $("#cart-result").innerHTML = "";
@@ -750,7 +750,7 @@ async function loadMealPlan({ force = false } = {}) {
   const week = getWeekBounds(state.weekOffset);
   const request = ++mealPlanRequest;
   message("#planner-message", "");
-  $("#cart-result").innerHTML = "";
+  dropCartReview();
   const cached = force ? null : cachedMealPlan(week);
   if (cached) {
     state.entries = cached;

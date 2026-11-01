@@ -952,7 +952,7 @@ I18N.add("en", {
   "update.how": "Pull the latest image (<code>ghcr.io/helmerznl/mealieshopper:latest</code>) and restart the container. Your data lives in the data folder and is kept.",
   "settings.tab.system": "System",
   "system.portions_title": "Default portions",
-  "system.portions_intro": "How many people you usually cook for. A meal whose portions nobody has set counts with this number in the week menu and in the basket. Mealie itself does not change. Empty means off, unless the environment sets a default: then the recipe's yield applies.",
+  "system.portions_intro": "How many people you usually cook for. A meal whose portions nobody has set counts with this number in the week menu and in the basket. Mealie itself does not change. Empty means off. If the environment sets a default, that default applies. Otherwise the recipe's yield applies.",
   "system.portions_label": "Portions per meal (1 to 12)",
   "system.portions_save": "Save",
   "system.portions_saved": "Saved. The week menu now counts with this setting.",
