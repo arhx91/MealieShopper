@@ -133,7 +133,11 @@ def create_app() -> Flask:
         entries = body.get("entries") if isinstance(body, dict) else None
         if not isinstance(entries, list):
             return jsonify({"error": tr("entries (een lijst met maaltijden) is verplicht", "entries (a list of meals) is required")}), 400
-        return jsonify({"items": week_ingredients.basket_lines(entries)})
+        # Elke maaltijd rekent met haar eigen porties (zie portions.effective); een maaltijd zonder "portions"
+        # (een oude pagina of een zelfgemaakte aanvraag) kopen we ongeschaald, zoals vroeger.
+        return jsonify({"items": week_ingredients.basket_lines(
+            entries, scale_of=lambda e: (e.get("portions") or {}).get("scale", 1.0)
+        )})
 
     def portions_set_by() -> str:
         user = auth.current_user()

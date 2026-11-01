@@ -5,7 +5,7 @@ from unittest import mock
 
 os.environ["PASSKEY_AUTH_ENABLED"] = "false"
 
-from mealieshopper import auth, mealie, week_ingredients  # noqa: E402
+from mealieshopper import auth, ingredients, mealie, portions, week_ingredients  # noqa: E402
 from mealieshopper.app import create_app  # noqa: E402
 
 
@@ -77,6 +77,53 @@ class BasketLinesTest(unittest.TestCase):
         self.assertEqual(lines[0]["display"], "4 stuks tomaat (rijp)")
 
 
+def scaled(scale, *lines, recipe=None):
+    """Een maaltijd met de porties zoals /api/mealplan die meegeeft."""
+    return {"title": "", "recipeDetail": recipe or {"recipeIngredient": list(lines)}, "portions": {"scale": scale}}
+
+
+def by_scale(entry):
+    return entry["portions"]["scale"]
+
+
+class ScaledLinesTest(unittest.TestCase):
+    def test_default_halves_a_four_person_recipe(self):
+        lines = week_ingredients.basket_lines([scaled(0.5, line("ui", "stuks", 4, "4 stuks ui"))], scale_of=by_scale)
+        self.assertEqual(lines[0]["quantity"], 2)
+
+    def test_lines_without_food_are_not_scaled(self):
+        # Review Focus 1: het aantal van een regel die Mealie niet analyseerde is Mealie's standaard, geen hoeveelheid.
+        salt = {"food": None, "unit": None, "quantity": 1, "note": "1 snufje zout", "display": "1 snufje zout"}
+        lines = week_ingredients.basket_lines([scaled(0.5, salt)], scale_of=by_scale)
+        self.assertEqual(lines[0]["quantity"], 1)
+        self.assertEqual(lines[0]["display"], "1 snufje zout")
+
+    def test_same_recipe_twice_is_scaled_per_entry(self):
+        # Review Focus 2: get_meal_plan_with_recipes deelt één recipeDetail per recept over de maaltijden.
+        shared = {"recipeIngredient": [line("ui", "stuks", 4, "4 stuks ui")]}
+        entries = [scaled(0.5, recipe=shared), scaled(1.0, recipe=shared)]
+        lines = week_ingredients.basket_lines(entries, scale_of=by_scale)
+        self.assertEqual(lines[0]["quantity"], 6)
+        self.assertEqual(shared["recipeIngredient"][0]["quantity"], 4, "het gedeelde recept blijft ongewijzigd")
+        self.assertEqual(entries[0]["recipeDetail"]["recipeIngredient"][0]["display"], "4 stuks ui")
+
+    def test_uneven_scale_is_formatted(self):
+        with mock.patch.object(ingredients, "current_lang", return_value="nl"):
+            eggs = week_ingredients.basket_lines([scaled(2 / 3, line("ei", "stuks", 3, "3 stuks ei"))], scale_of=by_scale)
+            cheese = week_ingredients.basket_lines([scaled(2 / 3, line("kaas", "g", 100, "100 g kaas"))], scale_of=by_scale)
+        self.assertEqual(eggs[0]["display"], "2 stuks ei")
+        self.assertEqual(cheese[0]["display"], "66,67 g kaas")
+
+    def test_scale_one_everywhere_is_todays_basket(self):
+        lines = [
+            line("Ui", "stuks", 2, "2 stuks Ui"), line("ui", "g", 200, "200 g ui"),
+            line(quantity=1, display="Een snufje peper"), line("zout", display="zout"),
+        ]
+        plain = [entry(*lines), entry(line("Ui", "stuks", 1, "1 stuks Ui"))]
+        with_portions = [scaled(1.0, *lines), scaled(1.0, line("Ui", "stuks", 1, "1 stuks Ui"))]
+        self.assertEqual(week_ingredients.basket_lines(with_portions, scale_of=by_scale), week_ingredients.basket_lines(plain))
+
+
 class RouteTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -105,6 +152,35 @@ class RouteTest(unittest.TestCase):
             self.assertEqual(response.status_code, 400, body)
             self.assertIn("error", response.get_json())
         self.assertEqual(self.client.post("/api/mealplan/ingredients", data="geen json").status_code, 400)
+
+    def test_route_scales_by_the_portions_of_each_entry(self):
+        entries = [
+            scaled(0.5, line("ui", "stuks", 4, "4 stuks ui")),
+            entry(line("ui", "stuks", 4, "4 stuks ui")),  # zonder "portions" (oude pagina): ongeschaald
+            {**entry(line("ui", "stuks", 4, "4 stuks ui")), "portions": None},
+        ]
+        response = self.client.post("/api/mealplan/ingredients", json={"entries": entries})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["items"][0]["quantity"], 10)
+
+    def test_week_entries_carry_portions(self):
+        plan = [
+            {"id": 1, "date": "2026-11-03", "recipeId": "r1", "recipeScale": 1.0, "recipe": {"id": "r1", "slug": "pasta"}},
+            {"id": 2, "date": "2026-11-04", "recipeId": "r1", "recipeScale": 0.5, "recipe": {"id": "r1", "slug": "pasta"}},
+            {"id": 3, "date": "2026-11-05", "recipeId": None, "recipeScale": 1.0, "title": "Uit eten"},
+        ]
+        recipe = {"id": "r1", "slug": "pasta", "recipeServings": 4, "recipeIngredient": []}
+        auth.set_setting(portions.SETTING_DEFAULT, "2")
+        with mock.patch.object(mealie, "get_meal_plan", return_value=plan), \
+                mock.patch.object(mealie, "get_recipe", return_value=recipe), \
+                mock.patch.object(mealie, "_image_path", return_value=None):
+            week = mealie.get_meal_plan_with_recipes("2026-11-03", "2026-11-09")
+        self.assertEqual(len(week), 3)
+        for item in week:
+            self.assertIsInstance(item["portions"], dict, item["id"])
+            self.assertEqual(set(item["portions"]), {"portions", "scale", "source", "recipeServings"})
+        self.assertEqual([item["portions"]["source"] for item in week], ["default", "set", "unknown"])
+        self.assertEqual(week[0]["portions"]["scale"], 0.5)
 
 
 if __name__ == "__main__":

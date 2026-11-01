@@ -504,6 +504,14 @@ def _image_path(recipe: dict[str, Any] | None) -> str | None:
 
 
 def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """Het weekmenu met per maaltijd het hele recept (`recipeDetail`), een afbeelding en de porties die gelden.
+
+    Maaltijden met hetzelfde recept delen één `recipeDetail`; de porties (`portions`, zie portions.effective) staan per
+    maaltijd, zodat het mandje elke maaltijd met haar eigen factor rekent zonder het gedeelde recept te wijzigen.
+    """
+    # Late import: portions gebruikt zelf dit module om porties naar Mealie te schrijven.
+    from . import portions
+
     entries = get_meal_plan(start_date, end_date)
     slugs = sorted(
         {
@@ -529,6 +537,7 @@ def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str,
         detail = recipe_map.get(recipe.get("slug"))
         enriched["recipeDetail"] = detail
         enriched["imageUrl"] = _image_path(detail) or _image_path(recipe)
+        enriched["portions"] = portions.effective(entry, detail)
         result.append(enriched)
     return result
 
