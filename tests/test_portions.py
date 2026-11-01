@@ -71,6 +71,13 @@ class EffectiveTest(PortionsCase):
         self.assertIsNone(result["portions"])
         self.assertIsNone(result["recipeServings"])
 
+    def test_unknown_yield_follows_a_scale_set_in_mealie(self):
+        # Zonder opbrengst raden we geen porties, maar een factor die iemand in Mealie zette is bekend:
+        # het mandje volgt die, net als de boodschappenlijst van Mealie zelf. De standaard telt hier niet.
+        self.set_default(2)
+        result = portions.effective(plan_entry(scale=1.5), {"recipeServings": 0, "recipeYieldQuantity": 0})
+        self.assertEqual(result, {"portions": None, "scale": 1.5, "source": "unknown", "recipeServings": None})
+
     def test_text_only_entry_has_no_portions(self):
         self.set_default(2)
         entry = {"id": 9, "date": "2026-11-04", "recipeId": None, "recipeScale": 1.0, "recipe": None,

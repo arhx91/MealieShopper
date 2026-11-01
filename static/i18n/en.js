@@ -495,6 +495,7 @@ I18N.add("en", {
   "plan.portions_default": "default",
   "plan.portions_recipe": "recipe",
   "plan.portions_unknown": "recipe without servings",
+  "plan.portions_scale_mealie": "\u00d7{factor} from Mealie",
   "plan.portions_reset": "default",
   "plan.portions_less": "One portion less",
   "plan.portions_more": "One portion more",

@@ -554,7 +554,11 @@ function mealPortionsHtml(entry) {
         ${button("data-portions-minus", t("plan.portions_less"), "\u2212", MIN_PORTIONS, true)}
         <span class="meal-portions__value meal-portions__value--unknown">${escapeHtml(t("plan.portions_unknown"))}</span>
         ${button("data-portions-plus", t("plan.portions_more"), "+", MIN_PORTIONS, true)}
-      </div>`;
+      </div>${
+      portions.scale !== 1
+        ? `<small class="meal-portions__source">${escapeHtml(t("plan.portions_scale_mealie", { factor: I18N.formatNumber(portions.scale) }))}</small>`
+        : ""
+    }`;
   }
   // Het getal kan buiten 1-12 liggen als iemand in Mealie zelf een factor zette; we tonen het zoals het is.
   const count = Number(portions.portions) || 0;

@@ -139,6 +139,16 @@ class MarkupTest(unittest.TestCase):
         self.assertEqual(en["plan.portions_recipe"], "recipe")
         self.assertEqual(en["plan.portions_unknown"], "recipe without servings")
 
+    def test_unknown_yield_card_names_a_scale_from_mealie(self):
+        # Een recept zonder opbrengst met een factor uit Mealie: de knoppen blijven uit, de kaart noemt de factor.
+        body = self.function_body("mealPortionsHtml")
+        unknown = body[body.index('portions.source === "unknown"'):body.index("const count")]
+        self.assertIn('t("plan.portions_scale_mealie", { factor: I18N.formatNumber(portions.scale) })', unknown)
+        self.assertIn("portions.scale !== 1", unknown)
+        en = dictionary("en")
+        self.assertEqual(NL["plan.portions_scale_mealie"], "\u00d7{factor} uit Mealie")
+        self.assertEqual(en["plan.portions_scale_mealie"], "\u00d7{factor} from Mealie")
+
     def test_scripts_load_in_order(self):
         self.assertLess(HTML.index("app.js"), HTML.index("onboarding.js"))
 

@@ -131,14 +131,17 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
     """De porties die voor deze maaltijd gelden en de factor voor de aantallen in het mandje.
 
     `source` is "set" (bewust ingesteld), "default" (de standaard), "recipe" (de opbrengst van het recept),
-    "unknown" (een recept zonder opbrengst: niet schalen) of "unsupported" (een Mealie zonder `recipeScale`:
+    "unknown" (een recept zonder opbrengst: geen porties, alleen een factor die in Mealie zelf staat) of "unsupported" (een Mealie zonder `recipeScale`:
     niet schalen). De porties zijn afgerond op een geheel getal; de factor blijft een decimaal getal.
     """
     servings = recipe_yield(recipe)
     if "recipeScale" not in entry:
         return {"portions": None, "scale": 1.0, "source": "unsupported", "recipeServings": servings}
     if servings is None:
-        return {"portions": None, "scale": 1.0, "source": "unknown", "recipeServings": None}
+        # Geen opbrengst: we raden geen porties en de standaard telt niet. Een factor die iemand in Mealie zette,
+        # is wel bekend; het mandje volgt die, zoals de boodschappenlijst van Mealie zelf.
+        scale = _positive(entry.get("recipeScale")) or 1.0
+        return {"portions": None, "scale": scale, "source": "unknown", "recipeServings": None}
 
     scale = _positive(entry.get("recipeScale")) or 1.0
     if abs(scale - 1.0) >= SCALE_TOLERANCE or is_marked(str(entry.get("id") or ""), _recipe_id(entry, recipe)):

@@ -495,6 +495,7 @@ I18N.add("nl", {
   "plan.portions_default": "standaard",
   "plan.portions_recipe": "recept",
   "plan.portions_unknown": "recept zonder porties",
+  "plan.portions_scale_mealie": "\u00d7{factor} uit Mealie",
   "plan.portions_reset": "standaard",
   "plan.portions_less": "Eén portie minder",
   "plan.portions_more": "Eén portie meer",
