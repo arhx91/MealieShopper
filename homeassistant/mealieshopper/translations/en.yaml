@@ -5,6 +5,9 @@ configuration:
   mealie_api_token:
     name: Mealie API token
     description: A token from Mealie (user profile > API tokens). Optional; see Mealie address.
+  mealie_public_url:
+    name: Mealie address for your browser
+    description: The address you open Mealie on yourself, for links to recipes, when the Mealie address is one only Home Assistant knows (such as http://<add-on hostname>:9000). Optional; without it, links use the Mealie address.
   public_base_url:
     name: Public address
     description: The address you use to open MealieShopper from outside, for invitation links, the preview image and the AI connection. Optional; the app detects it itself.
