@@ -36,7 +36,7 @@ class MealieTestCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("MEALIE_URL", "MEALIE_API_TOKEN", "JWT_SECRET"):
+        for key in ("MEALIE_URL", "MEALIE_API_TOKEN", "MEALIE_PUBLIC_URL", "JWT_SECRET"):
             os.environ.pop(key, None)
         auth._INITIALIZED = False
         self.client = create_app().test_client()
@@ -101,6 +101,33 @@ class RecipePageUrlTest(MealieTestCase):
         auth.set_secret("MEALIE_API_TOKEN", TOKEN)
         mealie._group_slug_cache.clear()
         self.addCleanup(mealie._group_slug_cache.clear)
+
+    def test_a_public_address_is_used_for_links_but_not_for_the_api(self):
+        # In Docker bereikt MealieShopper Mealie op een interne naam (http://mealie:9000) die de browser niet kent.
+        with mock.patch.dict(os.environ, {"MEALIE_PUBLIC_URL": "http://localhost:9925/"}), mock.patch.object(
+            mealie.requests, "get", return_value=response(body={"groupSlug": "zb"})
+        ) as get:
+            self.assertEqual(mealie.recipe_page_url("pasta"), "http://localhost:9925/g/zb/r/pasta")
+            self.assertEqual(mealie.mealie_url(), URL, "de API blijft het adres van de koppeling gebruiken")
+        self.assertEqual(get.call_args.args[0], f"{URL}/api/users/self", "de groep komt via het adres van de koppeling")
+
+    def test_without_a_public_address_links_use_the_link_address(self):
+        for value in ("", "   "):
+            with mock.patch.dict(os.environ, {"MEALIE_PUBLIC_URL": value}), mock.patch.object(
+                mealie, "group_slug", return_value="zb"
+            ):
+                self.assertEqual(mealie.recipe_page_url("pasta"), f"{URL}/g/zb/r/pasta", repr(value))
+
+    def test_an_invalid_public_address_is_ignored_with_one_warning(self):
+        mealie._public_url_warned = False
+        self.addCleanup(setattr, mealie, "_public_url_warned", False)
+        with mock.patch.dict(os.environ, {"MEALIE_PUBLIC_URL": "ftp://mealie.example.nl"}), mock.patch.object(
+            mealie, "group_slug", return_value="zb"
+        ), self.assertLogs(mealie.log, "WARNING") as logs:
+            self.assertEqual(mealie.recipe_page_url("pasta"), f"{URL}/g/zb/r/pasta")
+            self.assertEqual(mealie.recipe_page_url("soep"), f"{URL}/g/zb/r/soep")
+        self.assertEqual(len(logs.output), 1, "één waarschuwing, niet één per link")
+        self.assertIn("MEALIE_PUBLIC_URL", logs.output[0])
 
     def test_the_recipe_link_has_the_group_of_the_user(self):
         with mock.patch.object(mealie.requests, "get", return_value=response(body={"username": "helmer", "groupSlug": "zb"})) as get:

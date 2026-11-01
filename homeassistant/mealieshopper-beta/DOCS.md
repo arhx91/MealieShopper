@@ -17,7 +17,7 @@ Alle opties van de add-on zijn optioneel. Een koppeling die je in de app maakt, 
 
 ### Mealie bereiken
 
-- **Mealie als add-on:** gebruik het adres dat Home Assistant eraan geeft, zoals `http://<hostnaam-van-de-add-on>:9000` (te zien op de infopagina van de Mealie-add-on). Zet dat in de optie *Mealie-adres* of in de app onder **Instellingen > Koppelen**.
+- **Mealie als add-on:** gebruik het adres dat Home Assistant eraan geeft, zoals `http://<hostnaam-van-de-add-on>:9000` (te zien op de infopagina van de Mealie-add-on). Zet dat in de optie *Mealie-adres* of in de app onder **Instellingen > Koppelen**. Je browser kent die hostnaam niet. Vul daarom bij *Mealie-adres voor je browser* het adres in waarop je Mealie zelf opent. Dan gaan links naar recepten open.
 - **Mealie elders:** het adres waarop de Home Assistant-machine Mealie bereikt, bijvoorbeeld `http://192.168.1.20:9925`.
 
 ### Beveiliging
@@ -51,7 +51,7 @@ All add-on options are optional. A link you make in the app takes precedence ove
 
 ### Reaching Mealie
 
-- **Mealie as an add-on:** use the address Home Assistant gives it, such as `http://<host name of the add-on>:9000` (shown on the info page of the Mealie add-on). Put it in the *Mealie address* option or in the app under **Settings > Link**.
+- **Mealie as an add-on:** use the address Home Assistant gives it, such as `http://<host name of the add-on>:9000` (shown on the info page of the Mealie add-on). Put it in the *Mealie address* option or in the app under **Settings > Link**. Your browser does not know that host name. Put the address you open Mealie on yourself in *Mealie address for your browser*. Then links to recipes open.
 - **Mealie elsewhere:** the address at which the Home Assistant machine reaches Mealie, for example `http://192.168.1.20:9925`.
 
 ### Security

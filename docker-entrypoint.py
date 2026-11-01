@@ -20,6 +20,7 @@ OPTIONS_FILE = "/data/options.json"
 OPTION_ENV = {
     "mealie_url": "MEALIE_URL",
     "mealie_api_token": "MEALIE_API_TOKEN",
+    "mealie_public_url": "MEALIE_PUBLIC_URL",
     "public_base_url": "MEALIESHOPPER_PUBLIC_BASE_URL",
     "auth_secret": "MEALIESHOPPER_AUTH_SECRET",
     "anthropic_api_key": "ANTHROPIC_API_KEY",

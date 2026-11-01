@@ -402,9 +402,33 @@ def group_slug() -> str | None:
     return slug
 
 
+PUBLIC_URL_ENV = "MEALIE_PUBLIC_URL"
+_public_url_warned = False
+
+
+def public_url() -> str:
+    """Het adres van Mealie voor links die de gebruiker in zijn browser opent.
+
+    MealieShopper bereikt Mealie soms op een adres dat alleen de server kent, zoals http://mealie:9000 in Docker. Is
+    MEALIE_PUBLIC_URL gezet, dan gebruiken links naar recepten dat adres; anders het adres van de koppeling. De API (ook
+    group_slug) gebruikt altijd het adres van de koppeling.
+    """
+    global _public_url_warned
+    value = environ.get(PUBLIC_URL_ENV, "").strip()
+    if value:
+        try:
+            return normalize_url(value)
+        except ValueError as exc:
+            # Een fout adres mag de links niet breken: terug naar het adres van de koppeling, met één waarschuwing.
+            if not _public_url_warned:
+                _public_url_warned = True
+                log.warning("%s wordt genegeerd (%s); links gebruiken het adres van de koppeling.", PUBLIC_URL_ENV, exc)
+    return mealie_url()
+
+
 def recipe_page_url(slug: str) -> str:
     """Het adres van een recept in Mealie: /g/<groep>/r/<recept>, of het oude /recipe/<recept> als de groep onbekend is."""
-    base = mealie_url()
+    base = public_url()
     group = group_slug()
     return f"{base}/g/{group}/r/{slug}" if group else f"{base}/recipe/{slug}"
 

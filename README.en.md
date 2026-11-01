@@ -347,7 +347,7 @@ You always link Mealie; of the supermarkets (Albert Heijn, Picnic and Jumbo) you
 3. Copy the token right away: Mealie shows it only once.
 4. Enter the address of your Mealie and the token in MealieShopper and choose **Link**.
 
-The address must be reachable from where MealieShopper runs, not necessarily from your phone. If they run in the same Docker environment it can be an internal name such as `http://mealie:9000`. The token is stored encrypted and never shown again. A link you make in the app takes precedence over `MEALIE_URL` and `MEALIE_API_TOKEN` from the environment.
+The address must be reachable from where MealieShopper runs, not necessarily from your phone. If they run in the same Docker environment it can be an internal name such as `http://mealie:9000`. Your browser does not know such a name, so links to recipes in Mealie do not open. Then set `MEALIE_PUBLIC_URL` to the address you open Mealie on yourself, for example `http://localhost:9925` or `https://mealie.example.com`. The token is stored encrypted and never shown again. A link you make in the app takes precedence over `MEALIE_URL` and `MEALIE_API_TOKEN` from the environment.
 
 ### Albert Heijn
 
@@ -492,6 +492,7 @@ Everything is optional. Set the values in your environment or in `.env.unraid` (
 | `MEALIESHOPPER_AUDIT_RETENTION_DAYS` | After how many days the audit log deletes entries (default 30; `0` never deletes on its own). |
 | `PASSKEY_AUTH_ENABLED` | With `false` login is turned off completely (emergency only). |
 | `MEALIE_URL`, `MEALIE_API_TOKEN` | Mealie through the environment; a link made in the app takes precedence. |
+| `MEALIE_PUBLIC_URL` | The address of Mealie for links you open in your browser, when MealieShopper reaches Mealie on an internal address (such as `http://mealie:9000`). Without it, links use the address of the link. |
 | `AH_REFRESH_TOKEN` | Starting value for the AH link; you normally link in the app. |
 | `PICNIC_COUNTRY_CODE` | Country of your Picnic account: `NL` (default), `DE` or `FR`. You make the link itself in the app. |
 | `PORT` | Port for `python run.py` (default 8000). |

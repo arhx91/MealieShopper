@@ -347,7 +347,7 @@ Mealie koppel je altijd; van de supermarkten (Albert Heijn, Picnic en Jumbo) kop
 3. Kopieer de token meteen: Mealie toont hem maar één keer.
 4. Vul in MealieShopper het adres van je Mealie en de token in en kies **Koppelen**.
 
-Het adres moet bereikbaar zijn vanaf de plek waar MealieShopper draait, niet per se vanaf je telefoon. Draaien ze in dezelfde Docker-omgeving, dan kan het een interne naam zijn zoals `http://mealie:9000`. De token wordt versleuteld bewaard en nooit meer getoond. Een koppeling die je in de app maakt gaat voor op `MEALIE_URL` en `MEALIE_API_TOKEN` uit de omgeving.
+Het adres moet bereikbaar zijn vanaf de plek waar MealieShopper draait, niet per se vanaf je telefoon. Draaien ze in dezelfde Docker-omgeving, dan kan het een interne naam zijn zoals `http://mealie:9000`. Je browser kent zo'n naam niet, dus links naar recepten in Mealie gaan dan niet open. Zet dan `MEALIE_PUBLIC_URL` op het adres waarop je Mealie zelf opent, bijvoorbeeld `http://localhost:9925` of `https://mealie.example.com`. De token wordt versleuteld bewaard en nooit meer getoond. Een koppeling die je in de app maakt gaat voor op `MEALIE_URL` en `MEALIE_API_TOKEN` uit de omgeving.
 
 ### Albert Heijn
 
@@ -492,6 +492,7 @@ Alles is optioneel. Zet de waarden in je omgeving of in `.env.unraid` ([`.env.un
 | `MEALIESHOPPER_AUDIT_RETENTION_DAYS` | Na hoeveel dagen de auditlog regels wist (standaard 30; `0` wist nooit vanzelf). |
 | `PASSKEY_AUTH_ENABLED` | Met `false` staat inloggen helemaal uit (alleen als noodgreep). |
 | `MEALIE_URL`, `MEALIE_API_TOKEN` | Mealie via de omgeving; een koppeling uit de app gaat voor. |
+| `MEALIE_PUBLIC_URL` | Het adres van Mealie voor links die je in je browser opent, als MealieShopper Mealie op een intern adres bereikt (zoals `http://mealie:9000`). Zonder deze waarde gebruiken links het adres van de koppeling. |
 | `AH_REFRESH_TOKEN` | Startwaarde voor de AH-koppeling; normaal koppel je in de app. |
 | `PICNIC_COUNTRY_CODE` | Land van je Picnic-account: `NL` (standaard), `DE` of `FR`. De koppeling zelf maak je in de app. |
 | `PORT` | Poort bij `python run.py` (standaard 8000). |

@@ -23,6 +23,7 @@ options: {}
 schema:
   mealie_url: str?
   mealie_api_token: password?
+  mealie_public_url: url?
   public_base_url: url?
   auth_secret: password?
   anthropic_api_key: password?
