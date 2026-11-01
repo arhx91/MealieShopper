@@ -45,6 +45,26 @@ class MarkupTest(unittest.TestCase):
         # De browser stuurt de maaltijden mee waaruit de dagkaarten zijn getekend.
         self.assertRegex(APP_JS, r'jsonFetch\("/api/mealplan/ingredients", \{\s*method: "POST"')
 
+    def test_system_tab_has_the_default_portions_field(self):
+        system = HTML[HTML.index('id="settings-system"'):HTML.index('id="backup-box"')]
+        field = re.search(r'<input[^>]*id="default-portions"[^>]*>', system)
+        self.assertIsNotNone(field, "het veld #default-portions staat niet bij Systeem")
+        for needle in ('type="number"', 'min="1"', 'max="12"'):
+            self.assertIn(needle, field.group(0), needle)
+        self.assertIn('id="default-portions-save"', system)
+        system_js = (ROOT / "static" / "system.js").read_text(encoding="utf-8")
+        self.assertRegex(system_js, r'jsonFetch\("/api/server-settings", \{\s*method: "PUT"')
+        self.assertIn("defaultPortions", system_js)
+        self.assertIn("loadDefaultPortions", APP_JS, "het tabblad Systeem laadt de instelling")
+
+    def test_default_portions_labels_exist_in_both_languages(self):
+        en = dictionary("en")
+        for key in ("system.portions_title", "system.portions_intro", "system.portions_label", "system.portions_save",
+                    "system.portions_saved", "system.portions_note_setting", "system.portions_note_env",
+                    "system.portions_note_off"):
+            self.assertTrue(key in NL, f"{key} ontbreekt in nl.js")
+            self.assertTrue(key in en, f"{key} ontbreekt in en.js")
+
     def test_scripts_load_in_order(self):
         self.assertLess(HTML.index("app.js"), HTML.index("onboarding.js"))
 

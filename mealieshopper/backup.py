@@ -106,6 +106,7 @@ PLAIN_SETTINGS = frozenset({
     *(info["model_setting"] for info in ai_review.PROVIDERS.values()),
     server_settings.SETTING_MCP,
     server_settings.SETTING_TOOLS_OFF,
+    portions.SETTING_DEFAULT,
 })
 MAX_SETTING_CHARS = 20_000
 

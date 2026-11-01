@@ -68,11 +68,22 @@ def _whole_portions(value: Any) -> int | None:
     return number if MIN_PORTIONS <= number <= MAX_PORTIONS else None
 
 
+def default_portions_source() -> tuple[int | None, str]:
+    """(standaard porties, bron): bron is "setting" (in de app), "env" (de omgeving) of "off" (geen standaard).
+
+    De instelling in de app gaat voor, ook als ze ongeldig is: dan staat de standaard uit (de omgeving telt niet).
+    """
+    setting = auth.get_setting(SETTING_DEFAULT).strip()
+    if setting:
+        number = _whole_portions(setting)
+        return (number, "setting") if number is not None else (None, "off")
+    number = _whole_portions((environ.get(ENV_DEFAULT) or "").strip())
+    return (number, "env") if number is not None else (None, "off")
+
+
 def default_portions() -> int | None:
     """De standaard porties: de instelling in de app, anders de omgeving. Leeg of ongeldig betekent: uit."""
-    setting = auth.get_setting(SETTING_DEFAULT).strip()
-    value = setting or (environ.get(ENV_DEFAULT) or "").strip()
-    return _whole_portions(value) if value else None
+    return default_portions_source()[0]
 
 
 def mark(entry_id: str, recipe_id: str, date: str, set_by: str) -> None:

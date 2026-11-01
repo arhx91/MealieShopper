@@ -130,3 +130,61 @@ async function submitFactoryReset(event) {
 $("#reset-open").addEventListener("click", openFactoryReset);
 $("#reset-cancel").addEventListener("click", closeFactoryReset);
 $("#reset-form").addEventListener("submit", submitFactoryReset);
+
+// Standaard porties (Instellingen > Systeem): voor hoeveel personen een maaltijd telt als niemand haar porties
+// instelde. De waarde in de app gaat voor op MEALIESHOPPER_DEFAULT_PORTIONS; een leeg veld zet de app-waarde uit.
+const defaultPortionsState = { settings: null };
+
+function renderDefaultPortions() {
+  const settings = defaultPortionsState.settings;
+  if (!settings) return;
+  const input = $("#default-portions");
+  const fromApp = settings.defaultPortionsSource === "setting";
+  if (document.activeElement !== input) input.value = fromApp ? String(settings.defaultPortions) : "";
+  input.placeholder = settings.defaultPortionsSource === "env" ? String(settings.defaultPortions) : "";
+  const note = {
+    setting: "system.portions_note_setting",
+    env: "system.portions_note_env",
+    off: "system.portions_note_off",
+  }[settings.defaultPortionsSource];
+  $("#default-portions-note").textContent = note ? t(note, { count: settings.defaultPortions }) : "";
+}
+
+async function loadDefaultPortions() {
+  try {
+    defaultPortionsState.settings = await jsonFetch("/api/server-settings");
+    renderDefaultPortions();
+  } catch (error) {
+    message("#default-portions-message", error.message);
+  }
+}
+
+async function saveDefaultPortions(event) {
+  const button = event.currentTarget;
+  const raw = $("#default-portions").value.trim();
+  const value = raw === "" ? null : Number(raw);
+  message("#default-portions-message", "");
+  if (value !== null && !(Number.isInteger(value) && value >= 1 && value <= 12)) {
+    message("#default-portions-message", t("system.portions_invalid"));
+    return;
+  }
+  button.disabled = true;
+  try {
+    defaultPortionsState.settings = await jsonFetch("/api/server-settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ defaultPortions: value }),
+    });
+    // Bewaarde weken rekenden met de oude standaard: haal ze opnieuw op zodra het weekmenu weer open gaat.
+    if (typeof mealPlanCache !== "undefined") mealPlanCache.clear();
+    renderDefaultPortions();
+    message("#default-portions-message", t("system.portions_saved"), "success");
+  } catch (error) {
+    message("#default-portions-message", error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("#default-portions-save").addEventListener("click", saveDefaultPortions);
+window.addEventListener("ms:languagechange", renderDefaultPortions);

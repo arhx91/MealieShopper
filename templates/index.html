@@ -1109,6 +1109,19 @@
         </div>
 
         <div id="settings-system" class="subpanel">
+        <div class="box" id="portions-box">
+          <h2 data-i18n="system.portions_title">Standaard porties</h2>
+          <p class="muted" data-i18n="system.portions_intro">Voor hoeveel personen je meestal kookt. Een maaltijd waarvan niemand de porties heeft ingesteld, rekent in het weekmenu en in het mandje met dit aantal. Mealie zelf verandert niet. Leeg betekent uit: dan geldt wat het recept opbrengt.</p>
+          <label class="field">
+            <span data-i18n="system.portions_label">Porties per maaltijd (1 tot en met 12)</span>
+            <input class="input" id="default-portions" type="number" min="1" max="12" step="1" inputmode="numeric">
+          </label>
+          <p class="muted" id="default-portions-note"></p>
+          <div class="security-actions">
+            <button class="button" type="button" id="default-portions-save" data-i18n="system.portions_save">Opslaan</button>
+          </div>
+          <div id="default-portions-message"></div>
+        </div>
         <div class="box">
           <h2 data-i18n="update.title">Updatecheck</h2>
           <p class="muted" data-i18n="update.intro">MealieShopper kijkt op GitHub of er een nieuwere versie is dan deze installatie. Er gaat geen informatie over jou, je gegevens of deze installatie mee.</p>

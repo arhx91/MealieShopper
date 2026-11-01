@@ -126,6 +126,7 @@ class EntrypointTest(unittest.TestCase):
                 "offers_sync_hour": 0,
                 "picnic_country_code": "DE",
                 "audit_retention_days": 14,
+                "default_portions": 4,
             }
         )
         self.assertEqual(
@@ -138,6 +139,7 @@ class EntrypointTest(unittest.TestCase):
                 "MEALIESHOPPER_OFFERS_SYNC_HOUR": "0",
                 "PICNIC_COUNTRY_CODE": "DE",
                 "MEALIESHOPPER_AUDIT_RETENTION_DAYS": "14",
+                "MEALIESHOPPER_DEFAULT_PORTIONS": "4",
             },
         )
 

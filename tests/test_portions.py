@@ -259,5 +259,62 @@ class WritePortionsTest(PortionsCase):
         self.assertIn("error", failed.get_json())
 
 
+class DefaultSettingTest(PortionsCase):
+    def settings(self):
+        response = self.client.get("/api/server-settings")
+        self.assertEqual(response.status_code, 200)
+        return response.get_json()
+
+    def test_payload_shows_default_and_source(self):
+        payload = self.settings()
+        self.assertIsNone(payload["defaultPortions"])
+        self.assertEqual(payload["defaultPortionsSource"], "off")
+        with mock.patch.dict(os.environ, {ENV_DEFAULT: "2"}):
+            payload = self.settings()
+            self.assertEqual((payload["defaultPortions"], payload["defaultPortionsSource"]), (2, "env"))
+            self.set_default(3)
+            payload = self.settings()
+            self.assertEqual((payload["defaultPortions"], payload["defaultPortionsSource"]), (3, "setting"))
+        with mock.patch.dict(os.environ, {ENV_DEFAULT: "twee"}):
+            self.set_default("")
+            payload = self.settings()
+            self.assertEqual((payload["defaultPortions"], payload["defaultPortionsSource"]), (None, "off"))
+
+    def test_source_helper_matches_default_portions(self):
+        self.assertEqual(portions.default_portions_source(), (None, "off"))
+        with mock.patch.dict(os.environ, {ENV_DEFAULT: "4"}):
+            self.assertEqual(portions.default_portions_source(), (4, "env"))
+            self.set_default(5)
+            self.assertEqual(portions.default_portions_source(), (5, "setting"))
+            self.assertEqual(portions.default_portions(), 5)
+
+    def test_put_sets_and_clears_default(self):
+        response = self.client.put("/api/server-settings", json={"defaultPortions": 4})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["defaultPortions"], 4)
+        self.assertEqual(response.get_json()["defaultPortionsSource"], "setting")
+        self.assertEqual(auth.get_setting(portions.SETTING_DEFAULT), "4")
+        self.assertEqual(portions.default_portions(), 4)
+
+        with mock.patch.dict(os.environ, {ENV_DEFAULT: "2"}):
+            cleared = self.client.put("/api/server-settings", json={"defaultPortions": None})
+            self.assertEqual(cleared.status_code, 200, cleared.get_json())
+            self.assertEqual(auth.get_setting(portions.SETTING_DEFAULT), "")
+            self.assertEqual((cleared.get_json()["defaultPortions"], cleared.get_json()["defaultPortionsSource"]), (2, "env"))
+
+    def test_put_rejects_out_of_range(self):
+        self.set_default(3)
+        for junk in (0, 13, -1, 2.5, "4", True, "", [4]):
+            response = self.client.put("/api/server-settings", json={"defaultPortions": junk})
+            self.assertEqual(response.status_code, 400, junk)
+            self.assertIn("error", response.get_json())
+        self.assertEqual(auth.get_setting(portions.SETTING_DEFAULT), "3", "niets opgeslagen")
+
+    def test_default_goes_along_in_a_backup(self):
+        from mealieshopper import backup
+
+        self.assertIn(portions.SETTING_DEFAULT, backup.PLAIN_SETTINGS)
+
+
 if __name__ == "__main__":
     unittest.main()
