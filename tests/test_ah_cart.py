@@ -111,6 +111,71 @@ class AssessPacksTest(unittest.TestCase):
         self.assertEqual(ah.packs_needed(8, None, "6 stuks"), ah.assess_packs(8, None, "6 stuks")[0])
 
 
+class PiecesInAPackTest(unittest.TestCase):
+    # "3 × 67 gram" zegt hoeveel stuks er in de verpakking zitten: een recept dat stuks vraagt, rekent daarmee.
+    def test_count_against_pieces_in_a_pack(self):
+        self.assertEqual(ah.assess_packs(4, "stuk", "3 × 67 gram"), (2, None))   # 4 worstjes, 3 per pak
+        self.assertEqual(ah.assess_packs(4, None, "3 x 67 gram"), (2, None))
+        self.assertEqual(ah.assess_packs(3, "stuks", "6 × 45 gram"), (1, None))
+        self.assertEqual(ah.assess_packs(2, None, "4 x 125 g"), (1, None))
+
+    def test_without_pieces_nothing_changes(self):
+        self.assertEqual(ah.assess_packs(2, None, "1 kg"), (1, None))            # "2 uien" bij gewicht
+        self.assertEqual(ah.assess_packs(750, "g", "4 x 125 g"), (2, None))      # gewicht tegen gewicht
+
+    def test_one_times_says_nothing_about_pieces(self):
+        self.assertEqual(ah.assess_packs(4, "stuk", "1 x 2 liter"), (1, None))
+        self.assertEqual(ah.assess_packs(2, None, "1 x 1 kg"), (1, None))
+
+    def test_many_packs_stay_doubtful(self):
+        self.assertEqual(ah.assess_packs(40, None, "3 x 67 g"), (14, "Groot aantal verpakkingen"))
+
+
+class ContainerUnitsTest(unittest.TestCase):
+    # "2 potten witte bonen": één product per pot. Hoe groot een pot in het recept is, weten we niet.
+    def test_sold_per_piece_is_certain(self):
+        self.assertEqual(ah.assess_packs(2, "potten", "per stuk"), (2, None))
+        self.assertEqual(ah.assess_packs(2, "blikjes", "1 stuk"), (2, None))
+
+    def test_sold_by_weight_is_doubtful(self):
+        packs, doubt = ah.assess_packs(2, "potten", "360 gram")
+        self.assertEqual(packs, 2)
+        self.assertIn("potten past niet bij de verpakking (360 gram)", doubt)
+        packs, doubt = ah.assess_packs(1, "fles", "750 ml")
+        self.assertEqual(packs, 1)
+        self.assertIsNotNone(doubt)
+
+    def test_unknown_pack_size_is_doubtful(self):
+        self.assertEqual(ah.assess_packs(3, "blik", None), (3, "Verpakkingsgrootte onbekend"))
+
+    def test_several_pieces_are_divided_but_checked(self):
+        # "6 stuks" is een sixpack blikjes, maar net zo goed een doos met 6 eieren: delen, en laten nakijken.
+        for args, packs in (((2, "blikjes", "6 stuks"), 1), ((8, "blikjes", "6 stuks"), 2), ((2, "doosjes", "10 stuks"), 1)):
+            got, doubt = ah.assess_packs(*args)
+            self.assertEqual(got, packs, args)
+            self.assertIn(f"{args[1]} bij {args[2]}: klopt het aantal?", doubt)
+
+    def test_unit_is_normalised(self):
+        self.assertEqual(ah.assess_packs(2, "Pot", "per stuk"), (2, None))
+        self.assertEqual(ah.assess_packs(2, "pot.", "per stuk"), (2, None))
+
+    def test_english_and_more_dutch_containers(self):
+        for unit in ("cans", "jar", "bottle", "kuipje", "bekers", "tube"):
+            self.assertEqual(ah.assess_packs(2, unit, "per stuk"), (2, None), unit)
+
+    def test_container_against_pieces_by_weight(self):
+        packs, doubt = ah.assess_packs(2, "zak", "6 x 30 g")
+        self.assertEqual(packs, 2)
+        self.assertIsNotNone(doubt)
+
+    def test_half_a_pot_is_one_product(self):
+        self.assertEqual(ah.assess_packs(0.5, "pot", "per stuk"), (1, None))
+
+    def test_other_units_are_untouched(self):
+        self.assertEqual(ah.assess_packs(2, "el", "500 ml"), (1, None))          # olie: een fles
+        self.assertEqual(ah.assess_packs(3, "teentje", "1 stuk"), (1, None))
+
+
 class AddToShoppingListTest(unittest.TestCase):
     def test_quantities_are_clamped_in_the_payload(self):
         ok = mock.Mock(ok=True)
