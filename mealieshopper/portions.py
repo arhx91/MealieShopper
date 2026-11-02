@@ -7,16 +7,21 @@ ingesteld als haar `recipeScale` niet 1.0 is (ook als iemand dat in Mealie zelf 
 niet te onderscheiden van "nooit aangeraakt".
 
 Niet ingesteld en een standaard ingesteld: de standaard geldt, alleen in MealieShopper (er gaat niets naar Mealie).
-Niet ingesteld en geen standaard: de opbrengst van het recept, zoals vroeger.
+Niet ingesteld en geen standaard: de opbrengst van het recept.
+
+Het weekmenu (mealie.get_meal_plan_with_recipes) rekent met de factor uit `effective`; schrijven gaat via
+mealie.set_meal_plan_scale, met het id zoals mealie._entry_id het controleert (een geheel getal).
 """
 from __future__ import annotations
 
 import logging
-import re
+import math
 import sqlite3
 from contextlib import closing
 from os import environ
 from typing import Any
+
+import requests
 
 from . import auth, mealie
 from .i18n import tr
@@ -28,9 +33,6 @@ ENV_DEFAULT = "MEALIESHOPPER_DEFAULT_PORTIONS"
 MIN_PORTIONS = 1
 MAX_PORTIONS = 12
 SCALE_TOLERANCE = 1e-6  # een recipeScale zo dicht bij 1.0 geldt als "niet ingesteld"
-# Het nummer van een maaltijd komt in het pad naar Mealie. Alleen letters, cijfers en "-" (een getal of een UUID):
-# ".." of "?" zou anders een ander adres bij Mealie raken, met het token van MealieShopper.
-ENTRY_ID_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meal_portions_set (
@@ -50,14 +52,18 @@ def _connect() -> sqlite3.Connection:
 
 
 def _positive(value: Any) -> float | None:
-    """Een getal groter dan 0 als float; anders None (ook voor True/False en tekst)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    """Een eindig getal groter dan 0 als float; anders None (ook voor True/False, tekst, NaN en oneindig)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         return None
     return float(value)
 
 
 def recipe_yield(recipe: dict[str, Any] | None) -> float | None:
-    """De opbrengst van een recept: `recipeServings`, anders `recipeYieldQuantity`; None als beide ontbreken of 0 zijn."""
+    """De opbrengst van een recept: `recipeServings`, anders `recipeYieldQuantity`; None als beide ontbreken of 0 zijn.
+
+    Bewust niet mealie._portions: die leest daarna ook het begin van de vrije tekst `recipeYield` ("12 koekjes" wordt
+    12 porties) en telt True als 1. Een opbrengst raden we niet; zo'n recept heeft hier geen porties.
+    """
     if not isinstance(recipe, dict):
         return None
     return _positive(recipe.get("recipeServings")) or _positive(recipe.get("recipeYieldQuantity"))
@@ -137,13 +143,13 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
     servings = recipe_yield(recipe)
     if "recipeScale" not in entry:
         return {"portions": None, "scale": 1.0, "source": "unsupported", "recipeServings": servings}
+    # De schaal lezen zoals upstream (mealie.recipe_scale): een raar getal, 0 of minder telt als 1.
+    scale = mealie.recipe_scale(entry)
     if servings is None:
         # Geen opbrengst: we raden geen porties en de standaard telt niet. Een factor die iemand in Mealie zette,
         # is wel bekend; het mandje volgt die, zoals de boodschappenlijst van Mealie zelf.
-        scale = _positive(entry.get("recipeScale")) or 1.0
         return {"portions": None, "scale": scale, "source": "unknown", "recipeServings": None}
 
-    scale = _positive(entry.get("recipeScale")) or 1.0
     if abs(scale - 1.0) >= SCALE_TOLERANCE or is_marked(str(entry.get("id") or ""), _recipe_id(entry, recipe)):
         return {"portions": round(scale * servings), "scale": scale, "source": "set", "recipeServings": servings}
 
@@ -153,21 +159,20 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
     return {"portions": round(servings), "scale": 1.0, "source": "recipe", "recipeServings": servings}
 
 
-def _checked_entry_id(entry_id: Any) -> str:
-    """Het nummer van een maaltijd als tekst; een ValueError als het geen getal of UUID kan zijn (vóór elke aanvraag)."""
-    text = "" if entry_id is None or isinstance(entry_id, bool) else str(entry_id)
-    if not ENTRY_ID_PATTERN.fullmatch(text):
-        raise ValueError(tr("Onbekende maaltijd.", "Unknown meal."))
-    return text
-
-
-def _writable(entry_id: str) -> tuple[dict[str, Any], dict[str, Any], float]:
+def _writable(entry_id: int) -> tuple[dict[str, Any], dict[str, Any], float]:
     """De maaltijd, de samenvatting van haar recept en de opbrengst; een ValueError als de porties niet te zetten zijn.
 
     De opbrengst komt uit de samenvatting van het recept in de maaltijd (RecipeSummary heeft recipeServings en
-    recipeYieldQuantity), dus er is geen tweede aanvraag voor het hele recept nodig.
+    recipeYieldQuantity), dus er is geen tweede aanvraag voor het hele recept nodig. Mealie onbereikbaar of een
+    weigering wordt een RuntimeError.
     """
-    entry = mealie.get_plan_entry(entry_id)
+    mealie.ensure_configured()
+    try:
+        entry = mealie._get_entry(entry_id)
+    except requests.RequestException as exc:
+        raise RuntimeError(tr(
+            f"Mealie is niet bereikbaar ({exc.__class__.__name__})", f"Mealie is not reachable ({exc.__class__.__name__})"
+        )) from exc
     recipe = entry.get("recipe") if isinstance(entry.get("recipe"), dict) else None
     if not recipe or not _recipe_id(entry, recipe):
         raise ValueError(tr("Deze maaltijd heeft geen recept.", "This meal has no recipe."))
@@ -192,7 +197,7 @@ def _after_write(updated: Any, entry: dict[str, Any], recipe: dict[str, Any]) ->
     return effective(updated, summary)
 
 
-def set_portions(entry_id: str, portions: int, set_by: str) -> dict[str, Any]:
+def set_portions(entry_id: Any, portions: int, set_by: str) -> dict[str, Any]:
     """Zet de porties van één maaltijd: recipeScale = porties / opbrengst in Mealie, en daarna de markering.
 
     De markering komt pas na een gelukte PUT; een fout van Mealie (RuntimeError) laat alles zoals het was.
@@ -202,19 +207,19 @@ def set_portions(entry_id: str, portions: int, set_by: str) -> dict[str, Any]:
             f"Kies {MIN_PORTIONS} tot en met {MAX_PORTIONS} porties.",
             f"Choose {MIN_PORTIONS} to {MAX_PORTIONS} portions.",
         ))
-    entry_id = _checked_entry_id(entry_id)
+    entry_id = mealie._entry_id(entry_id)  # een geheel getal, vóór elke aanvraag (het id komt in het pad)
     entry, recipe, servings = _writable(entry_id)
-    updated = mealie.set_plan_entry_scale(entry_id, portions / servings)
+    updated = mealie.set_meal_plan_scale(entry_id, portions / servings)
     mark(str(entry_id), _recipe_id(entry, recipe), str(entry.get("date") or ""), set_by)
     log.info("Porties van maaltijd %s op %d gezet door %s", entry_id, portions, set_by)
     return _after_write(updated, entry, recipe)
 
 
-def reset(entry_id: str, set_by: str) -> dict[str, Any]:
+def reset(entry_id: Any, set_by: str) -> dict[str, Any]:
     """Terug naar de standaard: recipeScale = 1.0 in Mealie en de markering weg. Zonder standaard geldt het recept."""
-    entry_id = _checked_entry_id(entry_id)
+    entry_id = mealie._entry_id(entry_id)  # een geheel getal, vóór elke aanvraag (het id komt in het pad)
     entry, recipe, _ = _writable(entry_id)
-    updated = mealie.set_plan_entry_scale(entry_id, 1.0)
+    updated = mealie.set_meal_plan_scale(entry_id, 1.0)
     unmark(str(entry_id))
     log.info("Porties van maaltijd %s teruggezet door %s", entry_id, set_by)
     return _after_write(updated, entry, recipe)

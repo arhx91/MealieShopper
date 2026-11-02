@@ -1,5 +1,8 @@
+import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,13 +41,6 @@ class MarkupTest(unittest.TestCase):
         for needle in ('id="password-form"', 'id="pw-current"', 'autocomplete="new-password"', 'id="mfa-panel"', 'id="credentials-list"'):
             self.assertIn(needle, security, needle)
 
-    def test_week_ingredients_come_from_the_server(self):
-        # De server telt gedeelde ingrediënten op; de browser hield vroeger alleen het eerste aantal.
-        self.assertNotIn("function aggregateIngredients", APP_JS)
-        self.assertIn("/api/mealplan/ingredients", APP_JS)
-        # De browser stuurt de maaltijden mee waaruit de dagkaarten zijn getekend.
-        self.assertRegex(APP_JS, r'jsonFetch\("/api/mealplan/ingredients", \{\s*method: "POST"')
-
     def test_system_tab_has_the_default_portions_field(self):
         system = HTML[HTML.index('id="settings-system"'):HTML.index('id="backup-box"')]
         field = re.search(r'<input[^>]*id="default-portions"[^>]*>', system)
@@ -71,27 +67,37 @@ class MarkupTest(unittest.TestCase):
         return match.group(0) if match else ""
 
     def test_meal_cards_have_a_portions_stepper(self):
-        render = self.function_body("renderMealPlan")
-        self.assertIn("mealPortionsHtml", render, "renderMealPlan tekent de knoppen voor de porties")
+        render = self.function_body("renderMeal")
+        self.assertIn("mealPortionsHtml(entry)", render, "renderMeal tekent de knoppen voor de porties")
+        # Upstreams "4 porties" (mealServings) alleen als er geen knoppen zijn: zo staat het aantal er één keer.
+        self.assertRegex(render, r'stepper \? "" : mealServings\(entry\)')
+        # De hele maaltijd is een knop (wijzigen); knoppen mogen daar niet in. De porties staan erna, in dezelfde groep.
+        self.assertLess(render.rindex("</button>"), render.index("meal-group__portions"))
         stepper = self.function_body("mealPortionsHtml")
-        for needle in ("data-portions-minus", "data-portions-plus", "aria-label", "data-portions-reset"):
+        for needle in ("data-portions-minus", "data-portions-plus", "aria-label", "data-portions-reset", "entry.servings"):
             self.assertIn(needle, stepper, needle)
-        for needle in ("data-portions-minus", "data-portions-plus", "aria-label"):
-            self.assertIn(needle, APP_JS, needle)
         # Alleen bij "set" een link terug naar de standaard; bij "unsupported" niets; zonder recept niets.
         self.assertIn('"unsupported"', stepper)
         self.assertIn('"unknown"', stepper)
-        self.assertIn("meal-portions", CSS)
+        for needle in (".meal-portions", ".meal-group__portions"):
+            self.assertIn(needle, CSS, needle)
 
-    def test_portion_changes_drop_the_week_cache(self):
-        # Review Focus 5: na een wijziging tonen kaart en lijst meteen de nieuwe aantallen, niet de bewaarde week.
+    def test_portion_changes_reload_the_week_like_a_plan_change(self):
+        # Na een wijziging tonen kaart en lijst meteen de nieuwe aantallen: zoals na een PATCH (refreshMealPlanAfterChange).
         for name in ("setMealPortions", "resetMealPortions"):
             body = self.function_body(name)
             self.assertTrue(body, f"{name} ontbreekt")
-            self.assertIn("mealPlanCache.delete", body, name)
+            self.assertIn("await refreshMealPlanAfterChange(", body, name)
             self.assertIn("/portions", body, name)
         self.assertIn('method: "PUT"', self.function_body("setMealPortions"))
         self.assertIn('method: "DELETE"', self.function_body("resetMealPortions"))
+        self.assertNotIn("reloadWeekAfterPortions", APP_JS, "geen eigen herlaadweg naast die van upstream")
+
+    def test_one_portion_change_at_a_time(self):
+        change = self.function_body("changeMealPortions")
+        self.assertIn("if (mealPortionsBusy) return;", change)
+        self.assertIn("mealPortionsBusy = true;", change)
+        self.assertLess(change.index("finally"), change.rindex("mealPortionsBusy = false;"))
 
     def test_portion_changes_drop_the_basket_check_list(self):
         # Na een gelukte wijziging klopt een open controlelijst van het mandje niet meer: die gaat weg, net als in
@@ -100,7 +106,7 @@ class MarkupTest(unittest.TestCase):
             body = self.function_body(name)
             self.assertIn("dropCartReview()", body, name)
             self.assertLess(body.index("jsonFetch"), body.index("dropCartReview()"), f"{name}: pas na een gelukte wijziging")
-            self.assertLess(body.index("dropCartReview()"), body.index("reloadWeekAfterPortions"), name)
+            self.assertLess(body.index("dropCartReview()"), body.index("refreshMealPlanAfterChange"), name)
         # Een andere week tonen (bladeren, sync, nieuwe standaard) maakt een voorbeeld dat nog liep ook ongeldig.
         load = self.function_body("loadMealPlan")
         self.assertIn("dropCartReview()", load)
@@ -125,11 +131,13 @@ class MarkupTest(unittest.TestCase):
 
     def test_portion_labels_exist_in_both_languages(self):
         en = dictionary("en")
-        for key in ("plan.portions", "plan.portions_set", "plan.portions_default", "plan.portions_recipe",
-                    "plan.portions_unknown", "plan.portions_reset"):
-            # "plan.portions" is een meervoudsvorm (tn): "1 portie", "4 porties".
-            self.assertTrue(key in NL or f"{key}.one" in NL, f"{key} ontbreekt in nl.js")
-            self.assertTrue(key in en or f"{key}.one" in en, f"{key} ontbreekt in en.js")
+        # Het aantal zelf is upstreams "plan.servings" (een meervoudsvorm: "1 portie", "4 porties").
+        for key in ("plan.servings.one", "plan.servings.other", "plan.portions_yield", "plan.portions_set", "plan.portions_default",
+                    "plan.portions_recipe", "plan.portions_unknown", "plan.portions_reset", "plan.portions_less", "plan.portions_more",
+                    "plan.portions_scale_mealie"):
+            self.assertTrue(key in NL, f"{key} ontbreekt in nl.js")
+            self.assertTrue(key in en, f"{key} ontbreekt in en.js")
+        self.assertFalse("plan.portions.other" in NL, "geen tweede tekst voor hetzelfde aantal")
         self.assertEqual(NL["plan.portions_set"], "ingesteld")
         self.assertEqual(NL["plan.portions_default"], "standaard")
         self.assertEqual(NL["plan.portions_recipe"], "recept")
@@ -138,14 +146,6 @@ class MarkupTest(unittest.TestCase):
         self.assertEqual(en["plan.portions_default"], "default")
         self.assertEqual(en["plan.portions_recipe"], "recipe")
         self.assertEqual(en["plan.portions_unknown"], "recipe without servings")
-
-    def test_unknown_yield_card_names_a_scale_from_mealie(self):
-        # Een recept zonder opbrengst met een factor uit Mealie: de knoppen blijven uit, de kaart noemt de factor.
-        body = self.function_body("mealPortionsHtml")
-        unknown = body[body.index('portions.source === "unknown"'):body.index("const count")]
-        self.assertIn('t("plan.portions_scale_mealie", { factor: I18N.formatNumber(portions.scale) })', unknown)
-        self.assertIn("portions.scale !== 1", unknown)
-        en = dictionary("en")
         self.assertEqual(NL["plan.portions_scale_mealie"], "\u00d7{factor} uit Mealie")
         self.assertEqual(en["plan.portions_scale_mealie"], "\u00d7{factor} from Mealie")
 
@@ -291,6 +291,93 @@ class StyleTest(unittest.TestCase):
     def test_checkbox_and_button_targets_are_large_enough(self):
         self.assertIn("width: 20px", re.search(r"\n\.check input \{(.*?)\n\}", CSS, re.S).group(1))
         self.assertIn("min-height: var(--control-height)", re.search(r"\n\.link-button \{(.*?)\n\}", CSS, re.S).group(1))
+
+
+def top_level(name: str) -> str:
+    """De broncode van een functie of constante op het hoogste niveau van app.js."""
+    match = re.search(rf"^(?:async\s+)?function\s+{name}\s*\(.*?^\}}", APP_JS, re.M | re.S) or re.search(
+        rf"^const {name} =.*?;$", APP_JS, re.M | re.S
+    )
+    if not match:
+        raise AssertionError(f"{name} niet gevonden in app.js")
+    return match.group(0)
+
+
+@unittest.skipUnless(shutil.which("node"), "Node is niet geïnstalleerd")
+class MealPortionsRenderTest(unittest.TestCase):
+    """De knoppen voor de porties op upstreams maaltijdkaart, echt getekend in Node met de Nederlandse teksten."""
+
+    PARTS = ("MDI_PENCIL_OUTLINE", "mdiIcon", "escapeHtml", "mealLabel", "mealName", "mealServings", "MIN_PORTIONS",
+             "MAX_PORTIONS", "PORTIONS_SOURCE_LABELS", "clampPortions", "mealPortionsHtml", "renderMeal")
+
+    def render(self, entries):
+        script = "\n".join([
+            "const I18N = { formatNumber: (v) => Number(v).toLocaleString('nl-NL'), messages: { nl: MESSAGES } };",
+            "function fill(text, params) { return text.replace(/\\{(\\w+)\\}/g, (m, k) => (k in params ? String(params[k]) : m)); }",
+            "function t(key, params = {}) { return fill(MESSAGES[key] ?? key, params); }",
+            "function tn(key, count, params = {}) { return t(`${key}.${Number(count) === 1 ? 'one' : 'other'}`, { count: I18N.formatNumber(count), ...params }); }",
+            *[top_level(name) for name in self.PARTS],
+            f"process.stdout.write(JSON.stringify({json.dumps(entries)}.map((e) => [mealPortionsHtml(e), renderMeal(e)])));",
+        ])
+        script = f"const MESSAGES = {json.dumps(NL)};\n" + script
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    @staticmethod
+    def entry(source, planned=4, base=4, scale=1.0, **extra):
+        return {"id": 7, "date": "2026-11-03", "entryType": "dinner", "recipeId": "r1",
+                "recipe": {"id": "r1", "name": "Pasta", "slug": "pasta"}, "recipeDetail": {"name": "Pasta", "recipeIngredient": [{}, {}]},
+                "servings": {"scale": scale, "base": base, "planned": planned, "source": source}, **extra}
+
+    @staticmethod
+    def text(html):
+        return " ".join(re.sub(r"<[^>]+>", " ", html).split())
+
+    def test_set_default_and_recipe(self):
+        (set_html, set_card), (default_html, _), (recipe_html, _) = self.render(
+            [self.entry("set", planned=6, scale=1.5), self.entry("default", planned=2, scale=0.5), self.entry("recipe")])
+        self.assertIn("\u2212 6 porties +", self.text(set_html))
+        self.assertIn("recept: 4 \u00b7 ingesteld standaard", self.text(set_html), "met de link terug naar de standaard")
+        self.assertIn('data-portions-reset="7"', set_html)
+        self.assertIn('data-portions-minus="7" data-portions-target="5"', set_html)
+        self.assertIn('data-portions-plus="7" data-portions-target="7"', set_html)
+        self.assertIn("recept: 4 \u00b7 standaard", self.text(default_html))
+        self.assertIn("meal-portions__value--default", default_html)
+        self.assertNotIn("data-portions-reset", default_html)
+        self.assertIn("recept: 4 \u00b7 recept", self.text(recipe_html))
+        self.assertNotIn("data-portions-reset", recipe_html)
+        # Het aantal staat één keer op de kaart: in de knoppen, niet ook in upstreams regel "6 porties · 2 ingrediënten".
+        self.assertEqual(self.text(set_card).count("6 porties"), 1, set_card)
+        self.assertIn("2 ingrediënten", self.text(set_card))
+        # De knoppen staan na de knop van de maaltijd, niet erin.
+        self.assertLess(set_card.index("</button>"), set_card.index('class="meal-portions"'))
+
+    def test_the_buttons_stop_at_one_and_twelve(self):
+        (low, _), (high, _), (odd, _) = self.render([self.entry("set", planned=1), self.entry("set", planned=12), self.entry("set", planned=4.5)])
+        self.assertRegex(low, r'data-portions-minus="7" data-portions-target="1"[^>]*disabled')
+        self.assertRegex(high, r'data-portions-plus="7" data-portions-target="12"[^>]*disabled')
+        # Een factor uit Mealie kan een half aantal geven; de knoppen schrijven altijd een geheel aantal.
+        self.assertIn('data-portions-minus="7" data-portions-target="4"', odd)
+        self.assertIn('data-portions-plus="7" data-portions-target="6"', odd)
+
+    def test_an_unknown_yield_has_disabled_buttons_and_names_a_scale(self):
+        (scaled, card), (plain, _) = self.render([self.entry("unknown", planned=None, base=None, scale=1.5),
+                                                 self.entry("unknown", planned=None, base=None, scale=1.0)])
+        self.assertEqual(scaled.count(" disabled"), 2)
+        self.assertIn("recept zonder porties", self.text(scaled))
+        self.assertIn("\u00d71,5 uit Mealie", self.text(scaled))
+        self.assertNotIn("uit Mealie", plain)
+        self.assertNotIn("data-portions-reset", scaled)
+        self.assertNotIn("\u00d71,5 \u00b7", self.text(card), "upstreams schaal staat er niet nog eens")
+
+    def test_no_stepper_on_unsupported_or_a_note(self):
+        note = {"id": 9, "date": "2026-11-04", "entryType": "dinner", "title": "Uit eten", "recipeId": None, "recipe": None,
+                "recipeDetail": None, "servings": None}
+        (unsupported, card), (empty, note_card) = self.render([self.entry("unsupported"), note])
+        self.assertEqual((unsupported, empty), ("", ""))
+        self.assertIn("4 porties \u00b7 2 ingrediënten", self.text(card), "upstreams regel blijft bij een oudere Mealie")
+        self.assertNotIn("meal-group", card + note_card)
 
 
 if __name__ == "__main__":
