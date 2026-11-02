@@ -753,6 +753,34 @@ class ToolsTest(McpTestCase):
             self.assertTrue(self.call(self.token, "remove_planned_meal", {})["isError"])
         delete.assert_not_called()
 
+    def test_remove_planned_meal_drops_the_marker_only_when_mealie_deleted_it(self):
+        # Hetzelfde recept op een hergebruikt nummer mag de porties van de verwijderde maaltijd niet terugkrijgen.
+        portions.mark("7", "r1", "2026-11-03", "mcp:admin")
+        with mock.patch.object(mealie, "delete_meal_plan_entry", side_effect=RuntimeError("Mealie kon de maaltijd niet verwijderen (500)")):
+            self.assertTrue(self.call(self.token, "remove_planned_meal", {"id": 7})["isError"])
+        self.assertTrue(portions.is_marked("7", "r1"), "mislukt: de markering blijft")
+        with mock.patch.object(mealie, "delete_meal_plan_entry", return_value={"id": 7, "deleted": True}):
+            self.assertEqual(self.data("remove_planned_meal", {"id": "7"}), {"id": 7, "deleted": True})
+        self.assertFalse(portions.is_marked("7", "r1"))
+
+    def test_set_meal_portions_rounds_like_get_week_menu(self):
+        # Eén regel voor afronden: wat Mealie na het schrijven teruggeeft (hier 4 x 0,625), op één decimaal zoals
+        # servings.planned in get_week_menu; geen 2 (Python round) of 3 (Math.round op de kaart).
+        entry = {"id": 7, "date": "2026-11-03", "entryType": "dinner", "recipeId": "r1", "recipeScale": 1.0,
+                 "recipe": {"id": "r1", "slug": "pasta", "name": "Pasta", "recipeServings": 4, "recipeYieldQuantity": 0}}
+        with mock.patch.object(mealie, "ensure_configured"), \
+                mock.patch.object(mealie, "_get_entry", return_value=entry), \
+                mock.patch.object(mealie, "set_meal_plan_scale", return_value={**entry, "recipeScale": 0.625}):
+            data = self.data("set_meal_portions", {"entry_id": 7, "portions": 3})
+        self.assertEqual(data, {"id": 7, "servings": 2.5, "portionsSource": "set"})
+        week = {**entry, "recipeScale": 0.625,
+                "servings": mealie._servings(entry["recipe"], 0.625, portions.effective({**entry, "recipeScale": 0.625}, entry["recipe"]))}
+        with mock.patch.object(mealie, "get_meal_plan_with_recipes", return_value=[week]), \
+                mock.patch.object(mealie, "mealie_url", return_value="https://mealie.example"), \
+                mock.patch.object(mealie, "group_slug", return_value="home"):
+            meals = self.data("get_week_menu", {"start_date": "2026-11-02", "days": 7})["meals"]
+        self.assertEqual(meals[0]["servings"], data["servings"])
+
     def test_week_menu_says_where_the_servings_come_from(self):
         # De vorm van upstream (id, servings = de geplande porties), met portionsSource erbij.
         def meal(entry_id, source, planned, recipe=True):

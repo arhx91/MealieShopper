@@ -99,6 +99,16 @@ class WeekMenuTextTest(unittest.TestCase):
         self.assertIn('tn("plan.servings", servings.planned)', servings)
         self.assertIn('t("plan.scale"', servings)
 
+    def test_the_stepper_uses_the_planned_number_of_the_server(self):
+        # Eén regel voor afronden (die van mealie._servings): de kaart rondt zelf niet af. Min en plus gaan naar het
+        # hele getal onder en boven het getal (2,5 geeft 2 en 3; een heel getal n geeft n-1 en n+1).
+        stepper = function_source("mealPortionsHtml")
+        self.assertNotIn("Math.round", stepper)
+        self.assertIn("const count = Number(servings.planned) || 0;", stepper)
+        self.assertIn("clampPortions(Math.ceil(count) - 1)", stepper)
+        self.assertIn("clampPortions(Math.floor(count) + 1)", stepper)
+        self.assertIn('tn("plan.servings", count)', stepper, "tn toont het getal met de komma van de taal")
+
     def test_the_basket_uses_the_added_up_list(self):
         self.assertIn("const ingredients = aggregateIngredients(state.entries);", function_source("addToCart"))
 

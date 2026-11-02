@@ -23,7 +23,9 @@ mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 def create_app() -> Flask:
     app = Flask(__name__, template_folder="../templates", static_folder="../static")
-    app.config["ASSET_VERSION"] = environ.get("MEALIESHOPPER_ASSET_VERSION", "20261101-62")
+    # De fork verhoogt dit (achtervoegsel -forkN) zodra zijn scripts of stijlen anders zijn dan die van upstream, zodat een
+    # browser met de bestanden van upstream onder hetzelfde adres ze opnieuw ophaalt.
+    app.config["ASSET_VERSION"] = environ.get("MEALIESHOPPER_ASSET_VERSION", "20261102-62-fork1")
     # De receptvoorstellen bij Aanbiedingen staan standaard verborgen zolang de koppelingen niet goed genoeg zijn.
     app.config["OFFERS_RECIPES"] = environ.get("MEALIESHOPPER_OFFERS_RECIPES", "false").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -160,11 +162,18 @@ def create_app() -> Flask:
     @app.patch("/api/mealplan/<int:entry_id>")
     def mealplan_update(entry_id: int):
         body = request.get_json(silent=True) or {}
-        return mealie_action(lambda: mealie.update_meal_plan_entry(entry_id, body), tr("Wijzigen mislukt", "Changing failed"))
+        # Pas na een gelukte wijziging: een ander recept laat de markering van de porties los (zie portions.py).
+        return mealie_action(
+            lambda: portions.forget_other_recipe(entry_id, mealie.update_meal_plan_entry(entry_id, body)),
+            tr("Wijzigen mislukt", "Changing failed"),
+        )
 
     @app.delete("/api/mealplan/<int:entry_id>")
     def mealplan_delete(entry_id: int):
-        return mealie_action(lambda: mealie.delete_meal_plan_entry(entry_id), tr("Verwijderen mislukt", "Removing failed"))
+        # Pas na een gelukte verwijdering gaat ook de markering van de porties weg; mislukt het, dan blijft ze.
+        return mealie_action(
+            lambda: portions.forget_deleted(mealie.delete_meal_plan_entry(entry_id)), tr("Verwijderen mislukt", "Removing failed")
+        )
 
     @app.get("/api/mealie/recipes")
     def mealie_recipes_search():

@@ -1,6 +1,10 @@
+import importlib.util
 import os
+import re
+import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ["PASSKEY_AUTH_ENABLED"] = "false"
@@ -37,6 +41,14 @@ def plan_entry(scale=1.0, recipe_id="r1", entry_id="7", date="2026-11-03"):
     if scale is not None:
         entry["recipeScale"] = scale
     return entry
+
+
+def _card_renderer():
+    """De kaarttekenaar van tests/test_onboarding_ui.py (Node), los geladen zodat die tests hier niet nog eens draaien."""
+    spec = importlib.util.spec_from_file_location("_onboarding_ui_cards", Path(__file__).with_name("test_onboarding_ui.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.MealPortionsRenderTest("test_set_default_and_recipe")
 
 
 class PortionsCase(unittest.TestCase):
@@ -138,6 +150,18 @@ class EffectiveTest(PortionsCase):
         result = portions.effective(plan_entry(), {"recipeServings": 3})
         self.assertEqual(result["portions"], 2)
         self.assertTrue(abs(result["scale"] - 2 / 3) < 1e-9)
+
+    def test_portions_follow_upstreams_planned_one_decimal_and_whole_as_int(self):
+        # Eén regel voor afronden, die van upstream (mealie._servings: opbrengst x schaal op één decimaal). Een schaal uit
+        # Mealie kan een half aantal geven; dat blijft 2,5 en wordt niet 2 (Python) of 3 (de kaart).
+        half = portions.effective(plan_entry(scale=0.625), {"recipeServings": 4})
+        self.assertEqual((half["portions"], half["source"]), (2.5, "set"))
+        self.assertEqual(portions.effective(plan_entry(), {"recipeServings": 0, "recipeYieldQuantity": 2.5})["portions"], 2.5)
+        self.assertEqual(portions.effective(plan_entry(scale=1 / 3), {"recipeServings": 4})["portions"], 1.3)
+        for result in (portions.effective(plan_entry(scale=1.5), {"recipeServings": 4}),
+                       portions.effective(plan_entry(), {"recipeServings": 4})):
+            self.assertEqual(result["portions"], int(result["portions"]))
+            self.assertIsInstance(result["portions"], int, "een heel aantal is een int, geen 6.0")
 
     def test_default_reads_setting_before_env_and_rejects_junk(self):
         with mock.patch.dict(os.environ, {ENV_DEFAULT: "2"}):
@@ -367,6 +391,74 @@ class WritePortionsTest(PortionsCase):
         self.assertFalse(portions.is_marked("7", "r1"))
 
 
+class StaleMarkerTest(PortionsCase):
+    """Een maaltijd die weg is of een ander recept kreeg, verliest haar markering; een mislukte poging houdt haar."""
+
+    RECIPE = "6f1c8d1e-2b3a-4c5d-8e9f-0a1b2c3d4e5f"  # Mealie geeft een recept-id als UUID
+    OTHER = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    # Dezelfde nabootsing van Mealie als hierboven, zonder de tests van WritePortionsTest te erven.
+    mock_mealie = WritePortionsTest.mock_mealie
+    put_body = WritePortionsTest.put_body
+
+    def setUp(self):
+        super().setUp()
+        auth.set_secret(mealie.SECRET_URL, URL)
+        auth.set_secret(mealie.SECRET_TOKEN, "token")
+        portions.mark("7", self.RECIPE, "2026-11-03", "user:helmer")
+
+    def entry(self):
+        entry = mealie_entry(scale=1.0, servings=4)
+        entry["recipeId"] = entry["recipe"]["id"] = self.RECIPE
+        return entry
+
+    def delete_answer(self, status):
+        return mock.patch.object(mealie.requests, "delete", return_value=response(status=status, body={}, text="kapot"))
+
+    def test_a_deleted_meal_loses_its_marker(self):
+        # Zonder dit vindt hetzelfde recept op een hergebruikt nummer de oude markering terug (en de oude porties).
+        with self.delete_answer(200):
+            answer = self.client.delete("/api/mealplan/7")
+        self.assertEqual(answer.status_code, 200, answer.get_json())
+        self.assertFalse(portions.is_marked("7", self.RECIPE))
+
+    def test_a_failed_delete_keeps_the_marker(self):
+        with self.delete_answer(500), self.assertLogs(self.client.application.logger, "WARNING"), \
+                self.assertLogs(mealie.log, "WARNING"):
+            answer = self.client.delete("/api/mealplan/7")
+        self.assertEqual(answer.status_code, 424)
+        self.assertTrue(portions.is_marked("7", self.RECIPE))
+
+    def test_another_recipe_removes_the_marker_and_back_does_not_bring_it_back(self):
+        self.set_default(2)
+        self.mock_mealie(self.entry())
+        answer = self.client.patch("/api/mealplan/7", json={"recipeId": self.OTHER})
+        self.assertEqual(answer.status_code, 200, answer.get_json())
+        self.assertEqual(self.put_body()["recipeScale"], 1.0, "upstream zet de schaal terug op 1")
+        self.assertFalse(portions.is_marked("7", self.RECIPE))
+        # Terug naar het eerste recept: de standaard geldt, niet de porties van vroeger.
+        self.assertEqual(portions.effective(self.entry(), {"recipeServings": 4})["source"], "default")
+
+    def test_a_note_instead_of_the_recipe_removes_the_marker(self):
+        self.mock_mealie(self.entry())
+        answer = self.client.patch("/api/mealplan/7", json={"title": "Uit eten", "recipeId": None})
+        self.assertEqual(answer.status_code, 200, answer.get_json())
+        self.assertFalse(portions.is_marked("7", self.RECIPE))
+
+    def test_the_same_recipe_or_another_day_keeps_the_marker(self):
+        self.mock_mealie(self.entry())
+        for body in ({"date": "2026-11-05"}, {"recipeId": self.RECIPE.upper(), "entryType": "lunch"}, {"title": "met sla"}):
+            answer = self.client.patch("/api/mealplan/7", json=body)
+            self.assertEqual(answer.status_code, 200, answer.get_json())
+            self.assertTrue(portions.is_marked("7", self.RECIPE), body)
+
+    def test_a_failed_recipe_change_keeps_the_marker(self):
+        self.mock_mealie(self.entry(), put_status=500)
+        with self.assertLogs(self.client.application.logger, "WARNING"), self.assertLogs(mealie.log, "WARNING"):
+            answer = self.client.patch("/api/mealplan/7", json={"recipeId": self.OTHER})
+        self.assertEqual(answer.status_code, 424)
+        self.assertTrue(portions.is_marked("7", self.RECIPE))
+
+
 SPAGHETTI = {"quantity": 400, "unit": {"name": "gram", "abbreviation": "g", "useAbbreviation": True},
              "food": {"name": "spaghetti"}, "note": "", "display": "400 g spaghetti"}
 
@@ -379,9 +471,9 @@ class WeekServingsTest(PortionsCase):
         auth.set_secret(mealie.SECRET_URL, URL)
         auth.set_secret(mealie.SECRET_TOKEN, "token")
 
-    def week(self, *items, servings=4, detail_ok=True):
+    def week(self, *items, servings=4, detail_ok=True, **recipe_extra):
         recipe = {"id": "r1", "slug": "pasta", "name": "Pasta", "recipeServings": servings, "recipeYieldQuantity": 0,
-                  "recipeIngredient": [dict(SPAGHETTI)]}
+                  "recipeIngredient": [dict(SPAGHETTI)], **recipe_extra}
 
         def get(url, **kwargs):
             if url.endswith("/mealplans"):
@@ -397,9 +489,10 @@ class WeekServingsTest(PortionsCase):
         return answer.get_json()
 
     @staticmethod
-    def entry(entry_id=1, scale=1.0, servings=4):
+    def entry(entry_id=1, scale=1.0, servings=4, **recipe_extra):
         item = {"id": entry_id, "date": "2026-11-03", "entryType": "dinner", "recipeId": "r1",
-                "recipe": {"id": "r1", "slug": "pasta", "name": "Pasta", "recipeServings": servings, "recipeYieldQuantity": 0}}
+                "recipe": {"id": "r1", "slug": "pasta", "name": "Pasta", "recipeServings": servings, "recipeYieldQuantity": 0,
+                           **recipe_extra}}
         if scale is not None:
             item["recipeScale"] = scale
         return item
@@ -442,6 +535,33 @@ class WeekServingsTest(PortionsCase):
         entry = self.week(self.entry(scale=1.5, servings=0), servings=0)[0]
         self.assertEqual(entry["servings"], {"scale": 1.5, "base": None, "planned": None, "source": "unknown"})
         self.assertEqual(self.quantity(entry), 600)
+
+    def free_text_week(self):
+        """Een recept met alleen de vrije tekst "4 personen": geen recipeServings, geen recipeYieldQuantity."""
+        self.set_default(2)
+        return self.week(self.entry(servings=0, recipeYield="4 personen"), servings=0, recipeYield="4 personen")
+
+    def test_a_free_text_yield_is_unknown_and_has_no_servings(self):
+        # Alleen recipeServings, dan recipeYieldQuantity; de vrije tekst `recipeYield` lezen we niet. Dan zegt `servings`
+        # hetzelfde als `source`: geen porties (geen "4" naast "unknown"). De factor uit Mealie blijft staan.
+        entry = self.free_text_week()[0]
+        self.assertEqual(entry["servings"], {"scale": 1.0, "base": None, "planned": None, "source": "unknown"})
+        self.assertEqual(self.quantity(entry), 400)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is niet geïnstalleerd")
+    def test_the_card_of_a_free_text_yield_says_it_has_no_portions(self):
+        # De echte kaart (static/app.js in Node), getekend met wat GET /api/mealplan hierboven gaf.
+        entry = self.free_text_week()[0]
+        stepper, card = _card_renderer().render([entry])[0]
+        text = " ".join(re.sub(r"<[^>]+>", " ", stepper + card).split())
+        self.assertIn("recept zonder porties", text)
+        self.assertNotIn("4 porties", text)
+
+    def test_a_half_portion_from_mealie_is_the_same_number_everywhere(self):
+        # Een schaal die iemand in Mealie zette (4 x 0,625): servings.planned is precies wat portions.effective zegt.
+        entry = self.week(self.entry(scale=0.625))[0]
+        self.assertEqual(entry["servings"], {"scale": 0.625, "base": 4, "planned": 2.5, "source": "set"})
+        self.assertEqual(portions.effective(self.entry(scale=0.625), self.entry()["recipe"])["portions"], 2.5)
 
     def test_a_mealie_without_recipe_scale_is_unsupported(self):
         self.set_default(2)

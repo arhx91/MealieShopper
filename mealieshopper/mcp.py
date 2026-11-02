@@ -138,7 +138,8 @@ def tool_plan_meal(args: dict[str, Any]) -> Any:
 def tool_remove_planned_meal(args: dict[str, Any]) -> Any:
     if args.get("id") in (None, ""):
         raise ToolError("Geef het id van de maaltijd op (zie get_week_menu)")
-    return mealie.delete_meal_plan_entry(args.get("id"))
+    # Pas na een gelukte verwijdering gaat ook de markering van de porties weg (zie portions.forget_deleted).
+    return portions.forget_deleted(mealie.delete_meal_plan_entry(args.get("id")))
 
 
 def tool_search_recipes(args: dict[str, Any]) -> Any:

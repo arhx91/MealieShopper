@@ -114,6 +114,27 @@ def unmark(entry_id: str) -> None:
         conn.execute("DELETE FROM meal_portions_set WHERE entry_id = ?", (str(entry_id),))
 
 
+def forget_deleted(result: dict[str, Any]) -> dict[str, Any]:
+    """Na een gelukte mealie.delete_meal_plan_entry: de markering van die maaltijd weg, en het antwoord ongewijzigd terug.
+
+    Anders vindt hetzelfde recept op een nummer dat Mealie misschien hergebruikt de oude markering terug.
+    """
+    unmark(str(result["id"]))
+    return result
+
+
+def forget_other_recipe(entry_id: int, updated: Any) -> Any:
+    """Na een gelukte mealie.update_meal_plan_entry: hoort de markering bij een ander recept dan nu, dan weg ermee.
+
+    Een ander recept (of een notitie) zet update_meal_plan_entry op recipeScale 1.0; de bewust gekozen porties golden
+    voor het oude recept. Zonder dit komt die markering terug als iemand later weer het eerste recept kiest. Een andere
+    dag of hetzelfde recept houdt de markering. Zegt Mealie in het antwoord niets over het recept, dan blijft alles staan.
+    """
+    if isinstance(updated, dict) and "recipeId" in updated and not is_marked(str(entry_id), str(updated["recipeId"] or "")):
+        unmark(str(entry_id))
+    return updated
+
+
 def is_marked(entry_id: str, recipe_id: str) -> bool:
     """Waar alleen als er een markering is voor deze maaltijd met hetzelfde recept.
 
@@ -138,7 +159,8 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
 
     `source` is "set" (bewust ingesteld), "default" (de standaard), "recipe" (de opbrengst van het recept),
     "unknown" (een recept zonder opbrengst: geen porties, alleen een factor die in Mealie zelf staat) of "unsupported" (een Mealie zonder `recipeScale`:
-    niet schalen). De porties zijn afgerond op een geheel getal; de factor blijft een decimaal getal.
+    niet schalen). De porties zijn afgerond zoals upstreams `servings.planned` (mealie.planned_portions: één decimaal,
+    een int als het heel is); de factor wordt niet afgerond.
     """
     servings = recipe_yield(recipe)
     if "recipeScale" not in entry:
@@ -151,12 +173,12 @@ def effective(entry: dict[str, Any], recipe: dict[str, Any] | None) -> dict[str,
         return {"portions": None, "scale": scale, "source": "unknown", "recipeServings": None}
 
     if abs(scale - 1.0) >= SCALE_TOLERANCE or is_marked(str(entry.get("id") or ""), _recipe_id(entry, recipe)):
-        return {"portions": round(scale * servings), "scale": scale, "source": "set", "recipeServings": servings}
+        return {"portions": mealie.planned_portions(servings, scale), "scale": scale, "source": "set", "recipeServings": servings}
 
     default = default_portions()
     if default is not None:
         return {"portions": default, "scale": default / servings, "source": "default", "recipeServings": servings}
-    return {"portions": round(servings), "scale": 1.0, "source": "recipe", "recipeServings": servings}
+    return {"portions": mealie.planned_portions(servings, 1.0), "scale": 1.0, "source": "recipe", "recipeServings": servings}
 
 
 def _writable(entry_id: int) -> tuple[dict[str, Any], dict[str, Any], float]:

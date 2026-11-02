@@ -640,9 +640,11 @@ function mealPortionsHtml(entry) {
         : ""
     }`;
   }
-  // Een geheel aantal: een factor uit Mealie kan 4,5 geven, en de knoppen schrijven 1 tot en met 12 hele porties.
-  // Het getal kan buiten 1-12 liggen als iemand in Mealie zelf een factor zette; we tonen het zoals het is.
-  const count = Math.round(Number(servings.planned) || 0);
+  // Het getal is `planned` van de server (mealie.planned_portions, één decimaal): de kaart rondt zelf niet af, dus een
+  // factor uit Mealie toont "2,5 porties", net als get_week_menu. De knoppen schrijven 1 tot en met 12 hele porties: min
+  // naar het hele getal eronder, plus naar het hele getal erboven (2,5 geeft 2 en 3; 4 geeft 3 en 5). Het getal kan
+  // buiten 1-12 liggen als iemand in Mealie zelf een factor zette; we tonen het zoals het is.
+  const count = Number(servings.planned) || 0;
   const label = PORTIONS_SOURCE_LABELS[servings.source];
   const recipeLine = [
     servings.base ? t("plan.portions_yield", { count: I18N.formatNumber(servings.base) }) : "",
@@ -650,9 +652,9 @@ function mealPortionsHtml(entry) {
   ].filter(Boolean).join(" \u00b7 ");
   return `
     <div class="meal-portions">
-      ${button("data-portions-minus", t("plan.portions_less"), "\u2212", clampPortions(count - 1), count <= MIN_PORTIONS)}
+      ${button("data-portions-minus", t("plan.portions_less"), "\u2212", clampPortions(Math.ceil(count) - 1), count <= MIN_PORTIONS)}
       <span class="meal-portions__value${servings.source === "default" ? " meal-portions__value--default" : ""}">${escapeHtml(tn("plan.servings", count))}</span>
-      ${button("data-portions-plus", t("plan.portions_more"), "+", clampPortions(count + 1), count >= MAX_PORTIONS)}
+      ${button("data-portions-plus", t("plan.portions_more"), "+", clampPortions(Math.floor(count) + 1), count >= MAX_PORTIONS)}
     </div>
     <small class="meal-portions__source">${escapeHtml(recipeLine)}${
       servings.source === "set"

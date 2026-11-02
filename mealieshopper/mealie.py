@@ -552,20 +552,31 @@ def recipe_scale(entry: dict[str, Any]) -> float:
     return float(value)
 
 
+def planned_portions(base: float, scale: float) -> int | float:
+    """De geplande porties: opbrengst x schaal op één decimaal, een int als het een heel getal is (2,5 blijft 2,5).
+
+    De enige afronding van porties: het weekmenu (`servings.planned`), portions.effective en daarmee de kaart,
+    get_week_menu en set_meal_portions rekenen er allemaal mee.
+    """
+    planned = round(base * scale, 1)
+    return int(planned) if float(planned).is_integer() else planned
+
+
 def _servings(recipe: dict[str, Any], scale: float, effective: dict[str, Any] | None = None) -> dict[str, Any]:
     """Porties van een maaltijd: `base` uit het recept (None als Mealie het niet weet), `planned` = `base` x `scale`.
 
-    Met `effective` (portions.effective) ook `source`: set, default, recipe, unknown of unsupported. Bij de standaard is
-    `planned` precies de standaard, ook als `base` x (standaard / opbrengst) een afrondingsfout zou geven.
+    Met `effective` (portions.effective) ook `source`: set, default, recipe, unknown of unsupported, en dan is `planned`
+    precies de porties van `effective` (bij de standaard dus de standaard, zonder afrondingsfout). Bij "unknown" zijn
+    `base` en `planned` None: alleen `recipeServings` of `recipeYieldQuantity` telt als opbrengst, de vrije tekst
+    `recipeYield` ("4 personen") niet. `_portions` leest die tekst wel, voor de receptkaarten; die beschrijven het
+    recept, niet de geplande maaltijd.
     """
-    base = _portions(recipe)
-    planned = round(base * scale, 1) if base else None
-    if planned is not None and float(planned).is_integer():
-        planned = int(planned)
+    base = None if effective and effective["source"] == "unknown" else _portions(recipe)
+    planned = planned_portions(base, scale) if base else None
     servings: dict[str, Any] = {"scale": scale, "base": base, "planned": planned}
     if effective:
         servings["source"] = effective["source"]
-        if effective["source"] == "default":
+        if effective["portions"] is not None:
             servings["planned"] = effective["portions"]
     return servings
 

@@ -357,9 +357,29 @@ class MealPortionsRenderTest(unittest.TestCase):
         (low, _), (high, _), (odd, _) = self.render([self.entry("set", planned=1), self.entry("set", planned=12), self.entry("set", planned=4.5)])
         self.assertRegex(low, r'data-portions-minus="7" data-portions-target="1"[^>]*disabled')
         self.assertRegex(high, r'data-portions-plus="7" data-portions-target="12"[^>]*disabled')
-        # Een factor uit Mealie kan een half aantal geven; de knoppen schrijven altijd een geheel aantal.
+        # Een factor uit Mealie kan een half aantal geven; de knoppen schrijven altijd een geheel aantal:
+        # min gaat naar het hele getal eronder, plus naar het hele getal erboven.
         self.assertIn('data-portions-minus="7" data-portions-target="4"', odd)
-        self.assertIn('data-portions-plus="7" data-portions-target="6"', odd)
+        self.assertIn('data-portions-plus="7" data-portions-target="5"', odd)
+
+    def test_a_half_portion_is_shown_as_is_and_steps_to_the_whole_numbers_around_it(self):
+        # Het getal is servings.planned van de server (één decimaal), met de Nederlandse komma; niet afgerond tot 3.
+        (half, card), (low, _), (high, _), (tiny, _), (big, _) = self.render(
+            [self.entry("set", planned=2.5, scale=0.625), self.entry("set", planned=1.5), self.entry("set", planned=11.5),
+             self.entry("set", planned=0.5), self.entry("set", planned=13)])
+        self.assertIn("\u2212 2,5 porties +", self.text(half))
+        self.assertNotIn("3 porties", self.text(half + card))
+        self.assertRegex(half, r'data-portions-minus="7" data-portions-target="2"(?![^>]*disabled)')
+        self.assertRegex(half, r'data-portions-plus="7" data-portions-target="3"(?![^>]*disabled)')
+        # 1,5: min mag nog (naar 1); 11,5: plus mag nog (naar 12).
+        self.assertRegex(low, r'data-portions-minus="7" data-portions-target="1"(?![^>]*disabled)')
+        self.assertRegex(high, r'data-portions-plus="7" data-portions-target="12"(?![^>]*disabled)')
+        # Buiten 1-12 (een factor in Mealie zelf): het getal zoals het is, de knop die verder weg gaat staat uit.
+        self.assertIn("0,5 porties", self.text(tiny))
+        self.assertRegex(tiny, r'data-portions-minus="7" data-portions-target="1"[^>]*disabled')
+        self.assertRegex(tiny, r'data-portions-plus="7" data-portions-target="1"(?![^>]*disabled)')
+        self.assertRegex(big, r'data-portions-minus="7" data-portions-target="12"(?![^>]*disabled)')
+        self.assertRegex(big, r'data-portions-plus="7" data-portions-target="12"[^>]*disabled')
 
     def test_an_unknown_yield_has_disabled_buttons_and_names_a_scale(self):
         (scaled, card), (plain, _) = self.render([self.entry("unknown", planned=None, base=None, scale=1.5),
