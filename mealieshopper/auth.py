@@ -1,29 +1,50 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
-import json
+import logging
 import os
 import secrets
 import sqlite3
 import time
-from contextlib import closing
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import jwt
 from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, jsonify, make_response, request
+from quart import Quart, g, jsonify, make_response, request
 from webauthn import verify_authentication_response, verify_registration_response
 from webauthn.helpers.cose import COSEAlgorithmIdentifier
 
+from . import readers, request_body, telemetry
 from .i18n import tr
 
 OWNER_ID = "owner"  # de eerste gebruiker is de beheerder; alle anderen zijn gewone gebruikers
 SESSION_COOKIE_NAME = "ms_session"
-SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
+SESSION_DAYS_DEFAULT = 90
+# Een sessie (cookie) die ouder is dan dit krijgt bij de eerstvolgende aanvraag een verse cookie: wie de app gebruikt blijft
+# ingelogd, wie `MEALIESHOPPER_SESSION_DAYS` dagen wegblijft logt opnieuw in.
+SESSION_RENEW_AFTER_SECONDS = 24 * 60 * 60
+# Hoe lang een sessie hooguit verlengd wordt, gerekend vanaf de inlog (`auth_time`): daarna log je hoe dan ook opnieuw in.
+SESSION_ABSOLUTE_SECONDS = 365 * 24 * 60 * 60
 _INITIALIZED = False
+BUSY_SECONDS: float = 30.0  # zo lang wacht een verbinding op het slot van een andere schrijver (sqlite3 zelf: 5 s)
+log: logging.Logger = logging.getLogger(__name__)
+
+# De schema's die dit proces al aanmaakte, per database-pad: elke module maakt haar tabellen, indexen en migraties een keer per
+# proces, niet bij elke verbinding. `forget_runtime_state` wist het, zodat een nieuwe database na een fabrieksreset het schema
+# weer krijgt. Twee coroutines die tegelijk de eerste zijn, draaien de opzet allebei: die is `IF NOT EXISTS` en de migraties
+# controleren zelf nog eens achter een schrijfslot.
+_SCHEMAS_READY: set[tuple[str, str]] = set()
+# Wat andere modules uit de gegevens afleiden en in het geheugen bewaren (de catalogus van de prijzen, de lijst van /api/offers),
+# als functie die het wist. `forget_cached_data` roept ze aan na het terugzetten van een back-up en na een fabrieksreset.
+_DATA_CACHES: list[Callable[[], None]] = []
 
 
 def auth_enabled() -> bool:
@@ -35,8 +56,49 @@ def auth_enabled() -> bool:
     }
 
 
+# (MEALIESHOPPER_DATA_DIR, de werkmap bij een relatief pad) -> de map, absoluut en zonder symlinks (`data_dir`).
+_DATA_DIRS: dict[tuple[str, str], Path] = {}
+DATA_DIRS_KEPT: int = 64  # de tests zetten elke test een eigen map: daarna begint het register opnieuw
+
+
 def data_dir() -> Path:
-    return Path(os.environ.get("MEALIESHOPPER_DATA_DIR", "data")).resolve()
+    """De map met de gegevens (MEALIESHOPPER_DATA_DIR, anders `data`), absoluut en zonder symlinks.
+
+    Een keer opgezocht per waarde van de variabele: `Path.resolve` doet een lstat per deel van het pad, en elke systeemaanroep
+    laat de GIL los. Rekent er een andere thread, dan krijgt de event loop hem pas na het wisselinterval (5 ms) terug: onder
+    belasting kostte elke lstat 5 tot 19 ms, een `data_dir` 24 tot 63 ms, en een paar verbindingen na elkaar een stilstand van
+    105 tot 204 ms (taak 9c). De sleutel is de tekst van de variabele, zodat een test die hem verandert meteen een andere map
+    krijgt, en bij een relatief pad ook de werkmap."""
+    raw: str = os.environ.get("MEALIESHOPPER_DATA_DIR", "data")
+    key: tuple[str, str] = (raw, "" if os.path.isabs(raw) else os.getcwd())
+    found: Path | None = _DATA_DIRS.get(key)
+    if found is None:
+        if len(_DATA_DIRS) >= DATA_DIRS_KEPT:
+            _DATA_DIRS.clear()
+        found = _DATA_DIRS[key] = Path(raw).resolve()
+    return found
+
+
+# De data-mappen die `ensure_data_dir` al aanmaakte (of die er al waren). Leeg na `forget_runtime_state`.
+_DIRS_MADE: set[Path] = set()
+
+
+def ensure_data_dir() -> Path:
+    """De data-map (`data_dir`), aangemaakt als hij er nog niet was. Een keer per pad: `mkdir` met `exist_ok` doet een mkdir en
+    een stat, twee systeemaanroepen op de event loop bij elke verbinding (het konvooi van loop_guard.py)."""
+    folder: Path = data_dir()
+    if folder not in _DIRS_MADE:
+        folder.mkdir(parents=True, exist_ok=True)
+        _DIRS_MADE.add(folder)
+    return folder
+
+
+def session_max_age_seconds() -> int:
+    """Hoe lang een sessie duurt: `MEALIESHOPPER_SESSION_DAYS` dagen, standaard 90. Tot 4.10.2 was dat een vaste dag,
+    zonder verlenging: wie de app elke dag gebruikte, logde elke dag opnieuw in."""
+    raw: str = os.environ.get("MEALIESHOPPER_SESSION_DAYS", "").strip()
+    days: int = int(raw) if raw.isdigit() else 0
+    return (days or SESSION_DAYS_DEFAULT) * 24 * 60 * 60
 
 
 def db_path() -> Path:
@@ -62,9 +124,10 @@ def make_challenge() -> bytes:
 
 _master_secrets: dict[str, str] = {}
 SECRET_FILE = "secret.key"
+SECRET_RETRY_SECONDS: float = 0.1  # zo lang wachten we tussen twee pogingen op een `secret.key` die een andere werker schrijft
 
 
-def master_secret() -> str:
+async def master_secret() -> str:
     """Het geheim waaruit zowel de sessiesleutel als de sleutel voor opgeslagen gegevens volgt.
 
     Is MEALIESHOPPER_AUTH_SECRET (of JWT_SECRET) ingesteld, dan die: de sleutel staat dan niet bij de
@@ -79,14 +142,14 @@ def master_secret() -> str:
     cached = _master_secrets.get(str(path))
     if cached:
         return cached
-    secret = _read_secret_file(path)
+    secret = await _read_secret_file(path)
     if not secret:
         data_dir().mkdir(parents=True, exist_ok=True)
         secret = secrets.token_hex(32)
         try:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:  # een andere werker was ons voor
-            secret = _read_secret_file(path, wait=True)
+            secret = await _read_secret_file(path, wait=True)
         else:
             with os.fdopen(descriptor, "w", encoding="ascii") as handle:
                 handle.write(secret)
@@ -99,8 +162,9 @@ def master_secret() -> str:
     return secret
 
 
-def _read_secret_file(path: Path, wait: bool = False) -> str:
-    """De inhoud van het geheim, of "". Een andere werker kan hem net aanmaken: wacht dan even op de inhoud."""
+async def _read_secret_file(path: Path, wait: bool = False) -> str:
+    """De inhoud van het geheim, of "". Een andere werker kan hem net aanmaken: wacht dan even op de inhoud, zonder de
+    event loop vast te houden."""
     for _ in range(20 if wait else 1):
         try:
             text = path.read_text(encoding="ascii").strip()
@@ -108,17 +172,17 @@ def _read_secret_file(path: Path, wait: bool = False) -> str:
             return ""
         if len(text) >= 32:
             return text
-        time.sleep(0.1)
+        await asyncio.sleep(SECRET_RETRY_SECONDS)
     return text
 
 
-def _derive(purpose: str) -> bytes:
-    return hashlib.sha256(f"mealieshopper:{purpose}:{master_secret()}".encode("utf-8")).digest()
+async def _derive(purpose: str) -> bytes:
+    return hashlib.sha256(f"mealieshopper:{purpose}:{await master_secret()}".encode()).digest()
 
 
-def signing_secret() -> str:
+async def signing_secret() -> str:
     """Sleutel waarmee sessies worden ondertekend."""
-    return _derive("sessions").hex()
+    return (await _derive("sessions")).hex()
 
 
 def rp_id() -> str:
@@ -154,198 +218,340 @@ def request_is_secure() -> bool:
     return request.is_secure or request_origin().startswith("https://")
 
 
-def connect() -> sqlite3.Connection:
-    data_dir().mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path())
-    conn.row_factory = sqlite3.Row
+@asynccontextmanager
+async def connect(*, uri: bool = False) -> AsyncIterator[aiosqlite.Connection]:
+    """Een kortlevende aiosqlite-verbinding, een per bewerking. Sluit bij het verlaten, maar commit niet.
+
+    Wie schrijft, eindigt dus zelf met `await conn.commit()`. De rijen zijn `sqlite3.Row` (`aiosqlite.Row` is
+    dezelfde klasse): `row["key"]` en `row[0]` werken allebei.
+    """
+    ensure_data_dir()
+    opened: float = time.perf_counter()
+    async with aiosqlite.connect(db_path(), timeout=BUSY_SECONDS, uri=uri) as conn:
+        telemetry.watch(conn, opened)  # doet niets zonder MEALIESHOPPER_TELEMETRY
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+async def _open_reader(path: str) -> aiosqlite.Connection:
+    """Een nieuwe verbinding voor `readers`: alleen-lezen (`PRAGMA query_only`), zodat een schrijfopdracht via `read` faalt."""
+    opened: float = time.perf_counter()
+    conn: aiosqlite.Connection = await aiosqlite.connect(path, timeout=BUSY_SECONDS)
+    try:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("PRAGMA query_only = ON"):
+            pass
+    except BaseException:
+        await conn.close()
+        raise
+    telemetry.watch_each(conn, opened)  # een bewerking telt voor de aanvraag die op dat moment leest
     return conn
 
 
-def init_db() -> None:
+@asynccontextmanager
+async def read() -> AsyncIterator[readers.Reader]:
+    """Een open leesverbinding uit `readers`, voor een paar korte SELECTs per aanvraag (de sessie, de instellingen): geen
+    nieuwe thread per lezing (readers.py, het konvooi van loop_guard.py). Je krijgt een `readers.Reader` met alleen `fetchone`
+    en `fetchall` (ook via `fetchone(reader, ...)` hieronder): die sluiten hun cursor, en een open cursor of transactie liet de
+    volgende lener een oude stand van de WAL zien. Schrijven gaat met `connect`, en niet binnen een `read`: een tweede `read`
+    daarbinnen geeft een `RuntimeError`."""
+    ensure_data_dir()
+    async with readers.borrow(str(db_path()), _open_reader) as reader:
+        yield reader
+
+
+async def close_readers() -> None:
+    """Sluit de open leesverbindingen van deze loop en wacht tot ze dicht zijn, een uitgeleende hooguit `readers.RETURN_SECONDS`:
+    voor wie daarna het databasebestand weghaalt (de fabrieksreset). Een verbinding met het weggehaalde bestand zou bij het
+    sluiten de WAL van een nieuw bestand kunnen wissen."""
+    await readers.close_running_loop()
+
+
+async def ensure_schema(conn: aiosqlite.Connection, name: str, setup: str | Callable[[aiosqlite.Connection], Awaitable[None]]) -> None:
+    """Draai `setup` (een SQL-script, of een coroutine met het schema en de migraties van `name`) een keer per proces en database.
+
+    Voor de `_connect` van elke module: DDL per verzoek kost tijd (en op een server als Postgres neemt elke CREATE een slot), en
+    het resultaat verandert nooit tot het proces of de database opnieuw begint. Mislukt de opzet, dan blijft hij open voor de
+    volgende verbinding. Wat per verbinding moet (`PRAGMA foreign_keys`, `create_function`) hoort niet in `setup`."""
+    key: tuple[str, str] = (str(db_path()), name)
+    if key in _SCHEMAS_READY:
+        return
+    if isinstance(setup, str):
+        await conn.executescript(setup)
+    else:
+        await setup(conn)
+    _SCHEMAS_READY.add(key)
+
+
+def schema_ready(name: str) -> bool:
+    """Of `ensure_schema` het schema van `name` in dit proces al op deze database zette: dan kan een lezer (`read`) meteen."""
+    return (str(db_path()), name) in _SCHEMAS_READY
+
+
+async def fetchone(conn: aiosqlite.Connection | readers.Reader, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
+    """De eerste rij van `sql` op `conn` (een verbinding, of een lezer van `read`), of None. Gedeeld door elke module met een
+    eigen tabel."""
+    if isinstance(conn, readers.Reader):
+        return await conn.fetchone(sql, params)
+    async with conn.execute(sql, params) as cursor:
+        return await cursor.fetchone()
+
+
+# Het schema van auth.sqlite3, voor init_db. Alles met IF NOT EXISTS: veilig om opnieuw te draaien.
+_SCHEMA: str = """
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  public_key BLOB NOT NULL,
+  sign_count INTEGER NOT NULL DEFAULT 0,
+  credential_name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS auth_challenges (
+  key TEXT PRIMARY KEY,
+  challenge BLOB NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+  sid TEXT PRIMARY KEY,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS password_credentials (
+  user_id TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS mfa_totp (
+  user_id TEXT PRIMARY KEY,
+  secret TEXT NOT NULL,
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  last_counter INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+  code_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+  key TEXT PRIMARY KEY,
+  failures INTEGER NOT NULL DEFAULT 0,
+  window_start TEXT NOT NULL,
+  locked_until TEXT
+);
+
+CREATE TABLE IF NOT EXISTS invites (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS passkey_credentials_user ON passkey_credentials (user_id);
+CREATE INDEX IF NOT EXISTS mfa_recovery_codes_user ON mfa_recovery_codes (user_id);
+"""
+
+
+async def init_db() -> None:
+    """Het schema en de migratie, met de vlag `_INITIALIZED`. Draait bij het starten (`before_serving`), anders een keer
+    via `ensure_db`, nooit per verzoek."""
     global _INITIALIZED
-    with connect() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-              id TEXT PRIMARY KEY,
-              username TEXT NOT NULL UNIQUE,
-              created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS passkey_credentials (
-              id TEXT PRIMARY KEY,
-              user_id TEXT NOT NULL,
-              public_key BLOB NOT NULL,
-              sign_count INTEGER NOT NULL DEFAULT 0,
-              credential_name TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              last_used_at TEXT,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS auth_challenges (
-              key TEXT PRIMARY KEY,
-              challenge BLOB NOT NULL,
-              expires_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS app_settings (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS password_credentials (
-              user_id TEXT PRIMARY KEY,
-              password_hash TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS mfa_totp (
-              user_id TEXT PRIMARY KEY,
-              secret TEXT NOT NULL,
-              confirmed INTEGER NOT NULL DEFAULT 0,
-              last_counter INTEGER NOT NULL DEFAULT 0,
-              created_at TEXT NOT NULL,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
-              code_hash TEXT PRIMARY KEY,
-              user_id TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS login_attempts (
-              key TEXT PRIMARY KEY,
-              failures INTEGER NOT NULL DEFAULT 0,
-              window_start TEXT NOT NULL,
-              locked_until TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS invites (
-              id TEXT PRIMARY KEY,
-              token_hash TEXT NOT NULL UNIQUE,
-              user_id TEXT NOT NULL,
-              username TEXT NOT NULL DEFAULT '',
-              kind TEXT NOT NULL,
-              created_by TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              expires_at TEXT NOT NULL
-            );
-            """
-        )
-        _migrate(conn)
+    async with connect() as conn:
+        await _set_journal_mode(conn)
+        await conn.executescript(_SCHEMA)
+        await _migrate(conn)
     _INITIALIZED = True
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-    if "session_epoch" not in columns:
-        # Elke gebruiker heeft een eigen teller: een nieuw wachtwoord logt alleen die gebruiker overal uit.
-        conn.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
-        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (SETTING_SESSION_EPOCH,)).fetchone()
-        try:
-            epoch = int(row["value"]) if row else 0
-        except (TypeError, ValueError):
-            epoch = 0
-        conn.execute("UPDATE users SET session_epoch = ?", (epoch,))
+def wal_enabled() -> bool:
+    return os.environ.get("MEALIESHOPPER_SQLITE_WAL", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
-def ensure_db() -> None:
-    if not _INITIALIZED:
-        init_db()
+async def _set_journal_mode(conn: aiosqlite.Connection) -> None:
+    """Zet de database in WAL (of terug in `delete` met `MEALIESHOPPER_SQLITE_WAL=false`). De keuze staat in het bestand en geldt
+    daarna voor elke verbinding, ook die van een tweede proces.
+
+    Zonder WAL houdt een schrijver elke lezer tegen en omgekeerd: een pagina wachtte op de nachtelijke synchronisatie of op
+    een auditregel, en wie te lang wachtte kreeg `database is locked`. Met WAL lezen en schrijven ze naast elkaar. Lukt het
+    wisselen niet (een andere verbinding is bezig, of het bestandssysteem kan het niet), dan blijft de database zoals ze was."""
+    wanted: str = "wal" if wal_enabled() else "delete"
+    try:
+        row = await fetchone(conn, "PRAGMA journal_mode")
+        if row is not None and str(row[0]).lower() == wanted:
+            return
+        row = await fetchone(conn, f"PRAGMA journal_mode = {wanted}")
+        if row is None or str(row[0]).lower() != wanted:
+            log.warning("De database blijft in journal_mode %s: %s kan hier niet", row[0] if row else "?", wanted)
+    except sqlite3.Error:
+        log.warning("Kon journal_mode %s niet instellen", wanted, exc_info=True)
 
 
-def _count(table: str, user_id: str | None, extra: str = "") -> int:
+async def _has_session_epoch(conn: aiosqlite.Connection) -> bool:
+    rows = await conn.execute_fetchall("PRAGMA table_info(users)")
+    return any(row["name"] == "session_epoch" for row in rows)
+
+
+async def _migrate(conn: aiosqlite.Connection) -> None:
+    """Elke gebruiker krijgt een eigen teller: een nieuw wachtwoord logt alleen die gebruiker overal uit.
+
+    Twee werkers kunnen tegelijk de eerste zijn: de tweede controle staat daarom achter een schrijfslot (BEGIN
+    IMMEDIATE). Wie als tweede komt, wacht op de eerste en ziet de kolom dan al staan."""
+    if await _has_session_epoch(conn):
+        return
+    await conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not await _has_session_epoch(conn):
+            await conn.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
+            row = await fetchone(conn, "SELECT value FROM app_settings WHERE key = ?", (SETTING_SESSION_EPOCH,))
+            try:
+                epoch = int(row["value"]) if row else 0
+            except (TypeError, ValueError):
+                epoch = 0
+            await conn.execute("UPDATE users SET session_epoch = ?", (epoch,))
+        await conn.commit()
+    except BaseException:
+        await conn.rollback()
+        raise
+
+
+# Een slot per event loop, zoals in http_client: elke test heeft een eigen loop.
+_init_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
+
+
+def _init_lock() -> asyncio.Lock:
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    lock: asyncio.Lock | None = _init_locks.get(loop)
+    if lock is None:
+        lock = _init_locks[loop] = asyncio.Lock()
+    return lock
+
+
+async def ensure_db() -> None:
+    """`init_db` als dat in dit proces nog niet gebeurde. Gelijktijdige eerste verzoeken wachten op elkaar, zodat de
+    migratie een keer loopt."""
+    if _INITIALIZED:
+        return
+    async with _init_lock():
+        if not _INITIALIZED:
+            await init_db()
+
+
+async def _count(table: str, user_id: str | None, extra: str = "") -> int:
     """Aantal rijen in `table`, voor één gebruiker of (zonder user_id) voor iedereen."""
-    ensure_db()
+    await ensure_db()
     where = [clause for clause in (extra, "user_id = ?" if user_id else "") if clause]
     sql = f"SELECT COUNT(*) AS count FROM {table}" + (" WHERE " + " AND ".join(where) if where else "")
-    with closing(connect()) as conn:
-        row = conn.execute(sql, (user_id,) if user_id else ()).fetchone()
+    async with read() as conn:
+        row = await fetchone(conn, sql, (user_id,) if user_id else ())
     return int(row["count"] if row else 0)
 
 
-def passkey_count(user_id: str | None = None) -> int:
-    return _count("passkey_credentials", user_id)
+async def passkey_count(user_id: str | None = None) -> int:
+    return await _count("passkey_credentials", user_id)
 
 
-def password_configured(user_id: str | None = None) -> bool:
-    return _count("password_credentials", user_id) > 0
+async def password_configured(user_id: str | None = None) -> bool:
+    return await _count("password_credentials", user_id) > 0
 
 
-def mfa_enabled(user_id: str | None = None) -> bool:
-    return _count("mfa_totp", user_id, "confirmed = 1") > 0
+async def mfa_enabled(user_id: str | None = None) -> bool:
+    return await _count("mfa_totp", user_id, "confirmed = 1") > 0
 
 
-def recovery_codes_left(user_id: str | None = None) -> int:
-    return _count("mfa_recovery_codes", user_id)
+async def recovery_codes_left(user_id: str | None = None) -> int:
+    return await _count("mfa_recovery_codes", user_id)
 
 
-def credentials_exist() -> bool:
+async def credentials_exist() -> bool:
     """Is er al een manier om in te loggen (passkey of wachtwoord)?"""
-    return passkey_count() > 0 or password_configured()
+    return await passkey_count() > 0 or await password_configured()
 
 
 # Instellingen zonder geheim (keuzes, vlaggen): onversleuteld in app_settings.
-def get_setting(key: str, default: str = "") -> str:
-    ensure_db()
-    with closing(connect()) as conn:
-        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+async def get_setting(key: str, default: str = "") -> str:
+    await ensure_db()
+    async with read() as conn:
+        row = await fetchone(conn, "SELECT value FROM app_settings WHERE key=?", (key,))
     return str(row["value"]) if row else default
 
 
-def set_setting(key: str, value: str) -> None:
-    ensure_db()
-    with closing(connect()) as conn, conn:
-        conn.execute(
-            """
-            INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-            """,
-            (key, value, utcnow().isoformat()),
-        )
+_UPSERT_SETTING_SQL: str = """
+    INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+"""
+
+
+async def set_setting(key: str, value: str) -> None:
+    await ensure_db()
+    async with connect() as conn:
+        await conn.execute(_UPSERT_SETTING_SQL, (key, value, utcnow().isoformat()))
+        await conn.commit()
 
 
 SETTING_AUTH_MODE = "AUTH_MODE"  # "none" = bewust zonder inloggen; verder afgeleid uit de aanwezige gegevens
 SETTING_SESSION_EPOCH = "SESSION_EPOCH"
 
 
-def auth_mode() -> str:
-    return get_setting(SETTING_AUTH_MODE)
+async def auth_mode() -> str:
+    return await get_setting(SETTING_AUTH_MODE)
 
 
-def auth_required() -> bool:
+async def auth_required() -> bool:
     """Moet je inloggen? Niet als de beheerder inloggen uitzette of er bewust voor koos het over te slaan."""
     if not auth_enabled():
         return False
-    if credentials_exist():
+    if await credentials_exist():
         return True
-    return auth_mode() != "none"
+    return await auth_mode() != "none"
 
 
-def session_epoch(user_id: str = OWNER_ID) -> int:
-    ensure_db()
-    with closing(connect()) as conn:
-        row = conn.execute("SELECT session_epoch FROM users WHERE id = ?", (user_id,)).fetchone()
+async def session_epoch(user_id: str = OWNER_ID) -> int:
+    await ensure_db()
+    async with read() as conn:
+        row = await fetchone(conn, "SELECT session_epoch FROM users WHERE id = ?", (user_id,))
     return int(row["session_epoch"]) if row else 0
 
 
-def bump_session_epoch(user_id: str = OWNER_ID) -> int:
+async def bump_session_epoch(user_id: str = OWNER_ID) -> int:
     """Maak alle bestaande sessies van een gebruiker ongeldig (bij een nieuw wachtwoord of uitgezette MFA)."""
-    ensure_db()
-    with closing(connect()) as conn, conn:
-        conn.execute("UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?", (user_id,))
-    return session_epoch(user_id)
+    await ensure_db()
+    async with connect() as conn:
+        await conn.execute("UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?", (user_id,))
+        await conn.commit()
+    return await session_epoch(user_id)
 
 
-def credential_rows(user_id: str = OWNER_ID) -> list[dict[str, Any]]:
-    ensure_db()
-    with closing(connect()) as conn:
-        rows = conn.execute(
+async def credential_rows(user_id: str = OWNER_ID) -> list[dict[str, Any]]:
+    await ensure_db()
+    async with connect() as conn:
+        rows = await conn.execute_fetchall(
             """
             SELECT
               c.id,
@@ -360,27 +566,21 @@ def credential_rows(user_id: str = OWNER_ID) -> list[dict[str, Any]]:
             ORDER BY c.created_at DESC
             """,
             (user_id,),
-        ).fetchall()
+        )
     return [dict(row) for row in rows]
 
 
-def secret_box() -> Fernet:
+async def secret_box() -> Fernet:
     """Versleuteling voor opgeslagen koppelingen (Mealie-token, AH-token) en het MFA-geheim."""
-    return Fernet(base64.urlsafe_b64encode(_derive("stored-secrets")))
+    return Fernet(base64.urlsafe_b64encode(await _derive("stored-secrets")))
 
 
-def set_secret(key: str, value: str) -> None:
-    ensure_db()
-    encrypted = secret_box().encrypt(value.encode("utf-8")).decode("ascii")
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO app_settings (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-            """,
-            (key, encrypted, utcnow().isoformat()),
-        )
+async def set_secret(key: str, value: str) -> None:
+    await ensure_db()
+    encrypted = (await secret_box()).encrypt(value.encode("utf-8")).decode("ascii")
+    async with connect() as conn:
+        await conn.execute(_UPSERT_SETTING_SQL, (key, encrypted, utcnow().isoformat()))
+        await conn.commit()
 
 
 # Inloggegevens en cookies van verwijderde functies (AH website-koppeling, Jumbo).
@@ -394,101 +594,158 @@ OBSOLETE_SECRET_KEYS = (
 )
 
 
-def purge_obsolete_secrets() -> int:
+async def purge_obsolete_secrets() -> int:
     """Verwijder opgeslagen gegevens van functies die niet meer bestaan; geeft het aantal rijen."""
-    init_db()  # idempotent (CREATE TABLE IF NOT EXISTS); werkt ook voor een nieuwe data-map
+    await init_db()  # idempotent (CREATE TABLE IF NOT EXISTS), werkt ook voor een nieuwe data-map
     placeholders = ",".join("?" for _ in OBSOLETE_SECRET_KEYS)
-    with closing(connect()) as conn, conn:
-        cursor = conn.execute(
-            f"DELETE FROM app_settings WHERE key IN ({placeholders})", OBSOLETE_SECRET_KEYS
-        )
+    async with connect() as conn:
+        cursor = await conn.execute(f"DELETE FROM app_settings WHERE key IN ({placeholders})", OBSOLETE_SECRET_KEYS)
+        await conn.commit()
         return cursor.rowcount
 
 
-def delete_secret(key: str) -> None:
-    ensure_db()
-    with closing(connect()) as conn, conn:
-        conn.execute("DELETE FROM app_settings WHERE key=?", (key,))
+async def delete_secret(key: str) -> None:
+    await ensure_db()
+    async with connect() as conn:
+        await conn.execute("DELETE FROM app_settings WHERE key=?", (key,))
+        await conn.commit()
 
 
-def get_secret(key: str) -> str:
-    ensure_db()
-    with connect() as conn:
-        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+async def get_secret(key: str) -> str:
+    await ensure_db()
+    async with read() as conn:
+        row = await fetchone(conn, "SELECT value FROM app_settings WHERE key=?", (key,))
     if not row:
         return ""
     value = str(row["value"] or "")
     try:
-        return secret_box().decrypt(value.encode("ascii")).decode("utf-8")
+        return (await secret_box()).decrypt(value.encode("ascii")).decode("utf-8")
     except (InvalidToken, ValueError):
         # Een versleutelde waarde met een andere sleutel is onleesbaar (opnieuw koppelen), geen tekst om terug te geven.
         return "" if value.startswith("gAAAA") else value
 
 
-def create_token(user_id: str, username: str) -> str:
+async def create_token(user_id: str, username: str, *, epoch: int | None = None, sid: str | None = None, auth_time: int | None = None) -> str:
+    """Een sessietoken. `sid` (de sessie, blijft gelijk bij een verlenging, uitloggen trekt hem in) en `auth_time` (de inlog)
+    komen bij een verlenging uit de gecontroleerde cookie, net als `epoch`: zo draagt een verlenging nooit een nieuwere
+    sessieteller dan de cookie die hem verdiende."""
+    now: datetime = utcnow()
     return jwt.encode(
         {
             "sub": user_id,
             "usr": username,
-            "ep": session_epoch(user_id),
-            "iat": utcnow(),
-            "exp": utcnow() + timedelta(seconds=SESSION_MAX_AGE_SECONDS),
+            "ep": await session_epoch(user_id) if epoch is None else epoch,
+            "sid": sid or secrets.token_hex(16),
+            "auth_time": int(now.timestamp()) if auth_time is None else auth_time,
+            "iat": now,
+            "exp": now + timedelta(seconds=session_max_age_seconds()),
         },
-        signing_secret(),
+        await signing_secret(),
         algorithm="HS256",
     )
 
 
-def verify_token(token: str) -> dict[str, Any] | None:
+async def _session_revoked(conn: aiosqlite.Connection | readers.Reader, sid: Any) -> bool:
+    if not sid:
+        return False  # een token van voor 4.10.3 heeft geen sessie-id en verloopt binnen een dag
+    return await fetchone(conn, "SELECT 1 FROM revoked_sessions WHERE sid=?", (str(sid),)) is not None
+
+
+async def revoke_session(token: str) -> str:
+    """Uitloggen: de sessie van `token` (en elke verlenging ervan, dezelfde `sid`) is vanaf nu ongeldig, ook al is het token nog
+    niet verlopen. De rij blijft staan tot de laatste verlenging verlopen kan zijn, oude rijen gaan er meteen uit. Geeft het
+    sessie-id, of "" als het token er geen heeft."""
     try:
-        return jwt.decode(token, signing_secret(), algorithms=["HS256"])
+        payload: dict[str, Any] = jwt.decode(token, await signing_secret(), algorithms=["HS256"], options={"verify_exp": False})
+    except Exception:
+        return ""
+    sid: Any = payload.get("sid")
+    if not sid:
+        return ""
+    auth_time: float = float(payload.get("auth_time") or payload.get("iat") or utcnow().timestamp())
+    expires_at: datetime = datetime.fromtimestamp(auth_time, tz=timezone.utc) + timedelta(
+        seconds=SESSION_ABSOLUTE_SECONDS + session_max_age_seconds()
+    )
+    async with connect() as conn:
+        await conn.execute("DELETE FROM revoked_sessions WHERE expires_at < ?", (utcnow().isoformat(),))
+        await conn.execute("INSERT OR REPLACE INTO revoked_sessions (sid, expires_at) VALUES (?, ?)", (str(sid), expires_at.isoformat()))
+        await conn.commit()
+    return str(sid)
+
+
+async def verify_token(token: str) -> dict[str, Any] | None:
+    try:
+        return jwt.decode(token, await signing_secret(), algorithms=["HS256"])
     except Exception:
         return None
 
 
-def current_user() -> dict[str, Any] | None:
-    ensure_db()
+def _request_token() -> tuple[str, bool]:
+    """Het sessietoken van deze aanvraag (de cookie, anders `Authorization: Bearer`) en of het uit de cookie kwam."""
     token = str(request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-    payload = verify_token(token) if token else None
+    if token:
+        return token, True
+    auth_header = request.headers.get("Authorization", "")
+    return (auth_header[7:].strip(), False) if auth_header.startswith("Bearer ") else ("", False)
+
+
+async def current_session() -> tuple[str, int]:
+    """Het sessie-id (`sid`) en de sessieteller van het token van deze aanvraag, of ("", 0) zonder. Of de sessie nog geldt,
+    zegt `current_user`: roep die eerst aan. Voor push.py, dat een push-abonnement aan de sessie koppelt."""
+    token, _ = _request_token()
+    payload = await verify_token(token) if token else None
+    if not payload or payload.get("purpose"):
+        return "", 0
+    return str(payload.get("sid") or ""), int(payload.get("ep") or 0)
+
+
+async def current_user() -> dict[str, Any] | None:
+    await ensure_db()
+    token, from_cookie = _request_token()
+    payload = await verify_token(token) if token else None
     if not payload:
         return None
     if payload.get("purpose"):
         return None  # een kaartje voor een tussenstap (bijvoorbeeld MFA) is geen sessie
-    with closing(connect()) as conn:
-        row = conn.execute(
-            "SELECT id, username, created_at, session_epoch FROM users WHERE id=?",
-            (payload.get("sub"),),
-        ).fetchone()
-    if not row or int(payload.get("ep") or 0) != int(row["session_epoch"]):
-        return None
+    async with read() as conn:
+        row = await fetchone(conn, "SELECT id, username, created_at, session_epoch FROM users WHERE id=?", (payload.get("sub"),))
+        if not row or int(payload.get("ep") or 0) != int(row["session_epoch"]) or await _session_revoked(conn, payload.get("sid")):
+            return None
+    now: float = utcnow().timestamp()
+    auth_time: int = int(payload.get("auth_time") or payload.get("iat") or now)
+    if from_cookie and now - float(payload.get("iat") or 0) >= SESSION_RENEW_AFTER_SECONDS and now - auth_time < SESSION_ABSOLUTE_SECONDS:
+        # De after_request-hook zet de verse cookie, met de sessieteller, sessie-id en inlogtijd van deze gecontroleerde cookie.
+        g.renew_session = {
+            "user_id": str(row["id"]),
+            "username": str(row["username"]),
+            "epoch": int(row["session_epoch"]),
+            "sid": payload.get("sid"),
+            "auth_time": auth_time,
+        }
     user = {"id": row["id"], "username": row["username"], "created_at": row["created_at"]}
     return {**user, "role": "owner" if user["id"] == OWNER_ID else "user"}
 
 
-def acting_user_id() -> str:
+async def acting_user_id() -> str:
     """Wie de aanvraag doet: de ingelogde gebruiker, of de eigenaar zolang er nog niemand is ingelogd (eerste start)."""
-    user = current_user()
+    user = await current_user()
     return user["id"] if user else OWNER_ID
 
 
-def is_owner() -> bool:
+async def is_owner() -> bool:
     """De eigenaar (beheerder) mag koppelen en gebruikers beheren. Zonder inlog is iedereen de beheerder."""
-    if not auth_required():
+    if not await auth_required():
         return True
-    user = current_user()
+    user = await current_user()
     return bool(user and user["id"] == OWNER_ID)
 
 
-def store_challenge(key: str, challenge: bytes) -> None:
-    ensure_db()
+async def store_challenge(key: str, challenge: bytes) -> None:
+    await ensure_db()
     expires_at = (utcnow() + timedelta(minutes=5)).isoformat()
-    with connect() as conn:
-        conn.execute("DELETE FROM auth_challenges WHERE expires_at < ?", (utcnow().isoformat(),))
-        conn.execute(
+    async with connect() as conn:
+        await conn.execute("DELETE FROM auth_challenges WHERE expires_at < ?", (utcnow().isoformat(),))
+        await conn.execute(
             """
             INSERT INTO auth_challenges (key, challenge, expires_at)
             VALUES (?, ?, ?)
@@ -496,47 +753,49 @@ def store_challenge(key: str, challenge: bytes) -> None:
             """,
             (key, challenge, expires_at),
         )
+        await conn.commit()
 
 
-def pop_challenge(key: str) -> bytes | None:
-    ensure_db()
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT challenge FROM auth_challenges WHERE key=? AND expires_at >= ?",
-            (key, utcnow().isoformat()),
-        ).fetchone()
-        conn.execute("DELETE FROM auth_challenges WHERE key=? OR expires_at < ?", (key, utcnow().isoformat()))
-    return bytes(row["challenge"]) if row else None
+async def pop_challenge(key: str) -> bytes | None:
+    """De challenge onder `key`, een keer. Lezen en wissen zijn een opdracht (`DELETE ... RETURNING`), dus twee verzoeken
+    tegelijk krijgen nooit allebei dezelfde challenge. Een verlopen challenge geeft None en verdwijnt ook."""
+    await ensure_db()
+    now = utcnow().isoformat()
+    async with connect() as conn:
+        row = await fetchone(conn, "DELETE FROM auth_challenges WHERE key=? RETURNING challenge, expires_at", (key,))
+        await conn.execute("DELETE FROM auth_challenges WHERE expires_at < ?", (now,))
+        await conn.commit()
+    return bytes(row["challenge"]) if row and str(row["expires_at"]) >= now else None
 
 
-def check_registration(credential: dict[str, Any], challenge: bytes) -> tuple[bytes, bytes, int]:
-    """Controleert een nieuwe passkey met py_webauthn; geeft (credential-id, COSE-sleutel, teller) of gooit een fout.
-
-    Alleen ES256 (dat is wat de opties aanbieden). Aanwezigheid is verplicht, verificatie niet: een wachtwoordmanager
-    als Enpass ontgrendelt met zijn eigen hoofdwachtwoord en meldt de verificatievlag niet.
-    """
+def _verify_registration(credential: dict[str, Any], challenge: bytes, rp: str, origins: list[str]) -> tuple[bytes, bytes, int]:
     result = verify_registration_response(
         credential=credential,
         expected_challenge=challenge,
-        expected_rp_id=rp_id(),
-        expected_origin=rp_origins(),
+        expected_rp_id=rp,
+        expected_origin=origins,
         require_user_verification=False,
         supported_pub_key_algs=[COSEAlgorithmIdentifier.ECDSA_SHA_256],
     )
     return result.credential_id, result.credential_public_key, result.sign_count
 
 
-def check_assertion(credential: dict[str, Any], challenge: bytes, public_key: bytes) -> int:
-    """Controleert de ondertekening van een passkey-aanmelding met py_webauthn; geeft de nieuwe teller of gooit een fout.
+async def check_registration(credential: dict[str, Any], challenge: bytes) -> tuple[bytes, bytes, int]:
+    """Controleert een nieuwe passkey met py_webauthn. Geeft (credential-id, COSE-sleutel, teller) of gooit een fout.
 
-    De tellercontrole staat uit (huidige teller 0): synced passkeys melden 0 en deze app bewaarde de teller nooit
-    om op te weigeren.
+    Alleen ES256 (dat is wat de opties aanbieden). Aanwezigheid is verplicht, verificatie niet: een wachtwoordmanager
+    als Enpass ontgrendelt met zijn eigen hoofdwachtwoord en meldt de verificatievlag niet. De controle loopt in een
+    thread, net als bij `check_assertion`.
     """
+    return await asyncio.to_thread(_verify_registration, credential, challenge, rp_id(), rp_origins())
+
+
+def _verify_assertion(credential: dict[str, Any], challenge: bytes, public_key: bytes, rp: str, origins: list[str]) -> int:
     result = verify_authentication_response(
         credential=credential,
         expected_challenge=challenge,
-        expected_rp_id=rp_id(),
-        expected_origin=rp_origins(),
+        expected_rp_id=rp,
+        expected_origin=origins,
         credential_public_key=public_key,
         credential_current_sign_count=0,
         require_user_verification=False,
@@ -544,125 +803,177 @@ def check_assertion(credential: dict[str, Any], challenge: bytes, public_key: by
     return result.new_sign_count
 
 
+async def check_assertion(credential: dict[str, Any], challenge: bytes, public_key: bytes) -> int:
+    """Controleert de ondertekening van een passkey-aanmelding met py_webauthn. Geeft de nieuwe teller of gooit een fout.
+
+    Het nakijken van de handtekening loopt in een thread, buiten de event loop. De verwachte host en origins komen uit
+    het verzoek, die lezen we vooraf. De tellercontrole staat uit (huidige teller 0): synced passkeys melden 0 en deze
+    app bewaarde de teller nooit om op te weigeren.
+    """
+    return await asyncio.to_thread(_verify_assertion, credential, challenge, public_key, rp_id(), rp_origins())
+
+
 def forget_runtime_state() -> None:
     """Vergeet wat er in het geheugen staat over de database en het geheim (na het wissen van de data-map)."""
     global _INITIALIZED
     _INITIALIZED = False
+    _SCHEMAS_READY.clear()
+    _DIRS_MADE.clear()  # de map kan weg zijn: de volgende verbinding maakt hem weer aan
     _master_secrets.clear()
+    forget_cached_data()
 
 
-def cookie_response(payload: dict[str, Any], token: str | None = None, status: int = 200):
-    result = make_response(jsonify(payload), status)
+def remember_cache(clear: Callable[[], None]) -> Callable[[], None]:
+    """Laat `clear` lopen bij `forget_cached_data`. Geeft de functie die hem weer loslaat (een app die stopt)."""
+    _DATA_CACHES.append(clear)
+
+    def release() -> None:
+        if clear in _DATA_CACHES:
+            _DATA_CACHES.remove(clear)
+
+    return release
+
+
+def forget_cached_data() -> None:
+    """Wist wat de modules uit de gegevens van de database afleidden (`remember_cache`): de gegevens zijn veranderd, het schema niet.
+    Ook de open leesverbindingen gaan dicht (`readers.retire_all`): na een fabrieksreset hebben ze het oude bestand nog open, en
+    na het terugzetten van een back-up begint de volgende lezing op een nieuwe verbinding."""
+    readers.retire_all()
+    for clear in _DATA_CACHES[:]:
+        clear()
+
+
+def set_session_cookie(response: Any, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=session_max_age_seconds(),
+        httponly=True,
+        secure=request_is_secure(),
+        samesite="Lax",
+        path="/",
+    )
+
+
+async def cookie_response(payload: dict[str, Any], token: str | None = None, status: int = 200):
+    result = await make_response(jsonify(payload), status)
     if token:
-        result.set_cookie(
-            SESSION_COOKIE_NAME,
-            token,
-            max_age=SESSION_MAX_AGE_SECONDS,
-            httponly=True,
-            secure=request_is_secure(),
-            samesite="Lax",
-            path="/",
-        )
+        set_session_cookie(result, token)
     return result
 
 
-def clear_cookie_response(payload: dict[str, Any]):
-    result = make_response(jsonify(payload))
+async def renew_session_cookie(response: Any) -> Any:
+    """De after_request-hook: een sessie die `current_user` ouder dan een dag vond krijgt een verse cookie, behalve als het
+    antwoord de cookie zelf al zet of wist (inloggen, uitloggen)."""
+    renew: dict[str, Any] | None = g.get("renew_session")
+    if not renew or any(header.startswith(f"{SESSION_COOKIE_NAME}=") for header in response.headers.getlist("Set-Cookie")):
+        return response
+    set_session_cookie(
+        response, await create_token(renew["user_id"], renew["username"], epoch=renew["epoch"], sid=renew["sid"], auth_time=renew["auth_time"])
+    )
+    return response
+
+
+async def clear_cookie_response(payload: dict[str, Any]):
+    result = await make_response(jsonify(payload))
     result.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=request_is_secure(), samesite="Lax")
     return result
 
 
-def register_routes(app: Flask) -> None:
+def register_routes(app: Quart) -> None:
+    app.after_request(renew_session_cookie)
+
     @app.get("/.well-known/webauthn")
-    def webauthn_well_known():
+    async def webauthn_well_known():
         return jsonify({"origins": rp_origins()})
 
     @app.get("/api/auth/status")
-    def auth_status():
-        user = current_user()
-        configured = credentials_exist()
-        required = auth_required()
+    async def auth_status():
+        user = await current_user()
+        configured = await credentials_exist()
+        required = await auth_required()
         payload = {
             "enabled": required,
             "envEnabled": auth_enabled(),
             "configured": configured,
-            "credentialCount": passkey_count(),
-            "methods": {"passkey": passkey_count() > 0, "password": password_configured()},
+            "credentialCount": await passkey_count(),
+            "methods": {"passkey": await passkey_count() > 0, "password": await password_configured()},
             "setupRequired": required and not configured,
             "authenticated": bool(user),
             "username": user["username"] if user else None,
             "userId": user["id"] if user else None,
             "role": user["role"] if user else ("owner" if not required else None),
-            "isOwner": is_owner(),
+            "isOwner": await is_owner(),
             "rpId": rp_id(),
             "rpOrigins": rp_origins(),
         }
         if user or not required:
             uid = user["id"] if user else OWNER_ID
-            payload["credentialCount"] = passkey_count(uid)
-            payload["passwordConfigured"] = password_configured(uid)
-            payload["mfaEnabled"] = mfa_enabled(uid)
-            payload["recoveryCodesLeft"] = recovery_codes_left(uid)
+            payload["credentialCount"] = await passkey_count(uid)
+            payload["passwordConfigured"] = await password_configured(uid)
+            payload["mfaEnabled"] = await mfa_enabled(uid)
+            payload["recoveryCodesLeft"] = await recovery_codes_left(uid)
             from . import profile  # late import: profile gebruikt dit module
 
-            payload.update(profile.get(uid))
+            payload.update(await profile.get(uid))
         return jsonify(payload)
 
     @app.get("/api/auth/credentials")
-    def credentials_list():
-        if auth_required() and credentials_exist() and not current_user():
-            return jsonify({"error": "Unauthorized"}), 401
-        return jsonify({"credentials": credential_rows(acting_user_id())})
+    async def credentials_list():
+        if await auth_required() and await credentials_exist() and not await current_user():
+            return jsonify({"error": tr("Je bent niet ingelogd. Log opnieuw in.", "You are not signed in. Sign in again.")}), 401
+        return jsonify({"credentials": await credential_rows(await acting_user_id())})
 
     @app.delete("/api/auth/credentials/<credential_id>")
-    def credentials_delete(credential_id: str):
-        if auth_required() and not current_user():
-            return jsonify({"error": "Unauthorized"}), 401
-        uid = acting_user_id()  # alleen je eigen passkeys
-        with connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM passkey_credentials WHERE id=? AND user_id=?",
-                (credential_id, uid),
-            ).fetchone()
+    async def credentials_delete(credential_id: str):
+        if await auth_required() and not await current_user():
+            return jsonify({"error": tr("Je bent niet ingelogd. Log opnieuw in.", "You are not signed in. Sign in again.")}), 401
+        uid = await acting_user_id()  # alleen je eigen passkeys
+        last_allowed = not await auth_required() or await password_configured(uid)  # buiten de verbinding hieronder
+        async with connect() as conn:
+            row = await fetchone(conn, "SELECT id FROM passkey_credentials WHERE id=? AND user_id=?", (credential_id, uid))
             if not row:
-                return jsonify({"error": "Not found"}), 404
-            count = conn.execute("SELECT COUNT(*) AS count FROM passkey_credentials WHERE user_id=?", (uid,)).fetchone()["count"]
-            if int(count) <= 1 and auth_required() and not password_configured(uid):
+                return jsonify({"error": tr("Niet gevonden.", "Not found.")}), 404
+            count = await fetchone(conn, "SELECT COUNT(*) AS count FROM passkey_credentials WHERE user_id=?", (uid,))
+            if int(count["count"] if count else 0) <= 1 and not last_allowed:
                 return jsonify({"error": tr("Je kunt de laatste passkey niet verwijderen.", "You cannot delete the last passkey.")}), 400
-            conn.execute("DELETE FROM passkey_credentials WHERE id=?", (credential_id,))
-        return jsonify({"status": "deleted", "remaining": passkey_count(uid)})
+            await conn.execute("DELETE FROM passkey_credentials WHERE id=?", (credential_id,))
+            await conn.commit()
+        return jsonify({"status": "deleted", "remaining": await passkey_count(uid)})
 
     @app.post("/api/auth/register/options")
-    def register_options():
+    async def register_options():
         if not auth_enabled():
-            return jsonify({"error": "Passkey auth is disabled"}), 400
-        body = request.get_json(silent=True) or {}
+            return jsonify({"error": tr("Inloggen met een passkey staat uit.", "Passkey sign-in is disabled.")}), 400
+        body = await request_body.json_object()
         from . import users  # lokaal: users importeert dit module
 
         invite = None
         if body.get("invite"):
-            invite = users.find_invite(body.get("invite"))
+            invite = await users.find_invite(body.get("invite"))
             if not invite:
-                return jsonify({"error": tr("Deze uitnodiging bestaat niet meer of is verlopen.", "This invitation no longer exists or has expired.")}), 404
-        elif credentials_exist() and auth_required() and not current_user():
-            return jsonify({"error": "Login required to add another passkey"}), 401
+                return jsonify(
+                    {"error": tr("Deze uitnodiging bestaat niet meer of is verlopen.", "This invitation no longer exists or has expired.")}
+                ), 404
+        elif await credentials_exist() and await auth_required() and not await current_user():
+            return jsonify({"error": tr("Log eerst in om nog een passkey toe te voegen.", "Sign in first to add another passkey.")}), 401
 
         credential_name = str(body.get("credentialName") or body.get("credential_name") or "Owner passkey").strip()
         if invite:
             user_id = invite["userId"]
             username = invite["username"] if invite["kind"] == "reset" else str(body.get("username") or invite["username"]).strip()
-            problem = None if invite["kind"] == "reset" else users.check_new_username(username, invite)
+            problem = None if invite["kind"] == "reset" else await users.check_new_username(username, invite)
             if problem:
                 return jsonify({"error": problem}), 400
         else:
-            user_id = acting_user_id()
-            current = current_user()
+            user_id = await acting_user_id()
+            current = await current_user()
             # Alleen de eigenaar kan zijn naam wijzigen; een gewone gebruiker houdt zijn eigen naam.
             username = (str(body.get("username") or "admin").strip() or "admin") if user_id == OWNER_ID or not current else current["username"]
         challenge = make_challenge()
-        store_challenge(f"register:{user_id}", challenge)
-        with connect() as conn:
-            rows = conn.execute("SELECT id FROM passkey_credentials WHERE user_id=? ORDER BY created_at", (user_id,)).fetchall()
+        await store_challenge(f"register:{user_id}", challenge)
+        async with connect() as conn:
+            rows = await conn.execute_fetchall("SELECT id FROM passkey_credentials WHERE user_id=? ORDER BY created_at", (user_id,))
 
         options = {
             "rp": {"name": rp_name(), "id": rp_id()},
@@ -677,34 +988,36 @@ def register_routes(app: Flask) -> None:
         return jsonify({"status": "ok", "userId": user_id, "username": username, "credentialName": credential_name, "options": options})
 
     @app.post("/api/auth/register/verify")
-    def register_verify():
-        ensure_db()
+    async def register_verify():
+        await ensure_db()
         if not auth_enabled():
-            return jsonify({"error": "Passkey auth is disabled"}), 400
-        body = request.get_json(silent=True) or {}
+            return jsonify({"error": tr("Inloggen met een passkey staat uit.", "Passkey sign-in is disabled.")}), 400
+        body = await request_body.json_object()
         from . import users  # lokaal: users importeert dit module
 
         invite = None
         if body.get("invite"):
-            invite = users.find_invite(body.get("invite"))
+            invite = await users.find_invite(body.get("invite"))
             if not invite:
-                return jsonify({"error": tr("Deze uitnodiging bestaat niet meer of is verlopen.", "This invitation no longer exists or has expired.")}), 404
+                return jsonify(
+                    {"error": tr("Deze uitnodiging bestaat niet meer of is verlopen.", "This invitation no longer exists or has expired.")}
+                ), 404
             user_id = invite["userId"]
             username = invite["username"] if invite["kind"] == "reset" else str(body.get("username") or invite["username"]).strip()
         else:
-            if credentials_exist() and auth_required() and not current_user():
-                return jsonify({"error": "Login required to add another passkey"}), 401
-            user_id = acting_user_id()  # een passkey kun je alleen voor jezelf toevoegen
-            current = current_user()
+            if await credentials_exist() and await auth_required() and not await current_user():
+                return jsonify({"error": tr("Log eerst in om nog een passkey toe te voegen.", "Sign in first to add another passkey.")}), 401
+            user_id = await acting_user_id()  # een passkey kun je alleen voor jezelf toevoegen
+            current = await current_user()
             username = (str(body.get("username") or "admin").strip() or "admin") if user_id == OWNER_ID or not current else current["username"]
         credential_name = str(body.get("credentialName") or body.get("credential_name") or "Owner passkey").strip()
         credential = body.get("credential") or {}
-        challenge = pop_challenge(f"register:{user_id}")
+        challenge = await pop_challenge(f"register:{user_id}")
         if not challenge:
-            return jsonify({"error": "No pending challenge"}), 400
+            return jsonify({"error": tr("Deze inlogpoging is verlopen. Probeer het opnieuw.", "This sign-in attempt has expired. Try again.")}), 400
 
         try:
-            credential_id, cose_key_bytes, sign_count = check_registration(credential, challenge)
+            credential_id, cose_key_bytes, sign_count = await check_registration(credential, challenge)
             credential_id_b64 = b64url_encode(credential_id)
         except Exception as exc:
             return jsonify({"error": f"Verification failed: {exc}"}), 400
@@ -712,17 +1025,17 @@ def register_routes(app: Flask) -> None:
         from . import onboarding  # lokaal: onboarding importeert dit module
 
         if invite:
-            if invite["kind"] == "new" and users.check_new_username(username, invite):
-                return jsonify({"error": users.check_new_username(username, invite)}), 409
+            if invite["kind"] == "new" and (taken := await users.check_new_username(username, invite)):
+                return jsonify({"error": taken}), 409
             try:
-                users.register_account(invite, username)  # nieuw account, of de oude inloggegevens wissen bij een reset
+                await users.register_account(invite, username)  # nieuw account, of de oude inloggegevens wissen bij een reset
             except users.UsernameTaken:
                 return jsonify({"error": tr("Deze naam is al in gebruik. Kies een andere.", "This name is already taken. Choose another one.")}), 409
         elif user_id == OWNER_ID:
-            onboarding.begin()
+            await onboarding.begin()
         now = utcnow().isoformat()
-        with connect() as conn:
-            conn.execute(
+        async with connect() as conn:
+            await conn.execute(
                 """
                 INSERT INTO users (id, username, created_at)
                 VALUES (?, ?, ?)
@@ -730,7 +1043,7 @@ def register_routes(app: Flask) -> None:
                 """,
                 (user_id, username, now),
             )
-            conn.execute(
+            await conn.execute(
                 """
                 INSERT INTO passkey_credentials (id, user_id, public_key, sign_count, credential_name, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -741,24 +1054,25 @@ def register_routes(app: Flask) -> None:
                 """,
                 (credential_id_b64, user_id, cose_key_bytes, sign_count, credential_name, now),
             )
+            await conn.commit()
         if invite:
-            users.consume_invite(invite["id"])
+            await users.consume_invite(invite["id"])
         elif user_id == OWNER_ID:
-            set_setting(SETTING_AUTH_MODE, "passkey")
-        token = create_token(user_id, username)
-        return cookie_response({"status": "ok", "username": username}, token)
+            await set_setting(SETTING_AUTH_MODE, "passkey")
+        token = await create_token(user_id, username)
+        return await cookie_response({"status": "ok", "username": username}, token)
 
     @app.post("/api/auth/login/options")
-    def login_options():
-        ensure_db()
+    async def login_options():
+        await ensure_db()
         if not auth_enabled():
-            return jsonify({"error": "Passkey auth is disabled"}), 400
-        with connect() as conn:
-            rows = conn.execute("SELECT id FROM passkey_credentials ORDER BY created_at").fetchall()
+            return jsonify({"error": tr("Inloggen met een passkey staat uit.", "Passkey sign-in is disabled.")}), 400
+        async with connect() as conn:
+            rows = await conn.execute_fetchall("SELECT id FROM passkey_credentials ORDER BY created_at")
         if not rows:
-            return jsonify({"error": "No passkey registered yet"}), 400
+            return jsonify({"error": tr("Er is nog geen passkey ingesteld.", "No passkey has been set up yet.")}), 400
         challenge = make_challenge()
-        store_challenge("login", challenge)
+        await store_challenge("login", challenge)
         return jsonify(
             {
                 "status": "ok",
@@ -773,20 +1087,23 @@ def register_routes(app: Flask) -> None:
         )
 
     @app.post("/api/auth/login/verify")
-    def login_verify():
+    async def login_verify():
         if not auth_enabled():
-            return jsonify({"error": "Passkey auth is disabled"}), 400
-        body = request.get_json(silent=True) or {}
-        credential = body.get("credential") or {}
+            return jsonify({"error": tr("Inloggen met een passkey staat uit.", "Passkey sign-in is disabled.")}), 400
+        body = await request_body.json_object()
+        credential = body.get("credential")
+        if not isinstance(credential, dict):
+            credential = {}
         credential_id = str(credential.get("id") or "")
-        challenge = pop_challenge("login")
+        challenge = await pop_challenge("login")
         if not credential_id:
-            return jsonify({"error": "Credential id is required"}), 400
+            return jsonify({"error": tr("De passkey ontbreekt in het verzoek.", "The passkey is missing from the request.")}), 400
         if not challenge:
-            return jsonify({"error": "No pending challenge"}), 400
+            return jsonify({"error": tr("Deze inlogpoging is verlopen. Probeer het opnieuw.", "This sign-in attempt has expired. Try again.")}), 400
 
-        with connect() as conn:
-            stored = conn.execute(
+        async with connect() as conn:
+            stored = await fetchone(
+                conn,
                 """
                 SELECT c.*, u.username
                 FROM passkey_credentials c
@@ -794,48 +1111,100 @@ def register_routes(app: Flask) -> None:
                 WHERE c.id=?
                 """,
                 (credential_id,),
-            ).fetchone()
+            )
         if not stored:
-            return jsonify({"error": "Unknown credential"}), 400
+            return jsonify({"error": tr("Deze passkey is hier niet bekend.", "This passkey is not known here.")}), 400
 
         try:
-            new_sign_count = check_assertion(credential, challenge, bytes(stored["public_key"]))
+            new_sign_count = await check_assertion(credential, challenge, bytes(stored["public_key"]))
         except Exception as exc:
             return jsonify({"error": f"Verification failed: {exc}"}), 400
 
-        with connect() as conn:
-            conn.execute(
+        async with connect() as conn:
+            await conn.execute(
                 "UPDATE passkey_credentials SET sign_count=?, last_used_at=? WHERE id=?",
                 (new_sign_count, utcnow().isoformat(), credential_id),
             )
-        token = create_token(str(stored["user_id"]), str(stored["username"]))
-        return cookie_response({"status": "ok", "username": stored["username"]}, token)
+            await conn.commit()
+        token = await create_token(str(stored["user_id"]), str(stored["username"]))
+        return await cookie_response({"status": "ok", "username": stored["username"]}, token)
 
     @app.post("/api/auth/logout")
-    def logout():
-        return clear_cookie_response({"status": "ok"})
+    async def logout():
+        token = str(request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
+        if token:
+            sid = await revoke_session(token)  # de cookie wissen is niet genoeg: het token zelf blijft anders geldig tot hij verloopt
+            if sid:
+                from . import push  # lokaal: push importeert dit module
+
+                await push.forget_session(sid)  # de meldingen van de kooktimers op dit toestel stoppen ook (issue #311)
+        return await clear_cookie_response({"status": "ok"})
 
 
 # Alleen de beheerder: Mealie en Albert Heijn koppelen, gebruikers beheren en de serverinstellingen. Gewone gebruikers
 # zien de status ervan wel (/api/mealie/status, /api/ah/auth/status), maar kunnen niets wijzigen.
-ADMIN_PREFIXES = ("/api/users", "/api/server-settings", "/api/audit", "/api/update", "/api/system", "/api/backup", "/api/mealie/auth", "/api/ah/auth/", "/api/picnic/auth/", "/api/jumbo/auth/")
-ADMIN_PATHS = {"/api/offers/sync-all", "/api/offers/ai", "/api/offers/ai/test", "/api/offers/ai/review", "/api/offers/ai/search", "/api/offers/ai/search/plan", "/api/offers/ai/search/status", "/api/ah/auth", "/api/ah/explore", "/api/picnic/auth", "/api/picnic/explore", "/api/jumbo/auth", "/api/jumbo/explore"}
-ADMIN_EXCEPTIONS = {"/api/ah/auth/status", "/api/picnic/auth/status", "/api/jumbo/auth/status"}
+ADMIN_PREFIXES = (
+    "/api/users",
+    "/api/server-settings",
+    "/api/audit",
+    "/api/update",
+    "/api/system",
+    "/api/backup",
+    "/api/price-archive",
+    "/api/mealie/auth",
+    "/api/prices/import",
+    "/api/ah/auth/",
+    "/api/picnic/auth/",
+    "/api/jumbo/auth/",
+    "/api/crisp/auth/",
+    "/api/loose-names",
+)
+ADMIN_PATHS = {
+    "/api/mealie/bulk-import/group",
+    "/api/mealie/nutrition/backfill",
+    "/api/offers/sync-all",
+    "/api/offers/ai",
+    "/api/offers/ai/test",
+    "/api/offers/ai/review",
+    "/api/offers/ai/search",
+    "/api/offers/ai/search/plan",
+    "/api/offers/ai/search/status",
+    "/api/ah/auth",
+    "/api/ah/explore",
+    "/api/picnic/auth",
+    "/api/picnic/explore",
+    "/api/jumbo/auth",
+    "/api/jumbo/explore",
+    "/api/crisp/auth",
+    "/api/crisp/explore",
+    "/api/shared-links/export",
+    "/api/telemetry",
+}
+ADMIN_EXCEPTIONS = {"/api/ah/auth/status", "/api/picnic/auth/status", "/api/jumbo/auth/status", "/api/crisp/auth/status"}
 
 
 def admin_only(path: str) -> bool:
     if path in ADMIN_EXCEPTIONS:
         return False
-    return path in ADMIN_PATHS or any(path == prefix or path.startswith(prefix + "/") or (prefix.endswith("/") and path.startswith(prefix)) for prefix in ADMIN_PREFIXES)
+    return path in ADMIN_PATHS or any(
+        path == prefix or path.startswith(prefix + "/") or (prefix.endswith("/") and path.startswith(prefix)) for prefix in ADMIN_PREFIXES
+    )
 
 
-def require_auth_for_request() -> tuple[dict[str, Any], int] | None:
-    if not auth_required():
-        return None
-    path = request.path
-    # De MCP-ingang en OAuth controleren zelf hun toegangstoken (of, voor /oauth/authorize, de sessie).
-    public_prefixes = ("/static/", "/api/auth/", "/api/invites/", "/oauth/", "/.well-known/oauth-")
-    public_paths = {
+# De adressen van de pagina's (zie static/router.js). Ze geven dezelfde pagina als "/", met het inlogscherm als je niet bent
+# ingelogd, dus ze zijn net zo openbaar als "/". De gegevens zelf komen via /api en daar geldt de gewone controle.
+PAGE_ROOTS = ("recipes", "offers", "import", "stores", "meal-kits", "cart", "profile", "settings", "about")
+
+
+def is_page_path(path: str) -> bool:
+    return any(path == f"/{root}" or path.startswith(f"/{root}/") for root in PAGE_ROOTS)
+
+
+# Zonder inlog bereikbaar. De MCP-ingang en OAuth controleren zelf hun toegangstoken (of, voor /oauth/authorize, de
+# sessie).
+_PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/api/auth/", "/api/invites/", "/oauth/", "/.well-known/oauth-")
+_PUBLIC_PATHS: frozenset[str] = frozenset(
+    {
         "/",
         "/healthz",
         "/.well-known/webauthn",
@@ -845,13 +1214,25 @@ def require_auth_for_request() -> tuple[dict[str, Any], int] | None:
         "/api/onboarding/status",
         "/api/onboarding/start",
     }
-    if path in public_paths or any(path.startswith(prefix) for prefix in public_prefixes):
+)
+
+
+def _is_public_path(path: str) -> bool:
+    return path in _PUBLIC_PATHS or is_page_path(path) or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES)
+
+
+async def require_auth_for_request() -> tuple[dict[str, Any], int] | None:
+    """De before_request-hook van app.py: None als het verzoek door mag, anders de fout en de status."""
+    if not await auth_required():
         return None
-    user = current_user()
+    path = request.path
+    if _is_public_path(path):
+        return None
+    user = await current_user()
     if user:
         if admin_only(path) and user["id"] != OWNER_ID:
             return {"error": tr("Dit kan alleen de beheerder.", "Only the administrator can do this.")}, 403
         return None
-    if not credentials_exist():
-        return {"error": "Setup required"}, 401
-    return {"error": "Unauthorized"}, 401
+    if not await credentials_exist():
+        return {"error": tr("Stel eerst de beveiliging in.", "Set up security first.")}, 401
+    return {"error": tr("Je bent niet ingelogd. Log opnieuw in.", "You are not signed in. Sign in again.")}, 401

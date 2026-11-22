@@ -20,6 +20,12 @@ configuration:
   openai_api_key:
     name: ChatGPT API key
     description: Optional. Lets ChatGPT review the matches between ingredients and offers.
+  anthropic_base_url:
+    name: Claude API address
+    description: Optional. Another address with the Anthropic API, without /v1 (for example a LiteLLM proxy). Default https://api.anthropic.com.
+  openai_base_url:
+    name: ChatGPT API address
+    description: Optional. Another address with the OpenAI API, with /v1 (for example a LiteLLM proxy, Azure OpenAI or a local model). Default https://api.openai.com/v1.
   picnic_country_code:
     name: Picnic country
     description: The country of your Picnic account. Default NL.
@@ -29,9 +35,6 @@ configuration:
   offers_sync_hour:
     name: Hour of the daily offers run
     description: The hour of the day (0 to 23) at which the offers are fetched. Default 5.
-  default_portions:
-    name: Default portions
-    description: How many people (1 to 12) a meal counts for in the week menu and the basket when nobody set its portions. Optional; empty means off (then the recipe applies). The value in the app (Settings > System) takes precedence.
   mcp:
     name: MCP server for AI assistants
     description: Start value of the MCP server (on by default, when login is on). The switch in the app (Profile > AI apps) takes precedence.
@@ -40,7 +43,7 @@ configuration:
     description: Let the app check GitHub for a newer release and tell the administrator. Nothing about you or the installation is sent. On by default. Home Assistant shows add-on updates itself.
   audit_log:
     name: Audit log
-    description: Store the traffic with Albert Heijn, Picnic and Jumbo and the requests of AI assistants in the audit log (Settings > Audit log). On by default.
+    description: Store the traffic with Albert Heijn, Picnic, Jumbo, Crisp, Lidl and Aldi and the requests of AI assistants in the audit log (Settings > Audit log). On by default.
   audit_retention_days:
     name: Audit log retention (days)
     description: After how many days entries are deleted. Default 30; 0 never deletes on its own.

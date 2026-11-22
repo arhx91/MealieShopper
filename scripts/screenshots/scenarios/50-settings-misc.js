@@ -1,4 +1,4 @@
-// Instellingen (Koppelen, Auditlog, Systeem), AI-apps, Over, de beta-build en het donkere thema.
+// Instellingen (Koppelen, Auditlog, Systeem, Voorkeuren en de navigatiebalk), AI-apps, Over, de beta-build en het donkere thema.
 const { DISHES, WEEK, VERSION, NEWER } = require("../demo");
 
 // Open een scherm via de functies van de app (zoals het avatar-menu dat doet) en wacht even op het laden.
@@ -19,10 +19,14 @@ const OFFERS_STATUS = {
     ah: { linked: true, syncedAt: "2026-10-28T04:00:21Z", total: 412 },
     picnic: { linked: true, syncedAt: "2026-10-28T04:00:48Z", total: 186 },
     jumbo: { linked: true, syncedAt: "2026-10-28T04:01:09Z", total: 354 },
+    crisp: { linked: true, syncedAt: "2026-10-28T04:01:22Z", total: 97 },
+    // Lidl en Aldi (sinds 4.6.0) hebben geen koppeling nodig; de server geeft elke winkel uit offers.STORES terug.
+    lidl: { linked: true, syncedAt: "2026-10-28T04:01:35Z", total: 143 },
+    aldi: { linked: true, syncedAt: "2026-10-28T04:01:47Z", total: 118 },
   },
 };
 
-// Een AI-sleutel van Claude is ingesteld, dus het blok AI-beoordeling staat ingeklapt.
+// Een AI-sleutel van Claude is ingesteld; het blok AI-beoordeling staat standaard ingeklapt, het blok Aanbiedingen open.
 const AI_REVIEW = {
   active: "anthropic",
   chosen: "",
@@ -41,7 +45,7 @@ const LINK_ROUTES = { "/api/offers/status": OFFERS_STATUS, "/api/offers/ai": AI_
 // Klap het blok van één winkel open en zet het bovenaan het scherm, onder de vaste balk.
 const openStoreBlock = (store, fill) => async (page) => {
   await openSettings("settings-link")(page);
-  await page.click(`#${store}-login-toggle`);
+  if ((await page.getAttribute(`#${store}-login-toggle`, "aria-expanded")) !== "true") await page.click(`#${store}-login-toggle`);
   if (fill) await fill(page);
   await page.evaluate((name) => {
     const box = document.getElementById(`${name}-login-box`);
@@ -55,8 +59,9 @@ const settingsScenarios = [
     routes: LINK_ROUTES,
     run: async (page) => {
       await openSettings("settings-link")(page);
-      // De vier meldingen en daaronder de ingeklapte blokken, zonder de kop van de pagina.
-      await page.evaluate(() => window.scrollTo({ top: document.getElementById("mealie-status").getBoundingClientRect().top + window.scrollY - 84 }));
+      // Sinds 4.13.0 bovenaan: de meldingen per koppeling, de ingeklapte blokken van Mealie en de winkels en daaronder de
+      // hulpmiddelen.
+      await page.evaluate(() => window.scrollTo({ top: 0 }));
     },
   },
   {
@@ -72,6 +77,15 @@ const settingsScenarios = [
     name: "settings-jumbo",
     routes: LINK_ROUTES,
     run: openStoreBlock("jumbo"),
+  },
+  {
+    // Crisp koppelen: het e-mailadres, en daaronder het veld voor de code die Crisp mailt.
+    name: "settings-crisp",
+    routes: { ...LINK_ROUTES, "/api/crisp/auth/status*": { connected: false, verified: false, codePending: true, country: "nl" } },
+    run: openStoreBlock("crisp", async (page) => {
+      await page.fill("#crisp-email", "anna@example.nl");
+      await page.evaluate(() => document.activeElement.blur());
+    }),
   },
 ];
 
@@ -256,6 +270,46 @@ const miscScenarios = [
     theme: "dark",
     routes: plan.routes,
     run: plan.run,
+  },
+  {
+    // Instellingen, Voorkeuren, Supermarkt: Jumbo is de voorkeurssupermarkt. Het bewaren wordt nagebootst, zodat de keuze niet
+    // op de server blijft staan voor de volgende scenario's.
+    name: "preferences",
+    routes: { "/api/profile/preferences": { preferredStore: "jumbo" } },
+    run: async (page) => {
+      await openSettings("settings-appearance")(page);
+      await page.click("#appearance-store-toggle");
+      await page.click('label.appearance-option:has(input[name="appearance-store"][value="jumbo"])');
+      await page.evaluate(() => window.scrollTo({ top: 0 }));
+    },
+  },
+  {
+    // Instellingen, Voorkeuren: Weergave en Thema open, het donkere thema met de donkergrijze achtergrond en blauw als accentkleur.
+    name: "appearance",
+    theme: "dark",
+    run: async (page) => {
+      await openSettings("settings-appearance")(page);
+      await page.click("#appearance-display-toggle");
+      await page.click("#appearance-theme-toggle");
+      await page.evaluate(() => {
+        THEME.apply({ darkBackground: "grey", accent: "#0b62c4" });
+        const box = document.getElementById("appearance-display-box");
+        window.scrollTo({ top: box.getBoundingClientRect().top + window.scrollY - 84 });
+      });
+    },
+  },
+  {
+    // Instellingen, Voorkeuren, Thema, Navigatiebalk: Android-achtig gekozen; de telefoon toont die balk onderaan.
+    name: "navbar",
+    run: async (page) => {
+      await openSettings("settings-appearance")(page);
+      await page.click("#appearance-theme-toggle");
+      await page.evaluate(() => {
+        THEME.apply({ navbarStyle: "android" });
+        const box = document.getElementById("appearance-nav-box");
+        window.scrollTo({ top: box.getBoundingClientRect().top + window.scrollY - 84 });
+      });
+    },
   },
 ];
 

@@ -1,5 +1,7 @@
 const state = {
   weekOffset: 0,
+  firstDayOfWeek: 1, // waar de week begint, zoals Mealie telt (0 = zondag, 1 = maandag); komt uit /api/mealie/status
+  weekStartKnown: false, // het antwoord van /api/mealie/status is binnen (of mislukt): tot dan is de week een gok, zie weekStartSettled
   entries: null,
   planAutoLoaded: false, // het weekmenu is na het koppelen van Mealie eenmaal vanzelf geladen
   auth: null,
@@ -16,12 +18,16 @@ const state = {
   ahRecipesLoaded: false,
   ahRecipes: [],
   ahRecipeQuery: "",
+  ahRecipeGroups: [], // de receptgroepen van AH: [{id, name, count, recipeIds}]
+  ahRecipeGroup: "", // de gekozen groep; "" is alle bewaarde recepten
   about: null,
   aboutLoaded: false,
-  store: "ah", // de keuze voor het weekmenu: "ah", "picnic" of "jumbo"
-  itemsStore: "ah", // de winkel in de tab Winkels: "ah" of "jumbo"
-  preferredStore: "ah", // de laatste keuze van de gebruiker; geldt zodra die winkel als gekoppeld bekend is
-  linkedStores: { picnic: false, jumbo: false, mealie: false }, // gezet door picnic.js, jumbo.js en renderMealieStatus; AH is altijd een keuze
+  store: "ah", // de keuze voor het weekmenu: "ah", "picnic", "jumbo" of "crisp"
+  itemsStore: "ah", // de winkel in de tab Winkels: "ah", "jumbo", "picnic" of "crisp"
+  itemsStoreChosen: false, // zelf een winkel gekozen in Winkels (menu of adres); tot dan volgt hij de voorkeurssupermarkt
+  preferredStore: "ah", // de laatste keuze van de gebruiker in het weekmenu; geldt zodra die winkel als gekoppeld bekend is
+  linkedStores: { picnic: false, jumbo: false, crisp: false, mealie: false }, // gezet door picnic.js, jumbo.js, crisp.js en renderMealieStatus; AH is altijd een keuze
+  storeStatusKnown: { picnic: false, jumbo: false, crisp: false }, // de status van die koppeling is binnen (gekoppeld of niet)
 };
 
 // Material Design Icons (zie static/icons/LICENSE-mdi.txt)
@@ -31,6 +37,13 @@ const MDI_PLUS = "M19,13H13V19H11V13H5V11H11V5H13V11H19V13Z";
 const MDI_MINUS = "M19,13H5V11H19V13Z";
 const MDI_LOADING = "M12,4V2A10,10 0 0,0 2,12H4A8,8 0 0,1 12,4Z";
 const MDI_CHECK_CIRCLE_OUTLINE = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
+const MDI_IMAGE_OUTLINE = "M19,19H5V5H19M19,3H5A2,2 0 0,0 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5A2,2 0 0,0 19,3M13.96,12.29L11.21,15.83L9.25,13.47L6.5,17H17.5L13.96,12.29Z";
+const MDI_CART_PLUS = "M11,9H13V6H16V4H13V1H11V4H8V6H11M7,18A2,2 0 0,0 5,20A2,2 0 0,0 7,22A2,2 0 0,0 9,20A2,2 0 0,0 7,18M17,18A2,2 0 0,0 15,20A2,2 0 0,0 17,22A2,2 0 0,0 19,20A2,2 0 0,0 17,18M7.17,14.75L7.2,14.63L8.1,13H15.55C16.3,13 16.96,12.59 17.3,11.97L21.16,4.96L19.42,4H19.41L18.31,6L15.55,11H8.53L8.4,10.73L6.16,6L5.21,4L4.27,2H1V4H3L6.6,11.59L5.25,14.04C5.09,14.32 5,14.65 5,15A2,2 0 0,0 7,17H19V15H7.42C7.29,15 7.17,14.89 7.17,14.75Z";
+const MDI_COMPARE_HORIZONTAL = "M9 14H2V16H9V19L13 15L9 11V14M15 13V10H22V8H15V5L11 9L15 13Z";
+const MDI_CHART_LINE = "M16,11.78L20.24,4.45L21.97,5.45L16.74,14.5L10.23,10.75L5.46,19H22V21H2V3H4V17.54L9.5,8L16,11.78Z";
+// Een oog: Prijs volgen bij een aanbieding (watched.js).
+const MDI_EYE = "M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z";
+const MDI_STORE = "M12,18H6V14H12M21,14V12L20,7H4L3,12V14H4V20H14V14H18V20H20V14M20,4H4V6H20V4Z";
 const MDI_FLAG_OUTLINE = "M12.36,6L12.76,8H18V14H14.64L14.24,12H7V6H12.36M14,4H5V21H7V14H12.6L13,16H20V6H14.4";
 const MDI_PENCIL_OUTLINE =
   "M14.06,9L15,9.94L5.92,19H5V18.08L14.06,9M17.66,3C17.41,3 17.15,3.1 16.96,3.29L15.13,5.12L18.88,8.87L20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18.17,3.09 17.92,3 17.66,3M14.06,6.19L3,17.25V21H6.75L17.81,9.94L14.06,6.19Z";
@@ -39,6 +52,13 @@ const MDI_OPEN_IN_NEW =
 
 function mdiIcon(path, className = "mdi") {
   return `<svg class="${className}" viewBox="0 0 24 24" aria-hidden="true"><path d="${path}"/></svg>`;
+}
+
+// Een badge: een gekleurd label met tekst (status, bespaard, bonus, eerder gekocht). De soort bepaalt de kleur in de CSS
+// (.badge--<soort>); de tekst staat er altijd, dus kleur is nooit het enige signaal.
+function badge(kind, text, title = "") {
+  const hint = title ? ` title="${escapeHtml(title)}"` : "";
+  return `<span class="badge badge--${kind}"${hint}>${escapeHtml(text)}</span>`;
 }
 
 const MDI_LINK = "M10.59,13.41C11,13.8 11,14.44 10.59,14.83C10.2,15.22 9.56,15.22 9.17,14.83C7.22,12.88 7.22,9.71 9.17,7.76V7.76L12.71,4.22C14.66,2.27 17.83,2.27 19.78,4.22C21.73,6.17 21.73,9.34 19.78,11.29L18.29,12.78C18.3,11.96 18.17,11.14 17.89,10.36L18.36,9.88C19.54,8.71 19.54,6.81 18.36,5.64C17.19,4.46 15.29,4.46 14.12,5.64L10.59,9.17C9.41,10.34 9.41,12.24 10.59,13.41M13.41,9.17C13.8,8.78 14.44,8.78 14.83,9.17C16.78,11.12 16.78,14.29 14.83,16.24V16.24L11.29,19.78C9.34,21.73 6.17,21.73 4.22,19.78C2.27,17.83 2.27,14.66 4.22,12.71L5.71,11.22C5.7,12.04 5.83,12.86 6.11,13.65L5.64,14.12C4.46,15.29 4.46,17.19 5.64,18.36C6.81,19.54 8.71,19.54 9.88,18.36L13.41,14.83C14.59,13.66 14.59,11.76 13.41,10.59C13,10.2 13,9.56 13.41,9.17Z";
@@ -91,6 +111,27 @@ function $(selector) {
   return document.querySelector(selector);
 }
 
+// Een productfoto van een winkel via de eigen cache (/api/images/<token>, zie image_cache.py): de server haalt hem een keer op
+// en serveert hem daarna van schijf, zodat de browser niet bij de winkel hotlinkt. Een adres van een andere host (Mealie, een
+// maaltijdbox) blijft zoals het is. Het token is het adres in URL-veilige base64 zonder "=".
+// Lidl en Aldi: alleen de hosts van hun productfoto's (de server controleert ook het pad, zie image_cache.store_for).
+const STORE_IMAGE_HOSTS = [/(^|\.)static\.ah\.nl$/, /(^|\.)jumbo\.com$/, /\.picnicinternational\.com$/, /(^|\.)crispapp\.nl$/, /^www\.lidl\.nl$/, /^imgproxy-retcat\.assets\.schwarz$/, /^s7g10\.scene7\.com$/];
+
+function storeImage(url) {
+  if (!url) return url;
+  let host = "";
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return url;
+    host = parsed.hostname;
+  } catch {
+    return url;
+  }
+  if (!STORE_IMAGE_HOSTS.some((pattern) => pattern.test(host))) return url;
+  const token = btoa(unescape(encodeURIComponent(String(url)))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  return `/api/images/${token}`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -100,14 +141,48 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+// De sessie verliep terwijl de app open stond (een 401 op een gewone route): de inlogpoort komt over de pagina, met de reden
+// erbij. De pagina eronder blijft staan, dus na het inloggen ga je verder waar je was. Een keer tegelijk: tien verzoeken die
+// samen een 401 krijgen vragen de status maar een keer op.
+let sessionExpiredCheck = null;
+
+function sessionExpired() {
+  if (sessionExpiredCheck) return sessionExpiredCheck;
+  sessionExpiredCheck = (async () => {
+    try {
+      await refreshAuthStatus();
+      if (state.auth?.enabled && !state.auth?.authenticated) message("#auth-message", t("err.session_expired"), "info");
+    } catch {
+      // Geen verbinding of een serverfout: de melding van het verzoek zelf volstaat.
+    } finally {
+      sessionExpiredCheck = null;
+    }
+  })();
+  return sessionExpiredCheck;
+}
+
 async function jsonFetch(url, options = {}) {
-  const response = await fetch(url, { credentials: "same-origin", ...options });
+  let response;
+  try {
+    response = await fetch(url, { credentials: "same-origin", ...options });
+  } catch (error) {
+    // Een afgebroken verzoek (AbortController) is geen storing: wie het afbrak, handelt het zelf af.
+    if (error?.name === "AbortError") throw error;
+    // Geen netwerk of de server is weg: de browser geeft dan zijn eigen Engelse tekst ("Failed to fetch", "Load failed").
+    throw new Error(t("err.offline"));
+  }
+  // De routes onder /api/auth/ geven zelf een 401 bij een verkeerd wachtwoord of een verlopen kaartje: dat is geen verlopen sessie.
+  if (response.status === 401 && state.auth?.authenticated && state.auth?.enabled && !String(url).startsWith("/api/auth/")) {
+    sessionExpired();
+    throw new Error(t("err.session_expired"));
+  }
   let data;
   try {
     data = await response.json();
   } catch (error) {
+    // De tip over de reverse proxy en de container-logs is voor de beheerder; een gewone gebruiker kan er niets mee (sinds 4.12.0).
     const proxyHint =
-      response.status === 502 || response.status === 504
+      (response.status === 502 || response.status === 504) && !document.documentElement.classList.contains("is-regular-user")
         ? t("err.proxy_hint")
         : "";
     throw new Error(
@@ -122,8 +197,87 @@ async function jsonFetch(url, options = {}) {
   return data;
 }
 
+// Een melding in het vak `target`. Soorten: "error" (de standaard), "warning", "success" en "info" (neutraal: bezig, wachten,
+// een mededeling zonder oordeel). Een fout of waarschuwing is een `alert`, de rest een `status`: zo leest een schermlezer de
+// melding voor zonder dat elk van de vakken in de pagina zelf een rol hoeft te hebben.
+// Een vraag in een eigen venster (sinds 4.12.0), in plaats van window.confirm: in de huisstijl, in de taal van de app (de knoppen
+// van de browser volgden de taal van het toestel), en niet te onderdrukken in een geinstalleerde app. Geeft een belofte: waar bij
+// de bevestigknop, onwaar bij Annuleren, Escape of een tik naast het venster. `danger` kleurt de knop rood en zet de focus op
+// Annuleren: bij iets dat niet terug kan is de veilige keuze de standaard.
+function confirmDialog(text, { confirm = t("common.confirm"), cancel = t("common.cancel"), danger = false } = {}) {
+  const dialog = $("#confirm-dialog");
+  const yes = $("#confirm-dialog-yes");
+  const no = $("#confirm-dialog-no");
+  $("#confirm-dialog-text").textContent = text;
+  yes.textContent = confirm;
+  no.textContent = cancel;
+  yes.classList.toggle("button--danger", danger);
+  return new Promise((resolve) => {
+    let answer = false;
+    const onYes = () => {
+      answer = true;
+      dialog.close();
+    };
+    const onNo = () => dialog.close();
+    const onBackdrop = (event) => {
+      if (event.target === dialog) dialog.close();
+    };
+    const onClose = () => {
+      yes.removeEventListener("click", onYes);
+      no.removeEventListener("click", onNo);
+      dialog.removeEventListener("click", onBackdrop);
+      resolve(answer);
+    };
+    yes.addEventListener("click", onYes);
+    no.addEventListener("click", onNo);
+    dialog.addEventListener("click", onBackdrop);
+    dialog.addEventListener("close", onClose, { once: true });
+    dialog.showModal();
+    (danger ? no : yes).focus();
+  });
+}
+
+// Een laadtoestand met vaste ruimte (sinds 4.12.0): een draaiend icoon met tekst in een vak van 160 px, zodat de pagina niet
+// verspringt als de inhoud komt. Daarvoor stond er een regel grijze tekst, of niets.
+function loadingHtml(text = t("common.loading")) {
+  return `<div class="loading-box" role="status">${mdiIcon(MDI_LOADING, "loading-box__icon")}<span>${escapeHtml(text)}</span></div>`;
+}
+
+// Het weekmenu terwijl het laadt: zeven lege dagkaarten op de plek van de echte, zodat de boodschappenlijst eronder niet springt.
+function mealPlanSkeletonHtml(days) {
+  return days.map(() => '<article class="day-card day-card--skeleton" aria-hidden="true"><span></span><span></span><span></span></article>').join("");
+}
+
+// Een korte melding onderaan het scherm (sinds 4.12.0), voor wat geen eigen vak heeft: "Opgeslagen" na een schakelaar, of een
+// fout bij een knop in een menu. Een succes verdwijnt na vier seconden; een fout blijft staan tot je hem sluit.
+function toast(text, type = "success") {
+  const box = $("#toasts");
+  if (!box || !text) return;
+  const item = document.createElement("div");
+  item.className = `toast toast--${type}`;
+  item.setAttribute("role", type === "error" ? "alert" : "status");
+  const label = document.createElement("span");
+  label.textContent = text;
+  item.append(label);
+  if (type === "error") {
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "toast__close";
+    close.textContent = t("common.close");
+    close.addEventListener("click", () => item.remove());
+    item.append(close);
+  } else {
+    setTimeout(() => item.remove(), 4000);
+  }
+  box.querySelectorAll(`.toast--${type}`).forEach((old) => {
+    if (old.textContent === item.textContent) old.remove(); // dezelfde melding stapelt niet
+  });
+  box.append(item);
+}
+
 function message(target, text, type = "error") {
-  $(target).innerHTML = text ? `<div class="message ${type}">${escapeHtml(text)}</div>` : "";
+  const role = type === "error" || type === "warning" ? "alert" : "status";
+  $(target).innerHTML = text ? `<div class="message ${type}" role="${role}">${escapeHtml(text)}</div>` : "";
 }
 
 function bufferToBase64url(buffer) {
@@ -214,6 +368,20 @@ function renderAuthState() {
   if (typeof renderInviteGate === "function") renderInviteGate();
   if (typeof applyRole === "function") applyRole();
   if (typeof renderUpdate === "function") renderUpdate();
+  syncAppInert();
+}
+
+// Staat het inlogscherm, een uitnodiging of de installatiehulp over de pagina, dan is de app erachter buiten bereik van Tab en
+// van een schermlezer (sinds 4.12.0). De installatiehulp noemde zich al een modaal venster, maar Tab liep de app erachter in.
+function syncAppInert() {
+  const covered = ["#auth-gate", "#invite-gate", "#onboarding"].some((selector) => {
+    const layer = document.querySelector(selector);
+    return Boolean(layer && !layer.hidden);
+  });
+  for (const selector of [".topbar", "main.shell"]) {
+    const part = document.querySelector(selector);
+    if (part) part.inert = covered;
+  }
 }
 
 function formatCredentialDate(value) {
@@ -277,6 +445,7 @@ function continueAfterLogin() {
 
 async function refreshAuthStatus() {
   state.auth = await jsonFetch("/api/auth/status");
+  if (typeof appearanceFromProfile === "function") appearanceFromProfile(); // de weergave van deze gebruiker
   if (typeof loadOnboardingStatus === "function") await loadOnboardingStatus();
   renderAuthState();
   if (continueAfterLogin()) return state.auth;
@@ -286,13 +455,15 @@ async function refreshAuthStatus() {
     refreshMealieStatus();
     if (typeof refreshPicnicStatus === "function") refreshPicnicStatus();
     if (typeof refreshJumboStatus === "function") refreshJumboStatus();
+    if (typeof refreshCrispStatus === "function") refreshCrispStatus();
     if (typeof startUpdateCheck === "function") startUpdateCheck();
+    if (typeof routerStart === "function") routerStart();
   }
   return state.auth;
 }
 
 async function registerPasskey({ username, credentialName, messageTarget, invite }) {
-  message(messageTarget, t("passkey.waiting"), "success");
+  message(messageTarget, t("passkey.waiting"), "info");
   const payload = await jsonFetch("/api/auth/register/options", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -336,7 +507,7 @@ async function addPasskey() {
 }
 
 async function deletePasskey(credentialId) {
-  if (!window.confirm(t("passkey.confirm_delete"))) return;
+  if (!(await confirmDialog(t("passkey.confirm_delete"), { danger: true, confirm: t("passkey.delete") }))) return;
   try {
     await jsonFetch(`/api/auth/credentials/${encodeURIComponent(credentialId)}`, { method: "DELETE" });
     message("#security-message", t("passkey.deleted"), "success");
@@ -347,7 +518,7 @@ async function deletePasskey(credentialId) {
 }
 
 async function loginWithPasskey() {
-  message("#auth-message", t("passkey.waiting"), "success");
+  message("#auth-message", t("passkey.waiting"), "info");
   const payload = await jsonFetch("/api/auth/login/options", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -365,7 +536,7 @@ async function loginWithPasskey() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ credential: publicKeyCredentialToJSON(credential) }),
   });
-  message("#auth-message", "Ingelogd.", "success");
+  message("#auth-message", t("auth.logged_in"), "success");
   await refreshAuthStatus();
 }
 
@@ -454,20 +625,25 @@ function localIsoDate(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function mondayOf(date) {
-  const monday = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const dow = monday.getDay();
-  monday.setDate(monday.getDate() - (dow === 0 ? 6 : dow - 1));
-  return monday;
+// De eerste dag van de week waarin `date` valt. `firstDay` telt zoals Mealie en getDay(): 0 = zondag, 1 = maandag ... 6 = zaterdag.
+function weekStartOf(date, firstDay = state.firstDayOfWeek) {
+  const start = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  start.setDate(start.getDate() - ((start.getDay() - firstDay + 7) % 7));
+  return start;
 }
 
+// De zeven dagen vanaf `start`, met het begin en eind (JJJJ-MM-DD) en een label als "7 nov - 13 nov".
+function weekFrom(start) {
+  const days = Array.from({ length: 7 }, (_, index) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + index));
+  const label = (d) => `${d.getDate()} ${monthShort(d)}`;
+  return { start: localIsoDate(days[0]), end: localIsoDate(days[6]), days: days.map(localIsoDate), label: `${label(days[0])} - ${label(days[6])}` };
+}
+
+// De week van het weekmenu, `offset` weken van de huidige. Ze begint op de eerste dag uit Mealie of de instelling van de beheerder.
 function getWeekBounds(offset = 0) {
   const today = new Date();
   today.setDate(today.getDate() + offset * 7);
-  const monday = mondayOf(today);
-  const days = Array.from({ length: 7 }, (_, index) => new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + index));
-  const label = (d) => `${d.getDate()} ${monthShort(d)}`;
-  return { start: localIsoDate(days[0]), end: localIsoDate(days[6]), days: days.map(localIsoDate), label: `${label(days[0])} - ${label(days[6])}` };
+  return weekFrom(weekStartOf(today));
 }
 
 // "Deze week", "Volgende week", "+2 weken": hoe ver een week van de huidige af ligt. Het weekmenu en Aanbiedingen gebruiken dezelfde tekst.
@@ -482,6 +658,8 @@ function updateWeekLabel() {
   const week = getWeekBounds(state.weekOffset);
   $("#week-range").textContent = week.label;
   $("#week-offset").textContent = weekOffsetText(state.weekOffset);
+  // Deze week staat er alleen als je een andere week bekijkt (sinds 4.8.0, gelijk bij Weekmenu, Aanbiedingen en Maaltijdboxen).
+  $("#this-week").hidden = state.weekOffset === 0;
 }
 
 // Een andere week kiezen. Het weekmenu en het tabblad Aanbiedingen delen de week: plan je volgende week, dan zie je de aanbiedingen
@@ -491,6 +669,21 @@ function setPlanWeek(offset) {
   state.weekOffset = offset;
   updateWeekLabel();
   if (state.planAutoLoaded) loadMealPlan();
+}
+
+// De week in het adres (sinds 4.13.0): ?week=<eerste dag> zolang je een andere week dan de huidige bekijkt, zodat herladen, een
+// bladwijzer en Terug bij dezelfde week uitkomen. Deze week heeft geen parameter.
+function weekParam() {
+  return state.weekOffset ? getWeekBounds(state.weekOffset).start : "";
+}
+
+// Hoeveel weken een dag uit het adres van de huidige week af ligt. Geen geldige dag: 0, deze week. Hooguit twee jaar ver.
+function weekOffsetOf(day, today = new Date()) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(day || ""))) return 0;
+  const date = new Date(`${day}T12:00:00`);
+  if (Number.isNaN(date.getTime())) return 0;
+  const weeks = Math.round((weekStartOf(date) - weekStartOf(today)) / (7 * 24 * 60 * 60 * 1000));
+  return Math.max(-104, Math.min(104, weeks));
 }
 
 function formatDate(dateStr) {
@@ -570,6 +763,157 @@ function mealServings(entry) {
   return servings.scale && servings.scale !== 1 ? t("plan.scale", { n: I18N.formatNumber(servings.scale) }) : "";
 }
 
+// ---- Calorieën (issue #283): per portie (per persoon), uit Mealie of de winkel, en voor de geplande porties samen. Elke
+// waarde staat in een eigen <span class="kcal">, zodat Calorieën tonen (html.no-calories, zie theme.js) ze kan verbergen; de
+// punt ervoor komt dan uit CSS (kcal--after), zodat er geen losse punt blijft staan.
+function kcalSpan(key, kcal, after = false) {
+  if (!kcal) return "";
+  return `<span class="kcal${after ? " kcal--after" : ""}">${escapeHtml(t(key, { kcal: I18N.formatNumber(Math.round(kcal)) }))}</span>`;
+}
+
+// Een regel met feiten ("4 porties · 30 min") als HTML, met daarachter de calorieën (`[sleutel, kcal]`, lege vallen weg).
+function factsWithKcal(parts, kcals = []) {
+  const text = escapeHtml(parts.filter(Boolean).join(" \u00b7 "));
+  const shown = kcals.filter(([, value]) => value);
+  return text + shown.map(([key, value], index) => kcalSpan(key, value, Boolean(text) || index > 0)).join("");
+}
+
+// De kcal per portie van een recept: `kcal` uit Mealie, anders de energie uit de voedingswaarden van de winkel.
+function recipeKcal(recipe) {
+  const value = recipe?.kcal ?? (recipe?.nutrition || []).find((item) => item?.key === "calories")?.quantity;
+  return Number(value) > 0 ? Number(value) : null;
+}
+
+// ---- Voedingswaarden (vervolg op #283): per portie uit Mealie of de winkel, als `[{key, quantity, unit}]` (zie
+// mealieshopper/nutrition.py). Natrium (mg) tonen we als zout in gram, zoals op een verpakking: zout = natrium x 2,5.
+const SODIUM_MG_PER_SALT_G = 400;
+
+// De rijen van de tabel in de volgorde van een etiket: [veld, naam, ingesprongen ("waarvan ...")]. `salt` komt uit natrium.
+const NUTRITION_ROWS = [
+  ["calories", "nutrition.calories", false],
+  ["proteinContent", "nutrition.proteinContent", false],
+  ["fatContent", "nutrition.fatContent", false],
+  ["saturatedFatContent", "nutrition.saturatedFatContent", true],
+  ["unsaturatedFatContent", "nutrition.unsaturatedFatContent", true],
+  ["transFatContent", "nutrition.transFatContent", true],
+  ["carbohydrateContent", "nutrition.carbohydrateContent", false],
+  ["sugarContent", "nutrition.sugarContent", true],
+  ["fiberContent", "nutrition.fiberContent", false],
+  ["salt", "nutrition.salt", false],
+  ["cholesterolContent", "nutrition.cholesterolContent", false],
+];
+
+// De waarden als `{veld: getal}`, met `salt` (g) uit `sodiumContent` (mg).
+function nutritionValues(items) {
+  const values = {};
+  for (const item of items || []) {
+    if (item?.key && Number.isFinite(Number(item.quantity))) values[item.key] = Number(item.quantity);
+  }
+  if (values.sodiumContent != null) values.salt = values.sodiumContent / SODIUM_MG_PER_SALT_G;
+  return values;
+}
+
+// Een hoeveelheid met eenheid: kcal heel, gram met een decimaal onder de 10, zout met twee decimalen onder de 1 g.
+function nutrientAmount(key, value) {
+  const amount = Number(value);
+  if (value == null || !Number.isFinite(amount)) return "";
+  if (key === "calories") return `${I18N.formatNumber(Math.round(amount))} kcal`;
+  const digits = key === "salt" && amount < 1 ? 2 : amount < 10 ? 1 : 0;
+  const factor = 10 ** digits;
+  return `${I18N.formatNumber(Math.round(amount * factor) / factor)} ${key === "cholesterolContent" ? "mg" : "g"}`;
+}
+
+// De tabel "Voedingswaarden" onder een recept: per portie, en met `servings` (geplande porties, niet 1) ook het totaal.
+function nutritionTable(items, { servings = null, headingLevel = 4 } = {}) {
+  const values = nutritionValues(items);
+  const rows = NUTRITION_ROWS.filter(([key]) => values[key] != null);
+  if (!rows.length) return "";
+  const count = Number(servings) > 0 && Number(servings) !== 1 ? Number(servings) : 0;
+  const head = `<tr><th scope="col"><span class="visually-hidden">${escapeHtml(t("nutrition.title"))}</span></th><th scope="col">${escapeHtml(t("nutrition.per_serving"))}</th>${
+    count ? `<th scope="col">${escapeHtml(tn("nutrition.total", count))}</th>` : ""
+  }</tr>`;
+  const body = rows
+    .map(([key, label, sub]) => `<tr${sub ? ' class="nutrition-table__sub"' : ""}><th scope="row">${escapeHtml(t(label))}</th><td>${escapeHtml(nutrientAmount(key, values[key]))}</td>${
+      count ? `<td>${escapeHtml(nutrientAmount(key, values[key] * count))}</td>` : ""
+    }</tr>`)
+    .join("");
+  return `<section class="nutrition-facts"><h${headingLevel} class="nutrition-facts__title">${escapeHtml(t("nutrition.title"))}</h${headingLevel}>
+    <table class="nutrition-table"><thead>${head}</thead><tbody>${body}</tbody></table></section>`;
+}
+
+// "27 g eiwit", "6 g suiker" en "0,5 g zout" uit de waarden (nutritionValues), voor zover bekend.
+function nutritionBriefParts(values) {
+  return [
+    ["proteinContent", "nutrition.brief_protein"],
+    ["sugarContent", "nutrition.brief_sugar"],
+    ["salt", "nutrition.brief_salt"],
+  ]
+    .filter(([key]) => values[key] != null)
+    .map(([key, label]) => t(label, { amount: nutrientAmount(key, values[key]) }));
+}
+
+// Kort, voor een kaart: "27 g eiwit · 6 g suiker · 0,5 g zout" achter de kcal (`after`: met de punt ervoor, zoals kcalSpan).
+function nutritionBrief(items, after = true) {
+  const parts = nutritionBriefParts(nutritionValues(items)).map((part) => `<span class="nutrition-brief__part">${escapeHtml(part)}</span>`);
+  return parts.length ? `<span class="kcal nutrition-brief${after ? " kcal--after" : ""}">${parts.join(" \u00b7 ")}</span>` : "";
+}
+
+// Wat één persoon op een dag binnenkrijgt: de som per portie van de maaltijden met een recept. Een notitie telt niet mee; een
+// recept zonder voedingswaarden telt in `without`.
+function dayNutrition(entries) {
+  const totals = {};
+  let without = 0;
+  for (const entry of entries || []) {
+    if (!entry.recipe && !entry.recipeId) continue;
+    const values = nutritionValues(entry.nutrition);
+    if (!Object.keys(values).length) {
+      without += 1;
+      continue;
+    }
+    for (const [key, value] of Object.entries(values)) totals[key] = (totals[key] || 0) + value;
+  }
+  return { totals, without };
+}
+
+// De regel onder een dag in het weekmenu: "Per persoon: 1.850 kcal · 85 g eiwit · ...", of "" zonder voedingswaarden.
+function dayNutritionLine(entries) {
+  const { totals, without } = dayNutrition(entries);
+  if (!Object.keys(totals).length) return "";
+  const parts = [totals.calories != null ? nutrientAmount("calories", totals.calories) : "", ...nutritionBriefParts(totals)].filter(Boolean);
+  const note = without ? ` ${tn("nutrition.day_without", without)}` : "";
+  return `<p class="day-card__nutrition">${escapeHtml(t("nutrition.day_total", { values: parts.join(" \u00b7 ") }) + note)}</p>`;
+}
+
+// Of de calorieën en voedingswaarden te zien zijn (Instellingen, Voorkeuren, Weergave); zonder theme.js (in de tests) wel.
+function caloriesShown() {
+  return typeof THEME === "undefined" || THEME.appearance().showCalories !== false;
+}
+
+// De filters op voedingswaarden: [naam in het verzoek, decimalen]. De velden heten #<scope>-<naam>-min en -max.
+const NUTRITION_FILTERS = [["kcal", 0], ["protein", 0], ["fat", 0], ["carbs", 0], ["sugar", 0], ["fiber", 0], ["salt", 1]];
+
+// De grenzen uit de velden van een scherm (`plan` of `search`): `kcalMin=..&saltMax=..` voor de zoekroute, of "" zonder filter.
+function nutritionQuery(scope) {
+  if (!caloriesShown()) return "";
+  const params = [];
+  for (const [name, digits] of NUTRITION_FILTERS) {
+    for (const side of ["min", "max"]) {
+      const value = String(document.getElementById(`${scope}-${name}-${side}`)?.value ?? "").trim().replace(",", ".");
+      if (value === "" || !Number.isFinite(Number(value))) continue;
+      const factor = 10 ** digits;
+      params.push(`${name}${side === "min" ? "Min" : "Max"}=${encodeURIComponent(Math.max(0, Math.round(Number(value) * factor) / factor))}`);
+    }
+  }
+  return params.join("&");
+}
+
+// Wat er bij een zoekopdracht op voedingswaarden nog bij hoort: de cache vult zich nog, of recepten zonder die waarden vielen weg.
+function kcalSearchNote(answer) {
+  if (answer?.indexing) return t("kcal.indexing", { done: I18N.formatNumber(answer.indexing.done), total: I18N.formatNumber(answer.indexing.total) });
+  const missing = answer?.withoutValues ?? answer?.withoutKcal;
+  return missing ? tn("kcal.without", missing) : "";
+}
+
 // De volgorde van de maaltijden op een dag, zoals Mealie ze ook toont.
 const MEAL_ORDER = ["breakfast", "lunch", "dinner", "side", "snack", "drink", "dessert"];
 
@@ -579,14 +923,13 @@ function mealName(entry) {
 
 function renderMeal(entry) {
   const note = !entry.recipe && !entry.recipeId;
-  const stepper = mealPortionsHtml(entry);
-  const facts = [
-    stepper ? "" : mealServings(entry), // de knoppen tonen het aantal al; zo staat het er één keer
-    entry.recipeDetail ? tn("plan.ingredients_count", (entry.recipeDetail.recipeIngredient || []).length) : "",
-  ].filter(Boolean).join(" · ");
+  const facts = factsWithKcal(
+    [mealServings(entry), entry.recipeDetail ? tn("plan.ingredients_count", (entry.recipeDetail.recipeIngredient || []).length) : ""],
+    [["kcal.per_serving", entry.kcal?.perServing]],
+  );
   const detail = note
     ? entry.text ? `<small class="meal__note">${escapeHtml(entry.text)}</small>` : ""
-    : facts ? `<small>${escapeHtml(facts)}</small>` : "";
+    : facts ? `<small>${facts}</small>` : "";
   const content = `
       ${entry.imageUrl ? `<img class="meal__image" src="${escapeHtml(entry.imageUrl)}" alt="" width="64" height="64" loading="lazy" data-hide-on-error>` : ""}
       <span class="meal__text">
@@ -595,143 +938,68 @@ function renderMeal(entry) {
         ${detail}
       </span>`;
   const classes = `meal${entry.imageUrl ? " meal--with-image" : ""}${note ? " meal--note" : ""}`;
-  // De hele maaltijd is de knop om haar te wijzigen of te verwijderen: een groot tikvlak en ruimte voor de naam.
-  const card = entry.id != null
-    ? `<button class="${classes} meal--button" type="button" data-plan-edit="${escapeHtml(entry.id)}" title="${escapeHtml(t("plan.edit"))}">${content}
-        ${mdiIcon(MDI_PENCIL_OUTLINE, "meal__pencil")}<span class="visually-hidden">${escapeHtml(t("plan.edit"))}</span></button>`
-    : `<div class="${classes}">${content}</div>`;
-  // Een knop mag geen knoppen bevatten: de porties staan onder de maaltijd, in één groep met haar.
-  return stepper
-    ? `<div class="meal-group${entry.imageUrl ? " meal-group--with-image" : ""}">${card}<div class="meal-group__portions">${stepper}</div></div>`
-    : card;
+  if (entry.id == null) return `<div class="${classes}">${content}</div>`;
+  // De hele maaltijd is een groot tikvlak dat het recept opent (openMealRecipe); het potlood rechtsboven wijzigt of
+  // verwijdert haar. Een notitie heeft geen recept: een tik daarop wijzigt haar meteen.
+  const id = escapeHtml(entry.id);
+  const open = note
+    ? `data-plan-edit="${id}" title="${escapeHtml(t("plan.edit"))}"`
+    : `data-plan-view="${id}" title="${escapeHtml(t("plan.view"))}"`;
+  // `data-plan-entry`: de maaltijd die je in de bewerkstand naar een andere dag sleept (plan_drag.js).
+  return `<div class="${classes} meal--planned" data-plan-entry="${id}">
+      <button class="meal__open" type="button" ${open}>${content}</button>
+      <button class="meal__edit" type="button" data-plan-edit="${id}" title="${escapeHtml(t("plan.edit"))}" aria-label="${escapeHtml(t("plan.edit_meal", { name: mealName(entry) }))}">${mdiIcon(MDI_PENCIL_OUTLINE)}</button>
+    </div>`;
 }
 
-// Porties per maaltijd (zie portions.py): "[−] 4 porties [+]" onder de maaltijd, met daaronder "recept: <opbrengst> ·
-// <herkomst>". Alles komt uit `servings` (mealie.py): `planned`, `base`, `scale` en `source`. Een maaltijd zonder recept
-// krijgt niets; een Mealie zonder recipeScale ("unsupported") ook niet: daar blijft upstreams "4 porties" staan.
-const MIN_PORTIONS = 1;
-const MAX_PORTIONS = 12;
-const PORTIONS_SOURCE_LABELS = { set: "plan.portions_set", default: "plan.portions_default", recipe: "plan.portions_recipe" };
-let mealPortionsBusy = false; // één wijziging tegelijk; klikken in de tussentijd tellen niet
-// Telt op bij elke gelukte wijziging van porties: een voorbeeld van het mandje dat daarvóór begon, is verouderd.
-let cartGeneration = 0;
+// ---- Het recept van een maaltijd in een venster: wat de week al van Mealie kreeg (recipeDetail, met de hoeveelheden
+// voor de geplande porties), zonder nieuw verzoek. Wijzigen opent vanuit het venster het plan-venster. De ingrediënten en
+// de bereiding staan in de kookweergave (renderCookView in recipe_view.js); de sleutel mealie:<slug> is dezelfde als bij
+// Recepten zoeken, zodat de voortgang van een recept op beide plekken dezelfde is.
+const mealRecipe = { entry: null };
 
-function clampPortions(value) {
-  return Math.min(MAX_PORTIONS, Math.max(MIN_PORTIONS, value));
-}
-
-function mealPortionsHtml(entry) {
-  const servings = entry.servings;
-  const hasRecipe = Boolean(entry.recipe && (entry.recipeId || entry.recipe.id));
-  if (!hasRecipe || entry.id == null || !servings?.source || servings.source === "unsupported") return "";
-  const id = escapeHtml(String(entry.id ?? ""));
-  const button = (attribute, label, sign, target, disabled) =>
-    `<button class="meal-portions__button" type="button" ${attribute}="${id}" data-portions-target="${target}" aria-label="${escapeHtml(label)}"${disabled ? " disabled" : ""}>${sign}</button>`;
-  if (servings.source === "unknown") {
-    // Het recept zegt niet voor hoeveel personen het is: niet te schalen, dus de knoppen staan uit.
-    return `
-      <div class="meal-portions">
-        ${button("data-portions-minus", t("plan.portions_less"), "\u2212", MIN_PORTIONS, true)}
-        <span class="meal-portions__value meal-portions__value--unknown">${escapeHtml(t("plan.portions_unknown"))}</span>
-        ${button("data-portions-plus", t("plan.portions_more"), "+", MIN_PORTIONS, true)}
-      </div>${
-      servings.scale !== 1
-        ? `<small class="meal-portions__source">${escapeHtml(t("plan.portions_scale_mealie", { factor: I18N.formatNumber(servings.scale) }))}</small>`
-        : ""
-    }`;
-  }
-  // Het getal is `planned` van de server (mealie.planned_portions, één decimaal): de kaart rondt zelf niet af, dus een
-  // factor uit Mealie toont "2,5 porties", net als get_week_menu. De knoppen schrijven 1 tot en met 12 hele porties: min
-  // naar het hele getal eronder, plus naar het hele getal erboven (2,5 geeft 2 en 3; 4 geeft 3 en 5). Het getal kan
-  // buiten 1-12 liggen als iemand in Mealie zelf een factor zette; we tonen het zoals het is.
-  const count = Number(servings.planned) || 0;
-  const label = PORTIONS_SOURCE_LABELS[servings.source];
-  const recipeLine = [
-    servings.base ? t("plan.portions_yield", { count: I18N.formatNumber(servings.base) }) : "",
-    label ? t(label) : "",
-  ].filter(Boolean).join(" \u00b7 ");
+function renderMealRecipeBody(entry) {
+  const detail = entry.recipeDetail;
+  if (!detail) return `<p class="muted">${escapeHtml(t("plan.view_unavailable"))}</p>`;
+  const description = String(detail.description || "").trim();
+  const slug = entry.recipe?.slug || detail.slug;
+  const recipe = cookRecipeFromMealie(detail, slug ? `mealie:${slug}` : `plan:${entry.id}`, mealName(entry));
   return `
-    <div class="meal-portions">
-      ${button("data-portions-minus", t("plan.portions_less"), "\u2212", clampPortions(Math.ceil(count) - 1), count <= MIN_PORTIONS)}
-      <span class="meal-portions__value${servings.source === "default" ? " meal-portions__value--default" : ""}">${escapeHtml(tn("plan.servings", count))}</span>
-      ${button("data-portions-plus", t("plan.portions_more"), "+", clampPortions(Math.floor(count) + 1), count >= MAX_PORTIONS)}
-    </div>
-    <small class="meal-portions__source">${escapeHtml(recipeLine)}${
-      servings.source === "set"
-        ? ` <button class="link-button meal-portions__reset" type="button" data-portions-reset="${id}">${escapeHtml(t("plan.portions_reset"))}</button>`
-        : ""
-    }</small>`;
+    ${description ? `<p class="meal-recipe__description">${escapeHtml(description)}</p>` : ""}
+    ${renderCookView(recipe, { headingLevel: 4, noIngredients: t("rsearch.no_ingredients_mealie"), noSteps: t("rsearch.no_steps_mealie") })}
+    ${nutritionTable(entry.nutrition, { servings: entry.servings?.planned, headingLevel: 4 })}`;
 }
 
-async function changeMealPortions(write) {
-  if (mealPortionsBusy) return;
-  mealPortionsBusy = true;
-  message("#planner-message", "");
-  // De knoppen staan uit tot de week terug is; daarna tekent renderMealPlan nieuwe. Lukt het herladen niet (of was er niets
-  // te herladen), dan gaan de oude weer aan.
-  const paused = [...document.querySelectorAll("#meal-days .meal-portions button, #meal-days [data-portions-reset]")].filter((button) => !button.disabled);
-  paused.forEach((button) => {
-    button.disabled = true;
-  });
-  try {
-    await write();
-  } catch (error) {
-    // Mislukt (ook een fout van Mealie): de kaart houdt het oude aantal en we tonen de melding van de server.
-    message("#planner-message", error.message);
-  } finally {
-    mealPortionsBusy = false;
-    paused.forEach((button) => {
-      if (button.isConnected) button.disabled = false;
-    });
-  }
+// Een maaltijd uit het weekmenu. Vanuit het weekmenu begint de reeks om door de maaltijden met een recept te bladeren (recipe_nav.js);
+// met `move` is dit een stap naar de vorige of volgende maaltijd, in hetzelfde venster.
+function openMealRecipe(entry, { move = false } = {}) {
+  mealRecipe.entry = entry;
+  const dialog = $("#meal-recipe-dialog");
+  if (!move && typeof recipeNavMeal === "function") recipeNavMeal(entry);
+  $("#meal-recipe-type").textContent = `${mealLabel(entry.entryType)} · ${formatDate(entry.date)}`;
+  $("#meal-recipe-title").textContent = mealName(entry);
+  // Het totaal alleen als het iets toevoegt: bij één portie is het gelijk aan de kcal per portie.
+  const total = entry.kcal?.total && entry.kcal.total !== entry.kcal.perServing ? entry.kcal.total : null;
+  const facts = factsWithKcal(
+    [mealServings(entry), entry.recipeMinutes ? t("rsearch.minutes", { count: entry.recipeMinutes }) : ""],
+    [["kcal.per_serving", entry.kcal?.perServing], ["kcal.total", total]],
+  );
+  $("#meal-recipe-facts").innerHTML = facts;
+  $("#meal-recipe-facts").hidden = !facts;
+  const image = $("#meal-recipe-image");
+  image.hidden = !entry.imageUrl;
+  if (entry.imageUrl) image.src = entry.imageUrl;
+  else image.removeAttribute("src");
+  const link = $("#meal-recipe-mealie");
+  link.hidden = !entry.recipeUrl;
+  if (entry.recipeUrl) link.href = entry.recipeUrl;
+  else link.removeAttribute("href");
+  $("#meal-recipe-body").innerHTML = renderMealRecipeBody(entry);
+  if (!dialog.open) dialog.showModal();
+  dialog.scrollTop = 0;
+  if (typeof cookWakeUpdate === "function") cookWakeUpdate(); // "Scherm aan laten" (recipe_view.js)
+  if (move && typeof recipeNavArrived === "function") recipeNavArrived(dialog);
 }
-
-// Een open controlelijst van het mandje hoort bij een oude week of oude porties: weg ermee, en een voorbeeld
-// dat nog onderweg is, tekent niets meer (zie addToCart). Ook bij elke nieuwe weekweergave (loadMealPlan).
-function dropCartReview() {
-  cartGeneration++;
-  $("#cart-result").innerHTML = "";
-}
-
-// De dag van een maaltijd, zodat refreshMealPlanAfterChange de goede week vergeet; onbekend: de getoonde week.
-function mealPortionsDates(entryId) {
-  const entry = (state.entries || []).find((item) => String(item.id) === String(entryId));
-  return [entry?.date || getWeekBounds(state.weekOffset).start];
-}
-
-// Na een wijziging klopt de bewaarde week niet meer: net als na een PATCH vergeet refreshMealPlanAfterChange die week
-// en haalt de getoonde week opnieuw op, zodat de kaart en de boodschappenlijst meteen de nieuwe aantallen tonen.
-async function setMealPortions(entryId, portions) {
-  const dates = mealPortionsDates(entryId);
-  await changeMealPortions(async () => {
-    await jsonFetch(`/api/mealplan/${encodeURIComponent(entryId)}/portions`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ portions }),
-    });
-    dropCartReview();
-    await refreshMealPlanAfterChange(dates);
-  });
-}
-
-async function resetMealPortions(entryId) {
-  const dates = mealPortionsDates(entryId);
-  await changeMealPortions(async () => {
-    await jsonFetch(`/api/mealplan/${encodeURIComponent(entryId)}/portions`, { method: "DELETE" });
-    dropCartReview();
-    await refreshMealPlanAfterChange(dates);
-  });
-}
-
-$("#meal-days").addEventListener("click", (event) => {
-  const step = event.target.closest("[data-portions-minus], [data-portions-plus]");
-  if (step && !step.disabled) {
-    setMealPortions(step.dataset.portionsMinus ?? step.dataset.portionsPlus, Number(step.dataset.portionsTarget));
-    return;
-  }
-  const reset = event.target.closest("[data-portions-reset]");
-  if (reset && !reset.disabled) resetMealPortions(reset.dataset.portionsReset);
-});
 
 function renderMealPlan(entries) {
   const byDay = {};
@@ -743,41 +1011,56 @@ function renderMealPlan(entries) {
   const dates = [...new Set([...getWeekBounds(state.weekOffset).days, ...Object.keys(byDay)])].sort();
   const today = localIsoDate(new Date());
   const rank = (entry) => (MEAL_ORDER.indexOf(entry.entryType) + 1 || MEAL_ORDER.length + 1);
+  // Toevoegen: op een lege dag de enige handeling, dus een volle knop onderaan; op een dag met maaltijden een kleine "+" in de
+  // kop, zodat de dag niet twee keer zo hoog wordt. Het aria-label noemt de dag in beide gevallen.
+  const addButton = (date, compact) => {
+    const label = escapeHtml(t("plan.add_on", { day: formatDate(date) }));
+    return compact
+      ? `<button class="day-card__add day-card__add--compact" type="button" data-plan-add="${date}" aria-label="${label}" title="${escapeHtml(t("plan.add"))}">${mdiIcon(MDI_PLUS, "")}</button>`
+      : `<button class="day-card__add" type="button" data-plan-add="${date}" aria-label="${label}">${mdiIcon(MDI_PLUS, "")}<span>${escapeHtml(t("plan.add"))}</span></button>`;
+  };
   $("#meal-days").innerHTML = dates
     .map(
       (date) => `
-        <article class="day-card${date === today ? " day-card--today" : ""}${byDay[date] ? "" : " day-card--empty"}">
-          <h3>${escapeHtml(formatDate(date))}${date === today ? `<span class="day-card__today">${escapeHtml(t("plan.today"))}</span>` : ""}</h3>
+        <article class="day-card${date === today ? " day-card--today" : ""}${byDay[date] ? "" : " day-card--empty"}" data-plan-date="${date}">
+          <div class="day-card__head">
+            <h3>${escapeHtml(formatDate(date))}${date === today ? `<span class="day-card__today">${escapeHtml(t("plan.today"))}</span>` : ""}</h3>
+            ${byDay[date] ? addButton(date, true) : ""}
+          </div>
           ${(byDay[date] || []).sort((a, b) => rank(a) - rank(b)).map(renderMeal).join("")}
-          <button class="day-card__add" type="button" data-plan-add="${date}" aria-label="${escapeHtml(t("plan.add_on", { day: formatDate(date) }))}">${mdiIcon(MDI_PLUS, "")}<span>${escapeHtml(t("plan.add"))}</span></button>
+          ${dayNutritionLine(byDay[date])}
+          ${byDay[date] ? "" : addButton(date, false)}
         </article>
       `
     )
     .join("");
 
-  const ingredients = aggregateIngredients(entries);
-  if (!entries.length) {
-    $("#ingredients-panel").innerHTML = "";
-    message("#planner-message", t("plan.none_planned"), "success");
-    return;
+  // De boodschappenlijst (vinkjes, al in huis, de dagen) en de controlelijst van deze week: shopping.js.
+  renderShoppingList();
+  message("#planner-message", entries.length ? "" : t("plan.none_planned"), "info");
+  restoreCartReview();
+}
+
+// *Liever biologisch* (#218): per gebruiker bewaard in het profiel, zodat de schakelaar de volgende keer nog zo staat.
+async function savePreferOrganic(input, target = "#planner-message") {
+  const wanted = input.checked;
+  state.auth = { ...state.auth, preferOrganic: wanted };
+  // De schakelaar staat bij de boodschappenlijst en onder Voorkeuren (sinds 4.13.0): ze volgen elkaar.
+  for (const selector of ["#cart-organic", "#appearance-organic"]) {
+    if ($(selector)) $(selector).checked = wanted;
   }
-  message("#planner-message", "");
-  $("#ingredients-panel").innerHTML = ingredients.length
-    ? `
-      <div class="box ingredients">
-        <h2>${escapeHtml(t("plan.all_ingredients", { count: I18N.formatNumber(ingredients.length) }))}</h2>
-        <ul>
-          ${ingredients.map((item) => `<li>${escapeHtml(item.display || item.food?.name || "-")}</li>`).join("")}
-        </ul>
-        <div class="toolbar ingredients__actions">
-          <span id="cart-store-slot"></span>
-          <button class="button" id="add-cart">${escapeHtml(cartButtonLabel())}</button>
-        </div>
-      </div>
-    `
-    : "";
-  $("#add-cart")?.addEventListener("click", addToCart);
-  renderStoreChoice();
+  try {
+    const data = await jsonFetch("/api/profile/preferences", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preferOrganic: wanted }),
+    });
+    state.auth = { ...state.auth, preferOrganic: Boolean(data.preferOrganic) };
+    toast(t("common.saved"));
+  } catch (error) {
+    // Niet bewaard: de schakelaar geldt dan alleen nu, en de gebruiker ziet waarom.
+    message(target, t("cart.organic_save_failed", { error: error.message }), "error");
+  }
 }
 
 // Een weekmenu verandert zelden: elke week wordt na het ophalen bewaard, zodat bladeren door de weken direct gaat.
@@ -812,7 +1095,7 @@ function fetchMealPlan(week) {
 // Na een wijziging in het weekmenu: de week van elke geraakte dag opnieuw ophalen, en de getoonde week zonder flikkeren vernieuwen.
 async function refreshMealPlanAfterChange(dates) {
   for (const date of dates.filter(Boolean)) {
-    const start = localIsoDate(mondayOf(new Date(`${date}T00:00:00`)));
+    const start = localIsoDate(weekStartOf(new Date(`${date}T00:00:00`)));
     mealPlanCache.delete(start);
     mealPlanInflight.delete(start);
   }
@@ -854,7 +1137,8 @@ async function loadMealPlan({ force = false } = {}) {
   const week = getWeekBounds(state.weekOffset);
   const request = ++mealPlanRequest;
   message("#planner-message", "");
-  dropCartReview();
+  closeShopView(); // een andere of opnieuw opgehaalde week: de boodschappenlijst (shopping.js) staat weer achter de knop
+  $("#cart-result").innerHTML = "";
   const cached = force ? null : cachedMealPlan(week);
   if (cached) {
     state.entries = cached;
@@ -864,9 +1148,9 @@ async function loadMealPlan({ force = false } = {}) {
     return;
   }
   state.entries = null;
-  $("#meal-days").innerHTML = "";
+  $("#meal-days").innerHTML = mealPlanSkeletonHtml(week.days);
   $("#ingredients-panel").innerHTML = "";
-  message("#planner-message", t("plan.loading"), "success");
+  message("#planner-message", t("plan.loading"), "info");
   setBusy(button, true);
   try {
     const entries = await fetchMealPlan(week);
@@ -886,13 +1170,20 @@ async function loadMealPlan({ force = false } = {}) {
 // (zie mealie.py); MealieShopper bewaart zelf geen planning. Daarna wordt de week opnieuw opgehaald.
 const PLAN_BASE_TYPES = ["breakfast", "lunch", "dinner", "side"];
 const MDI_DICE = "M19 5V19H5V5H19M19 3H5C3.9 3 3 3.9 3 5V19C3 20.1 3.9 21 5 21H19C20.1 21 21 20.1 21 19V5C21 3.9 20.1 3 19 3M7.5 6C6.7 6 6 6.7 6 7.5S6.7 9 7.5 9 9 8.3 9 7.5 8.3 6 7.5 6M16.5 15C15.7 15 15 15.7 15 16.5C15 17.3 15.7 18 16.5 18C17.3 18 18 17.3 18 16.5C18 15.7 17.3 15 16.5 15M16.5 6C15.7 6 15 6.7 15 7.5S15.7 9 16.5 9C17.3 9 18 8.3 18 7.5S17.3 6 16.5 6M12 10.5C11.2 10.5 10.5 11.2 10.5 12S11.2 13.5 12 13.5 13.5 12.8 13.5 12 12.8 10.5 12 10.5M7.5 15C6.7 15 6 15.7 6 16.5C6 17.3 6.7 18 7.5 18S9 17.3 9 16.5C9 15.7 8.3 15 7.5 15Z";
-const planDialog = { entry: null, recipe: null, results: [], types: null, searchTimer: 0, searchSeq: 0, target: null };
+// `servings`: het aantal porties in het venster; `servingsTouched`: of iemand het veranderde (dan gaat het mee naar Mealie).
+// `scaleSupported`: of de gekoppelde Mealie porties per maaltijd kent (recipeScale, vanaf 3.29).
+const planDialog = {
+  entry: null, recipe: null, results: [], types: null, searchTimer: 0, searchSeq: 0, target: null,
+  servings: null, servingsTouched: false, scaleSupported: false,
+};
 
 // De maaltijden die de gekoppelde Mealie kent (snack, drank en dessert pas vanaf Mealie 3.7); bij een fout de vier vaste.
 async function loadPlanTypes() {
   if (planDialog.types) return planDialog.types;
   try {
-    planDialog.types = (await jsonFetch("/api/mealplan/options")).entryTypes || PLAN_BASE_TYPES;
+    const options = await jsonFetch("/api/mealplan/options");
+    planDialog.types = options.entryTypes || PLAN_BASE_TYPES;
+    planDialog.scaleSupported = Boolean(options.recipeScale);
     return planDialog.types;
   } catch {
     return PLAN_BASE_TYPES;
@@ -925,9 +1216,54 @@ function renderPlanKind() {
 }
 
 function planRecipeRow(recipe) {
-  const meta = [recipe.minutes ? t("rsearch.minutes", { count: recipe.minutes }) : "", ...(recipe.tags || [])].filter(Boolean).join(" · ");
+  const facts = factsWithKcal([recipe.minutes ? t("rsearch.minutes", { count: recipe.minutes }) : "", ...(recipe.tags || [])], [["kcal.per_serving", recipeKcal(recipe)]]);
+  const meta = facts + nutritionBrief(recipe.nutrition, Boolean(facts));
   return `${recipe.image ? `<img src="${escapeHtml(recipe.image)}" alt="" width="48" height="48" loading="lazy" data-hide-on-error>` : `<span class="plan-recipe__placeholder" aria-hidden="true">${mdiIcon(MDI_PLUS, "")}</span>`}
-    <span class="plan-recipe__text"><strong>${escapeHtml(recipe.name || recipe.slug)}</strong>${meta ? `<small>${escapeHtml(meta)}</small>` : ""}</span>`;
+    <span class="plan-recipe__text"><strong>${escapeHtml(recipe.name || recipe.slug)}</strong>${meta ? `<small>${meta}</small>` : ""}</span>`;
+}
+
+// De porties van het gekozen recept (de basis), of 0 als Mealie of de winkel die niet weet.
+function planBase(recipe) {
+  const base = Number(recipe?.portions);
+  return Number.isFinite(base) && base > 0 ? base : 0;
+}
+
+// Porties kiezen (issue #283): alleen als Mealie het kent en de porties van het recept bekend zijn. Mealie bewaart de keuze
+// als schaal van het recept (recipeScale); per persoon blijven de kcal gelijk, het totaal rekent mee.
+function planServingsHtml(recipe) {
+  const base = planBase(recipe);
+  if (!planDialog.scaleSupported || !base) return "";
+  const max = Math.min(99, Math.floor(base * 20));
+  return `<div class="plan-servings">
+      <span class="plan-servings__label" id="plan-servings-label">${escapeHtml(t("plan.servings_label"))}</span>
+      <div class="qty">
+        <button type="button" class="qty__step" data-servings-step="-1" aria-label="${escapeHtml(t("plan.servings_less"))}">${mdiIcon(MDI_MINUS)}</button>
+        <input class="qty__input" id="plan-servings" type="number" inputmode="numeric" min="1" max="${max}" step="1" value="${escapeHtml(planDialog.servings || base)}" aria-labelledby="plan-servings-label">
+        <button type="button" class="qty__step" data-servings-step="1" aria-label="${escapeHtml(t("plan.servings_more"))}">${mdiIcon(MDI_PLUS)}</button>
+      </div>
+      <span class="plan-servings__kcal" id="plan-servings-kcal">${planServingsKcal(recipe)}</span>
+    </div>`;
+}
+
+function planServingsKcal(recipe) {
+  const kcal = recipeKcal(recipe);
+  const count = planDialog.servings || planBase(recipe);
+  return kcal ? factsWithKcal([], [["kcal.per_serving", kcal], ["kcal.total", count > 1 ? kcal * count : null]]) : "";
+}
+
+// Een ander aantal porties: alleen het veld en de kcal ernaast bijwerken, zodat de focus in het veld blijft.
+function setPlanServings(value) {
+  const recipe = planDialog.recipe;
+  const base = planBase(recipe);
+  if (!base) return;
+  const max = Math.min(99, Math.floor(base * 20));
+  const count = Math.min(max, Math.max(1, Math.round(Number(value) || base)));
+  planDialog.servings = count;
+  planDialog.servingsTouched = true;
+  const input = $("#plan-servings");
+  if (input && Number(input.value) !== count) input.value = count;
+  const kcal = $("#plan-servings-kcal");
+  if (kcal) kcal.innerHTML = planServingsKcal(recipe);
 }
 
 function renderPlanRecipe() {
@@ -936,9 +1272,18 @@ function renderPlanRecipe() {
   $("#plan-recipe-picker").hidden = Boolean(chosen);
   $("#plan-recipe-chosen").innerHTML = chosen
     ? `<div class="plan-recipe plan-recipe--chosen">${planRecipeRow(chosen)}</div>
-       <button class="link-button" type="button" id="plan-recipe-change">${escapeHtml(t("plan.other_recipe"))}</button>`
+       <button class="link-button" type="button" id="plan-recipe-change">${escapeHtml(t("plan.other_recipe"))}</button>
+       ${planServingsHtml(chosen)}`
     : "";
   $("#plan-surprise").hidden = Boolean(planDialog.entry);
+}
+
+// Een (ander) recept gekozen: de porties beginnen bij die van het recept, of bij wat er voor deze maaltijd gepland stond.
+function choosePlanRecipe(recipe, planned = null) {
+  planDialog.recipe = recipe;
+  planDialog.servings = Number(planned) > 0 ? Math.round(Number(planned)) : planBase(recipe) || null;
+  planDialog.servingsTouched = false;
+  renderPlanRecipe();
 }
 
 function renderPlanResults() {
@@ -948,16 +1293,27 @@ function renderPlanResults() {
 }
 
 // Zoeken in de recepten van Mealie; zonder zoekterm de recepten op naam. Een ouder antwoord overschrijft een nieuwer niet.
+// Met een grens op de calorieën (kcal per persoon, issue #283) zoekt de server in zijn cache; leest die de recepten nog in,
+// dan zoekt het venster na twee seconden opnieuw.
 async function searchPlanRecipes() {
   const query = $("#plan-recipe-query").value.trim();
+  const kcal = nutritionQuery("plan");
   const seq = ++planDialog.searchSeq;
+  clearTimeout(planDialog.searchTimer);
   message("#plan-message", "");
   try {
-    const data = await jsonFetch(`/api/mealie/recipes?q=${encodeURIComponent(query)}`);
+    const data = await jsonFetch(`/api/mealie/recipes?q=${encodeURIComponent(query)}${kcal ? `&${kcal}` : ""}`);
     if (seq !== planDialog.searchSeq) return;
     planDialog.results = data.recipes || [];
     renderPlanResults();
-    if (!planDialog.results.length) message("#plan-message", query ? t("rsearch.none", { query }) : t("plan.no_recipes"), "success");
+    const note = kcal ? kcalSearchNote(data) : "";
+    if (!planDialog.results.length) {
+      const none = kcal ? t("kcal.none") : query ? t("rsearch.none", { query }) : t("plan.no_recipes");
+      message("#plan-message", [none, note].filter(Boolean).join(" "), "success");
+    } else if (note) {
+      message("#plan-message", note, "success");
+    }
+    if (kcal && data.indexing && $("#plan-dialog").open) planDialog.searchTimer = setTimeout(searchPlanRecipes, 2000);
   } catch (error) {
     if (seq === planDialog.searchSeq) message("#plan-message", error.message);
   }
@@ -968,8 +1324,7 @@ async function completePlanRecipe(recipe) {
   try {
     const detail = await jsonFetch(`/api/mealie/recipes/${encodeURIComponent(recipe.slug)}`);
     if (planDialog.recipe !== recipe) return;
-    planDialog.recipe = { slug: detail.slug, recipeId: detail.recipeId, name: detail.name, image: detail.image, minutes: detail.minutes, tags: detail.tags };
-    renderPlanRecipe();
+    choosePlanRecipe({ slug: detail.slug, recipeId: detail.recipeId, name: detail.name, image: detail.image, minutes: detail.minutes, tags: detail.tags, portions: detail.portions, kcal: detail.kcal });
   } catch (error) {
     if (planDialog.recipe === recipe) message("#plan-message", error.message);
   }
@@ -981,8 +1336,12 @@ function openPlanDialog({ date = "", entry = null, recipe = null, target = null 
   planDialog.target = target;
   planDialog.results = [];
   planDialog.recipe = entry
-    ? entry.recipe ? { slug: entry.recipe.slug, recipeId: entry.recipeId || entry.recipe.id, name: mealName(entry), image: entry.imageUrl } : null
+    ? entry.recipe
+      ? { slug: entry.recipe.slug, recipeId: entry.recipeId || entry.recipe.id, name: mealName(entry), image: entry.imageUrl, portions: entry.servings?.base, kcal: entry.kcal?.perServing }
+      : null
     : recipe;
+  planDialog.servings = entry?.servings?.planned ? Math.round(entry.servings.planned) : planBase(planDialog.recipe) || null;
+  planDialog.servingsTouched = false;
   $("#plan-dialog-title").textContent = t(entry ? "plan.edit_title" : "plan.add_title");
   $("#plan-date").value = entry?.date || date || localIsoDate(new Date());
   $("#plan-title").value = entry && !entry.recipe ? entry.title || "" : "";
@@ -997,7 +1356,9 @@ function openPlanDialog({ date = "", entry = null, recipe = null, target = null 
   setPlanKind(entry && !entry.recipe && !entry.recipeId ? "note" : "recipe");
   if (!$("#plan-dialog").open) $("#plan-dialog").showModal();
   loadPlanTypes().then((types) => {
-    if ($("#plan-dialog").open && planDialog.entry === entry) renderPlanTypes(types, $("#plan-type").value || current);
+    if (!$("#plan-dialog").open || planDialog.entry !== entry) return;
+    renderPlanTypes(types, $("#plan-type").value || current);
+    if (planDialog.recipe && planDialog.scaleSupported && !$("#plan-servings")) renderPlanRecipe(); // nu weten we of porties kunnen
   });
   if (recipe?.slug && !recipe.name) completePlanRecipe(recipe);
 }
@@ -1048,6 +1409,9 @@ async function savePlanEntry(event) {
     }
     if (recipe.recipeId) body.recipeId = recipe.recipeId;
     else if (recipe.slug) body.recipeSlug = recipe.slug;
+    // De gekozen porties als schaal van het recept (Mealie 3.29+); niet aangeraakt, dan blijft wat Mealie had.
+    const base = planBase(recipe);
+    if (planDialog.servingsTouched && planDialog.scaleSupported && base && planDialog.servings) body.recipeScale = planDialog.servings / base;
     // Was het een notitie, dan gaan titel en tekst weg; anders blijft wat er in Mealie bij staat.
     if (entry && !entry.recipe && !entry.recipeId) Object.assign(body, { title: "", text: "" });
   }
@@ -1076,7 +1440,7 @@ async function savePlanEntry(event) {
 
 async function deletePlanEntry() {
   const entry = planDialog.entry;
-  if (!entry || !window.confirm(t("plan.delete_confirm", { name: mealName(entry) }))) return;
+  if (!entry || !(await confirmDialog(t("plan.delete_confirm", { name: mealName(entry) }), { danger: true, confirm: t("plan.delete") }))) return;
   const button = $("#plan-delete");
   setBusy(button, true);
   try {
@@ -1130,9 +1494,49 @@ function dealText(deal) {
   return [deal.label || t("list.bonus"), day].filter(Boolean).join(" ");
 }
 
-function cartCandidateLabel(candidate) {
+// Wat de controlelijst van een product laat zien, naast zijn naam: de inhoud, de prijs, de prijs per kilo, liter of stuk, de
+// aanbieding, biologisch (#218) en waarom een vergelijkingsoptie erbij staat (#178): zelfde product of goedkoper per eenheid.
+function cartCandidateFacts(candidate) {
   const deal = candidate.deal ? dealText(candidate.deal) : "";
-  return [candidate.title, candidate.unitSize, formatPrice(candidate.price), deal].filter(Boolean).join(" \u2013 ");
+  const perUnit = candidate.unitPrice ? offerPerUnitText(candidate.unitPrice) : "";
+  const why = [candidate.same ? t("offers.compare.same") : "", candidate.cheaper ? t("offers.compare.cheaper") : ""].filter(Boolean).join(", ");
+  const organic = candidate.organic ? t("cart.organic") : "";
+  return [candidate.unitSize, formatPrice(candidate.price), perUnit, deal, organic, why].filter(Boolean);
+}
+
+function cartCandidateLabel(candidate) {
+  return [candidate.title, ...cartCandidateFacts(candidate)].filter(Boolean).join(" \u2013 ");
+}
+
+// De goedkoopste optie per eenheid van een regel, als die duidelijk (2%) goedkoper is dan de gekozen; anders -1.
+function reviewCheaperIndex(row, chosen) {
+  const mine = row.candidates[chosen]?.unitPrice;
+  if (!mine) return -1;
+  // Met Liever biologisch (#218) en een biologische keuze telt alleen een goedkopere biologische: dat de gewone variant
+  // goedkoper is, weet je al, en die staat er in de keuzelijst als "goedkoper per eenheid" bij.
+  const organicOnly = Boolean(row.organic && row.candidates[chosen].organic);
+  let best = -1;
+  row.candidates.forEach((candidate, index) => {
+    const unit = candidate.unitPrice;
+    if (index === chosen || !unit || unit.unit !== mine.unit || unit.value >= mine.value * 0.98) return;
+    if (organicOnly && !candidate.organic) return;
+    if (best < 0 || unit.value < row.candidates[best].unitPrice.value) best = index;
+  });
+  return best;
+}
+
+function reviewCheaperHtml(row, chosen) {
+  const best = reviewCheaperIndex(row, chosen);
+  if (best < 0) return "";
+  const candidate = row.candidates[best];
+  const unit = t({ kg: "offers.unit.kg", l: "offers.unit.l" }[candidate.unitPrice.unit] || "offers.unit.stuk");
+  const text = t("cart.cheaper_hint", {
+    unit,
+    title: [candidate.title, candidate.unitSize].filter(Boolean).join(" "),
+    price: offerPerUnitText(candidate.unitPrice),
+    current: offerPerUnitText(row.candidates[chosen].unitPrice),
+  });
+  return `${escapeHtml(text)} <button class="link-button review-cheaper-pick" type="button" data-pick="${best}">${escapeHtml(t("cart.cheaper_pick"))}</button>`;
 }
 
 function openProductPopup(url) {
@@ -1146,26 +1550,66 @@ function openProductPopup(url) {
   }
 }
 
-function cartSelection(row, candidate, quantity) {
-  return {
-    query: row.query,
-    productId: candidate.productId,
-    quantity,
-    title: candidate.title,
-    price: candidate.price,
-    unitSize: candidate.unitSize,
-    image: candidate.image,
-  };
-}
-
 const STORES = {
   ah: { name: "Albert Heijn", api: "ah", linked: "ah", button: "plan.add_cart", ready: "cart.ready" },
   picnic: { name: "Picnic", api: "picnic", linked: "picnic", button: "plan.add_cart_picnic", ready: "cart.ready_picnic" },
   jumbo: { name: "Jumbo", api: "jumbo", linked: "jumbo", button: "plan.add_cart_jumbo", ready: "cart.ready_jumbo" },
+  crisp: { name: "Crisp", api: "crisp", linked: "crisp", button: "plan.add_cart_crisp", ready: "cart.ready_crisp" },
 };
+
+// Winkels zonder webwinkel: van hen zijn er alleen de aanbiedingen, zonder koppeling, mandje of zoeken (offers.OFFER_ONLY_STORES).
+// Ze staan bewust niet in STORES: die lijst voedt het mandje, Winkels en de voorkeurssupermarkt.
+const OFFER_ONLY_STORES = {
+  lidl: { name: "Lidl" },
+  aldi: { name: "Aldi" },
+};
+
+// De naam van een winkel, ook van een winkel met alleen aanbiedingen.
+function storeDisplayName(key) {
+  return (STORES[key] || OFFER_ONLY_STORES[key])?.name || key;
+}
+
+function offersOnlyStore(key) {
+  return Object.hasOwn(OFFER_ONLY_STORES, key);
+}
+
+// Een winkel die zonder koppeling te kiezen is bij Aanbiedingen: AH (de Bonus werkt zonder inlog) en de winkels met alleen aanbiedingen.
+function storeWithoutLink(key) {
+  return key === "ah" || offersOnlyStore(key);
+}
 
 function currentStore() {
   return STORES[state.store] || STORES.ah;
+}
+
+// De voorkeurssupermarkt van deze gebruiker (Instellingen, Voorkeuren; standaard Albert Heijn). Aanbiedingen en Winkels openen
+// ermee, tot je daar zelf een andere winkel kiest. Niet te verwarren met state.preferredStore, de laatste keuze in het weekmenu.
+function preferredSupermarket() {
+  const store = state.auth?.preferredStore;
+  return STORES[store] ? store : "ah";
+}
+
+// Weet de app al of de voorkeurssupermarkt gekoppeld is? Bij AH altijd; bij de andere zodra hun status binnen is.
+function preferredSupermarketKnown() {
+  const store = preferredSupermarket();
+  return store === "ah" || Boolean(state.storeStatusKnown[store]);
+}
+
+// De winkel waarmee een pagina opent, uit de winkels die daar te kiezen zijn: de voorkeurssupermarkt, of AH als die (nog) niet
+// gekoppeld is.
+function defaultStoreOf(available) {
+  const store = preferredSupermarket();
+  return available.includes(store) ? store : "ah";
+}
+
+// De winkels die gekoppeld zijn; AH is altijd een keuze.
+function linkedStoreKeys() {
+  return Object.keys(STORES).filter((key) => key === "ah" || state.linkedStores[key]);
+}
+
+// De winkel in een adres van Aanbiedingen: weggelaten als het de winkel is waarmee de pagina toch al opent (zie routerApplyOffers).
+function offersStoreParam(store) {
+  return store === defaultStoreOf(linkedStoreKeys()) ? "" : store;
 }
 
 function cartButtonLabel() {
@@ -1191,12 +1635,22 @@ function renderStoreChoice() {
     const menu = $("#cart-store-menu");
     if (menu) {
       bindSubtabMenu(menu);
-      $("#cart-store-list").addEventListener("click", (event) => {
+      $("#cart-store-list").addEventListener("click", async (event) => {
         const item = event.target.closest("[data-store]");
         if (!item) return;
+        // Een open controlelijst hoort bij de winkel waar hij voor gezocht is: zijn product-id's zeggen een andere winkel niets.
+        // Wisselen kan dus alleen door de lijst weg te doen, en dat vragen we eerst (cartReviewStore, sinds 4.10.4).
+        const reviewed = cartReviewStore();
+        if (reviewed && reviewed !== item.dataset.store) {
+          if (!(await confirmDialog(t("cart.switch_confirm", { from: STORES[reviewed].name, to: STORES[item.dataset.store].name })))) return;
+          discardCartReview();
+        }
         state.store = item.dataset.store;
         state.preferredStore = state.store;
+        // Het mandje volgt de winkel van het weekmenu (sinds 4.13.0): koos je hier Jumbo, dan opent Mandje ook Jumbo.
+        if (typeof basketState !== "undefined") basketState.store = state.store;
         try {
+          localStorage.setItem("ms-basket-store", state.store);
           localStorage.setItem("ms-store", state.store);
         } catch {
           // Zonder opslag onthoudt de pagina de keuze alleen tot je hem herlaadt.
@@ -1208,8 +1662,10 @@ function renderStoreChoice() {
   const button = $("#add-cart");
   if (button) button.textContent = cartButtonLabel();
   renderItemsStore();
+  itemsFollowPreferred();
   if (typeof renderBasketStoreChoice === "function") renderBasketStoreChoice();
   if (typeof renderOffersStore === "function") renderOffersStore();
+  if (typeof renderAppearanceStore === "function") renderAppearanceStore(); // gekoppeld of niet, bij Instellingen, Voorkeuren
 }
 
 // De winkel in de tab Winkels: AH, of Jumbo zodra die gekoppeld is.
@@ -1221,13 +1677,49 @@ function itemsStoreName() {
   return STORES[state.itemsStore].name;
 }
 
-// De winkels die in de tab Winkels te kiezen zijn: AH altijd, Jumbo en Picnic zodra ze gekoppeld zijn.
+// De winkels die in de tab Winkels te kiezen zijn: AH altijd, Jumbo, Picnic en Crisp zodra ze gekoppeld zijn.
 function itemsStores() {
-  return ["ah", ...["jumbo", "picnic"].filter((key) => state.linkedStores[key])];
+  return ["ah", ...["jumbo", "picnic", "crisp"].filter((key) => state.linkedStores[key])];
 }
 
 const PICNIC_SUBTABS = ["ah-items-picnic", "ah-items-picnic-favorieten", "ah-items-picnic-bestellingen"];
 const JUMBO_SUBTABS = ["ah-items-jumbo-recepten"];
+const CRISP_SUBTABS = ["ah-items-crisp-recepten", "ah-items-crisp-favorieten", "ah-items-crisp-bestellingen"];
+
+// Winkels: per winkel de onderdelen en hun subtab, in de volgorde van de tabs. Het onderdeel is ook het stuk in het adres
+// (/stores/jumbo/lists, /stores/ah/planner, /stores/ah/loose voor Losse aankopen); /stores/ah/receipts/<id> is een kassabon onder Bestellingen, /stores/ah/imported/<ref> een ingelezen
+// oude bestelling (zie price_import.py en router.js). Elk subtab hoort bij één onderdeel, bij welke winkel ook.
+const STORE_SECTIONS = {
+  ah: { recipes: "ah-items-recepten", planner: "ah-items-weekplanner", lists: "ah-items-lijstjes", orders: "ah-items-bestellingen", loose: "ah-items-losse-aankopen" },
+  jumbo: { recipes: "ah-items-jumbo-recepten", lists: "ah-items-lijstjes", orders: "ah-items-bestellingen", loose: "ah-items-losse-aankopen" },
+  picnic: { recipes: "ah-items-picnic", favorites: "ah-items-picnic-favorieten", orders: "ah-items-picnic-bestellingen", loose: "ah-items-losse-aankopen" },
+  crisp: { recipes: "ah-items-crisp-recepten", favorites: "ah-items-crisp-favorieten", orders: "ah-items-crisp-bestellingen", loose: "ah-items-losse-aankopen" },
+};
+
+function itemsOpenSubtab() {
+  return document.querySelector("#ah-items .subtab.is-active[data-subtab]")?.dataset.subtab || "";
+}
+
+// Het onderdeel van een subtab: "lists" voor ah-items-lijstjes, "orders" voor ah-items-picnic-bestellingen.
+function itemsSection(subtab) {
+  for (const sections of Object.values(STORE_SECTIONS)) {
+    const found = Object.entries(sections).find(([, id]) => id === subtab);
+    if (found) return found[0];
+  }
+  return "";
+}
+
+// Het subtab van een onderdeel bij een winkel. Heeft de winkel dat onderdeel niet (Lijstjes bij Picnic, Favorieten bij
+// AH), dan zijn eerste tab.
+function itemsSubtab(store, section) {
+  const sections = STORE_SECTIONS[store] || STORE_SECTIONS.ah;
+  return sections[section] || Object.values(sections)[0];
+}
+
+// Waar de winkelkeuze heen gaat: hetzelfde onderdeel als nu open staat, zoals bij Aanbiedingen.
+function itemsStorePath(store) {
+  return storesPath(store, itemsSection(itemsSubtab(store, itemsSection(itemsOpenSubtab()))));
+}
 
 function renderItemsStore() {
   const stores = itemsStores();
@@ -1238,39 +1730,76 @@ function renderItemsStore() {
   $("#items-store-list").innerHTML = stores
     .map(
       (key) =>
-        `<button class="subtab-menu__item${state.itemsStore === key ? " is-active" : ""}" type="button" data-store="${key}">${escapeHtml(STORES[key].name)}</button>`
+        `<a class="subtab-menu__item${state.itemsStore === key ? " is-active" : ""}" data-store="${key}" href="${escapeHtml(itemsStorePath(key))}" data-nav>${escapeHtml(STORES[key].name)}</a>`
     )
     .join("");
-  // AH heeft recepten, Jumbo zijn favoriete recepten (zoeken naar Jumbo-recepten staat bij Recepten zoeken); lijstjes en bestellingen zijn er voor AH en Jumbo; Picnic heeft recepten, favorieten en bestellingen.
+  // AH heeft recepten, Jumbo zijn favoriete recepten (zoeken naar Jumbo-recepten staat bij Recepten zoeken); lijstjes en bestellingen zijn er voor AH en Jumbo; Picnic heeft recepten, favorieten en bestellingen; Crisp je bewaarde recepten, favorieten en bestellingen.
   const picnic = state.itemsStore === "picnic";
+  const crisp = state.itemsStore === "crisp";
+  // Picnic en Crisp hebben eigen tabs voor hun bestellingen; de lijstjes en bestellingen van AH en Jumbo horen daar niet bij.
+  const ownTabs = picnic || crisp;
   const hide = (subtab, hidden) =>
     document.querySelectorAll(`[data-subtab="${subtab}"]`).forEach((button) => {
       button.hidden = hidden;
     });
   hide("ah-items-recepten", state.itemsStore !== "ah");
-  hide("ah-items-lijstjes", picnic);
-  hide("ah-items-bestellingen", picnic);
+  hide("ah-items-weekplanner", state.itemsStore !== "ah"); // de weekplanner van de AH-app (ah_planner.js)
+  hide("ah-items-lijstjes", ownTabs);
+  hide("ah-items-bestellingen", ownTabs);
   PICNIC_SUBTABS.forEach((subtab) => hide(subtab, !picnic));
   JUMBO_SUBTABS.forEach((subtab) => hide(subtab, state.itemsStore !== "jumbo"));
-  // Staat de open tab niet meer bij de gekozen winkel (bijvoorbeeld na het ontkoppelen), ga dan naar de eerste die er wel is.
-  const open = document.querySelector("#ah-items .subtab.is-active");
-  if (open?.hidden) document.querySelector("#ah-items .subtab[data-subtab]:not([hidden])")?.click();
+  CRISP_SUBTABS.forEach((subtab) => hide(subtab, !crisp));
+  // Staat de open tab niet meer bij de gekozen winkel (bijvoorbeeld na het ontkoppelen), ga dan naar hetzelfde onderdeel bij
+  // deze winkel, of naar zijn eerste tab.
+  const open = itemsOpenSubtab();
+  if (open && document.querySelector(`#ah-items .subtab[data-subtab="${open}"]`).hidden) {
+    document.querySelector(`#ah-items .subtab[data-subtab="${itemsSubtab(state.itemsStore, itemsSection(open))}"]`)?.click();
+  }
+  if (typeof routerRetry === "function") routerRetry();
 }
 
-function switchItemsStore(store) {
+// Een andere winkel kiezen. Het onderdeel dat open staat (Recepten, Lijstjes, Bestellingen of Favorieten) blijft open, zoals
+// bij Aanbiedingen; heeft de nieuwe winkel het niet, dan opent zijn eerste tab. Een adres kan een ander onderdeel vragen.
+// `chosen`: de gebruiker koos hem zelf (menu of adres); anders is het de voorkeurssupermarkt (itemsFollowPreferred).
+function switchItemsStore(store, section = itemsSection(itemsOpenSubtab()), { chosen = true } = {}) {
+  state.itemsStoreChosen = chosen;
   state.itemsStore = itemsStores().includes(store) ? store : "ah";
-  // Een andere winkel heeft andere lijstjes: begin met een schone lijst en laad opnieuw.
+  // Een andere winkel heeft andere lijstjes en bestellingen: begin schoon. Ze laden opnieuw als hun tab hieronder opent.
   state.ahListsLoaded = false;
   state.ahLists = [];
   state.ahListHits = {};
   state.ahListQuery = "";
   $("#ah-list-filter").value = "";
-  closeAhList(false);
+  // Een open lijstje dicht zonder stap terug in de browser: die zou het adres van de vorige winkel weer openen.
+  state.ahListFromOverview = false;
+  showAhListsOverview({ restoreScroll: false });
   renderAhLists();
-  renderItemsStore();
   if (typeof resetOrders === "function") resetOrders();
-  // Elke winkel begint bij zijn eerste tabblad, en dat is steeds Recepten. De lijstjes en bestellingen laden opnieuw als je ze opent.
-  document.querySelector("#ah-items .subtab[data-subtab]:not([hidden])")?.click();
+  // Eerst de tab openen en dan de balk tekenen: zo laadt alleen deze tab, een keer, en krijgt het adres een stap. Andersom
+  // ging renderItemsStore eerst nog naar een andere tab, als de open tab bij deze winkel niet bestaat.
+  document.querySelector(`#ah-items .subtab[data-subtab="${itemsSubtab(state.itemsStore, section)}"]`)?.click();
+  renderItemsStore();
+}
+
+// Winkels opent met de voorkeurssupermarkt, tot je zelf een winkel kiest. Alleen terwijl Winkels open staat: een wissel opent
+// een tab, en die laadt de recepten, lijstjes of bestellingen van die winkel. Wacht een adres nog op een koppeling
+// (router.pending), dan beslist dat adres.
+function itemsFollowPreferred() {
+  if (state.itemsStoreChosen || (typeof router !== "undefined" && router.pending)) return;
+  if (!document.querySelector("#ah-items.is-active")) return;
+  const store = defaultStoreOf(itemsStores());
+  if (store !== state.itemsStore) switchItemsStore(store, itemsSection(itemsOpenSubtab()), { chosen: false });
+}
+
+// Een andere voorkeurssupermarkt (Instellingen, Voorkeuren): Aanbiedingen en Winkels openen voortaan daarmee, ook als je er
+// eerder zelf een andere winkel koos.
+function preferredSupermarketChanged() {
+  if (typeof routerRetry === "function") routerRetry(); // een adres dat nog op een koppeling wachtte, is niet meer open
+  state.itemsStoreChosen = false;
+  if (typeof offersState !== "undefined") offersState.chosen = false;
+  itemsFollowPreferred();
+  if (typeof offersFollowPreferred === "function") offersFollowPreferred();
+  if (typeof routerRefreshLinks === "function") routerRefreshLinks();
 }
 
 try {
@@ -1280,329 +1809,43 @@ try {
   // Geen opslag beschikbaar: AH blijft de standaard.
 }
 
-function showCartResult(data, notFound) {
-  const lines = (data.items || [])
-    .map((item) => {
-      const size = item.product.unitSize ? ` (${escapeHtml(item.product.unitSize)})` : "";
-      return `<li>${escapeHtml(item.quantity)}x ${escapeHtml(item.product.title)}${size}</li>`;
-    })
-    .join("");
-  // Picnic en Jumbo melden zelf ook welke producten ze niet in het mandje kregen (of al op het lijstje stonden).
-  const names = state.store === "ah" ? notFound : [...notFound, ...(data.skippedItems || [])];
-  const missing = names.length
-    ? th("cart.missing", { count: names.length, names: names.join(", ") })
-    : "";
-  const ready = currentStore().ready;
-  $("#cart-result").innerHTML = `
-    <div class="message success">${th(ready, { added: data.added }).replace("{missing}", missing)}</div>
-    ${lines ? `<ul class="cart-lines">${lines}</ul>` : ""}
-  `;
-  // Picnic en Jumbo vullen het echte mandje: laat zien waar je het kunt bekijken en aanpassen.
-  if (state.store === "picnic" || state.store === "jumbo") {
-    $("#cart-result").insertAdjacentHTML(
-      "beforeend",
-      `<p><button class="button button--secondary" id="view-basket" type="button">${escapeHtml(t("basket.view"))}</button></p>`
-    );
-    $("#view-basket").addEventListener("click", () => openBasket(state.store));
-  }
+// De titel van een receptkaart, overal gelijk (sinds 4.8.0). Met een recept om te openen (`open` is `winkel:id`) is de titel een
+// knop die met zijn ::after de hele kaart beslaat: een tik op de kaart opent het recept in MealieShopper (openStoreRecipe, via
+// data-store-open zoals eerst de knop Bekijken). Zonder recept-id een gewone titel.
+function recipeCardTitle(title, open) {
+  const text = escapeHtml(title);
+  return open
+    ? `<h3><button class="recipe-card__open" type="button" data-store-open="${escapeHtml(open)}">${text}</button></h3>`
+    : `<h3>${text}</h3>`;
 }
 
-async function submitCart(selection, notFound) {
-  const data = await jsonFetch(`/api/${currentStore().api}/cart`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items: selection }),
-  });
-  showCartResult(data, notFound);
-}
-
-function reviewSearchHtml(row, extra) {
-  // Zoekveld bij een regel. Bij een niet gevonden regel staat het er direct; bij een gevonden regel klapt het uit
-  // onder "Zoek een ander product", voor als het voorgestelde product niet is wat je zoekt.
-  return `
-    <form class="review-search${extra ? " review-search--extra" : ""}"${extra ? " hidden" : ""}>
-      <input type="search" class="review-search-input" value="${escapeHtml(row.query)}" aria-label="${escapeHtml(t("cart.search_label"))}">
-      <button class="button button--secondary" type="submit">${escapeHtml(t("cart.search_button"))}</button>
-      <small class="review-search-status" role="status"></small>
-    </form>`;
-}
-
-function reviewThumbHtml(candidate) {
-  // De foto van het gekozen product, zodat je ziet wat er in het mandje komt; Picnic heeft geen productpagina, dus daar
-  // is dit de enige manier om het product te zien. Tikken opent hem in het groot (openReviewPhoto). De knop blijft
-  // altijd staan, zodat de kolommen gelijk blijven als er geen foto is of hij niet laadt; dan is hij uitgeschakeld.
-  // De productnaam staat al in de keuzelijst, dus alt is leeg en de knop zegt wat hij doet.
-  const label = escapeHtml(t("cart.photo_open", { title: candidate.title }));
-  const src = candidate.image ? ` src="${escapeHtml(candidate.image)}"` : " hidden";
-  return `<button class="review-thumb" type="button" aria-label="${label}" title="${label}"${candidate.image ? "" : " disabled"}><img${src} alt="" width="56" height="56" loading="lazy"></button>`;
-}
-
-function showReviewThumb(button, candidate) {
-  const img = button.querySelector("img");
-  const label = t("cart.photo_open", { title: candidate.title });
-  button.disabled = !candidate.image;
-  button.setAttribute("aria-label", label);
-  button.title = label;
-  img.hidden = !candidate.image;
-  if (candidate.image) img.src = candidate.image;
-  else img.removeAttribute("src");
-}
-
-function openReviewPhoto(candidate) {
-  // De foto in het groot. Het grote formaat (imageLarge) geven AH en Picnic mee; laadt dat niet, of is er geen, dan
-  // valt het venster terug op de gewone foto.
-  const image = $("#photo-dialog-image");
-  const large = candidate.imageLarge || candidate.image;
-  if (!large) return;
-  image.dataset.fallback = large !== candidate.image ? candidate.image : "";
-  image.hidden = false;
-  image.src = large;
-  $("#photo-dialog-title").textContent = candidate.title;
-  $("#photo-dialog-meta").textContent = [candidate.unitSize, formatPrice(candidate.price)].filter(Boolean).join(" · ");
-  $("#photo-dialog").showModal();
-}
-
-function reviewRowHtml(row, index) {
-  if (!row.candidates.length) {
-    // Niet gevonden: de gebruiker zoekt zelf verder, bijvoorbeeld onder een andere naam (paksoi heet bij AH pak choi).
-    return `
-      <div class="review-row is-missing" data-row="${index}">
-        <input type="checkbox" disabled>
-        <div class="review-ingredient">
-          <strong>${escapeHtml(row.display)}</strong>
-          <small class="review-note">${escapeHtml(row.error || t("cart.not_found"))}</small>
-        </div>
-        ${reviewSearchHtml(row, false)}
-      </div>`;
-  }
-  const first = row.candidates[0];
-  return `
-    <div class="review-row${first.doubt ? " is-doubt" : ""}" data-row="${index}">
-      <input type="checkbox" class="review-include" checked aria-label="${escapeHtml(t("cart.include"))}">
-      <div class="review-ingredient">
-        <strong>${escapeHtml(row.display)}</strong>
-        <small class="review-note">${escapeHtml(first.doubt || "")}</small>
-        <button class="link-button review-search-toggle" type="button" aria-expanded="false">${escapeHtml(t("cart.search_other"))}</button>
-      </div>
-      ${reviewThumbHtml(first)}
-      <select class="review-product" aria-label="${escapeHtml(t("cart.product"))}">
-        ${row.candidates
-          .map((candidate, at) => `<option value="${at}">${escapeHtml(cartCandidateLabel(candidate))}</option>`)
-          .join("")}
-      </select>
-      ${
-        first.url
-          ? `<a class="review-link" href="${escapeHtml(first.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(t("cart.view_title"))}">${escapeHtml(t("cart.view"))} ${ICON_EXTERNAL}</a>`
-          : '<span class="review-link"></span>'
-      }
-      <input class="review-qty" type="number" min="1" max="99" value="${first.packs}" aria-label="${escapeHtml(t("cart.packs"))}">
-      ${reviewSearchHtml(row, true)}
-    </div>`;
-}
-
-function renderCartReview(rows) {
-  const missingCount = rows.filter((row) => !row.candidates.length).length;
-  const doubts = rows.filter((row) => row.candidates.length && row.candidates[0].doubt).length;
-  $("#cart-result").innerHTML = `
-    <div class="box cart-review">
-      <div class="toolbar">
-        <h2>${escapeHtml(t("cart.review_title"))}</h2>
-        <button class="button" id="confirm-cart"></button>
-        <button class="button button--secondary" id="cancel-cart">${escapeHtml(t("common.cancel"))}</button>
-      </div>
-      <p class="muted">${escapeHtml(doubts ? tn("cart.doubts", doubts) : t("cart.review_intro"))}</p>
-      ${missingCount ? `<p class="muted" id="review-missing-hint">${escapeHtml(tn("cart.missing_hint", missingCount))}</p>` : ""}
-      <div class="review-list">${rows.map((row, index) => reviewRowHtml(row, index)).join("")}</div>
-    </div>
-  `;
-
-  // De regels kunnen veranderen: een niet gevonden regel wordt na zoeken een gewone regel. Daarom steeds opnieuw zoeken.
-  const includable = () => [...document.querySelectorAll(".review-row[data-row]")].filter((el) => el.querySelector(".review-include"));
-  const updateConfirm = () => {
-    const count = includable().filter((el) => el.querySelector(".review-include").checked).length;
-    const button = $("#confirm-cart");
-    button.disabled = count === 0;
-    button.textContent = tn("cart.confirm", count);
-  };
-  const updateMissingHint = () => {
-    const left = rows.filter((row) => !row.candidates.length).length;
-    const hint = $("#review-missing-hint");
-    if (!hint) return;
-    hint.hidden = left === 0;
-    if (left) hint.textContent = tn("cart.missing_hint", left);
-  };
-
-  const bindRow = (el) => {
-    const row = rows[Number(el.dataset.row)];
-    el.querySelector(".review-search").addEventListener("submit", (event) => {
-      event.preventDefault();
-      searchRow(el, row);
-    });
-    if (!row.candidates.length) return;
-    const form = el.querySelector(".review-search");
-    const toggle = el.querySelector(".review-search-toggle");
-    toggle.addEventListener("click", () => {
-      form.hidden = !form.hidden;
-      toggle.setAttribute("aria-expanded", String(!form.hidden));
-      if (!form.hidden) el.querySelector(".review-search-input").focus();
-    });
-    const thumb = el.querySelector(".review-thumb");
-    const product = el.querySelector(".review-product");
-    // Laadt de foto niet, dan verbergen we hem (en halen we hem niet weg): een ander product kiezen gebruikt hem opnieuw.
-    thumb.querySelector("img").addEventListener("error", (event) => {
-      event.target.hidden = true;
-      thumb.disabled = true;
-    });
-    thumb.addEventListener("click", () => openReviewPhoto(row.candidates[Number(product.value)]));
-    product.addEventListener("change", (event) => {
-      const candidate = row.candidates[Number(event.target.value)];
-      showReviewThumb(thumb, candidate);
-      el.querySelector(".review-qty").value = candidate.packs;
-      const link = el.querySelector("a.review-link");
-      if (link && candidate.url) link.href = candidate.url;
-      el.querySelector(".review-note").textContent = candidate.doubt || "";
-      el.classList.toggle("is-doubt", Boolean(candidate.doubt));
-    });
-    el.querySelector(".review-include").addEventListener("change", updateConfirm);
-    el.querySelector("a.review-link")?.addEventListener("click", (event) => {
-      event.preventDefault();
-      openProductPopup(event.currentTarget.href);
-    });
-  };
-
-  // Zoekt één regel opnieuw met de zoekterm uit het veld, voor een niet gevonden regel en voor een gevonden regel
-  // waar je een ander product wilt. Alleen deze regel wordt vervangen, zodat wat je bij de andere regels hebt
-  // gekozen blijft staan. Vindt de zoekopdracht niets, dan houdt de regel zijn huidige producten.
-  async function searchRow(el, row) {
-    const input = el.querySelector(".review-search-input");
-    const button = el.querySelector(".review-search button");
-    const status = el.querySelector(".review-search-status");
-    const term = input.value.trim();
-    if (!term) return;
-    input.disabled = true;
-    button.disabled = true;
-    status.textContent = t("cart.searching");
-    try {
-      const preview = await jsonFetch(`/api/${currentStore().api}/cart/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: [{ query: term, display: row.display, quantity: row.quantity ?? null, unit: row.unit ?? null }] }),
-      });
-      const found = (preview.items || [])[0];
-      if (found?.candidates?.length) {
-        row.query = term;
-        row.candidates = found.candidates;
-        delete row.error;
-        el.outerHTML = reviewRowHtml(row, Number(el.dataset.row));
-        bindRow(document.querySelector(`.review-row[data-row="${el.dataset.row}"]`));
-        updateMissingHint();
-        updateConfirm();
-        return;
-      }
-      status.textContent = found?.error || t("cart.search_none", { term });
-    } catch (error) {
-      status.textContent = error.message;
-    }
-    input.disabled = false;
-    button.disabled = false;
-    input.focus();
-  }
-
-  document.querySelectorAll(".review-row[data-row]").forEach(bindRow);
-  updateConfirm();
-
-  $("#cancel-cart").addEventListener("click", () => {
-    $("#cart-result").innerHTML = "";
-  });
-  $("#confirm-cart").addEventListener("click", async (event) => {
-    const button = event.currentTarget;
-    const selection = includable()
-      .filter((el) => el.querySelector(".review-include").checked)
-      .map((el) => {
-        const row = rows[Number(el.dataset.row)];
-        const candidate = row.candidates[Number(el.querySelector(".review-product").value)];
-        const quantity = Math.min(99, Math.max(1, parseInt(el.querySelector(".review-qty").value, 10) || 1));
-        return cartSelection(row, candidate, quantity);
-      });
-    if (!selection.length) return;
-    button.disabled = true;
-    button.textContent = t("cart.adding");
-    try {
-      await submitCart(
-        selection,
-        rows.filter((row) => !row.candidates.length).map((row) => row.display)
-      );
-    } catch (error) {
-      $("#cart-result").insertAdjacentHTML(
-        "afterbegin",
-        `<div class="message error">${escapeHtml(error.message)}</div>`
-      );
-      updateConfirm();
-    }
-  });
-}
-
-async function addToCart() {
-  const ingredients = aggregateIngredients(state.entries);
-  if (!ingredients.length) return;
-  const button = $("#add-cart");
-  button.disabled = true;
-  button.textContent = t("cart.searching");
-  $("#cart-result").innerHTML = "";
-  const generation = ++cartGeneration;
-  try {
-    const preview = await jsonFetch(`/api/${currentStore().api}/cart/preview`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        items: ingredients.map((ingredient) => ({
-          query: ingredient.food?.name || ingredient.display,
-          display: ingredient.display || ingredient.food?.name || "",
-          // Het aantal verpakkingen rekent de server uit met de verpakkingsgrootte van AH.
-          quantity: ingredient.quantity ?? null,
-          unit: ingredient.unit?.name || ingredient.unit?.abbreviation || null,
-        })),
-      }),
-    });
-    // Intussen veranderden de porties (dropCartReview): deze aantallen kloppen niet meer, dus niets tekenen.
-    if (generation !== cartGeneration) return;
-    const rows = preview.items || [];
-    // Het mandje gaat nooit zonder controle vol: ook zonder twijfel toont de lijst eerst wat erin komt.
-    if (!rows.some((row) => row.candidates.length)) {
-      $("#cart-result").innerHTML = `<div class="message error">${escapeHtml(t("cart.none_found"))}</div>`;
-    } else {
-      renderCartReview(rows);
-    }
-  } catch (error) {
-    if (generation !== cartGeneration) return;
-    $("#cart-result").innerHTML = `<div class="message error">${escapeHtml(error.message)}</div>`;
-  } finally {
-    button.disabled = false;
-    button.textContent = cartButtonLabel();
-  }
-}
-
-// De knoppen onderaan elke receptkaart, overal gelijk: Bekijken (het recept in MealieShopper, zie openStoreRecipe) en
-// Inplannen (de plan-dialoog). `open` is `winkel:id`; `plan` zijn de data-attributen van planButtonAttrs of planSourceAttrs.
-// Importeren zonder plannen en de link naar de winkel staan in het detail.
-function recipeCardActions(open, plan) {
+// Onderaan elke receptkaart alleen Inplannen (de plan-dialoog), secundair en boven de knop van de titel; de naam van het recept
+// staat erbij voor een schermlezer. `plan` zijn de data-attributen van planButtonAttrs of planSourceAttrs. Importeren zonder
+// plannen en de link naar de winkel staan in het detail.
+function recipeCardActions(plan, title) {
   return `
       <div class="card-actions">
-        <button class="button button--secondary" type="button" data-store-open="${escapeHtml(open)}">${escapeHtml(t("rsearch.open"))}</button>
-        <button class="button" type="button" ${plan}>${escapeHtml(t("plan.schedule"))}</button>
+        <button class="button button--secondary" type="button" ${plan}>${escapeHtml(t("plan.schedule"))}<span class="visually-hidden">: ${escapeHtml(title)}</span></button>
       </div>
       <div class="recipe-import-result"></div>`;
 }
 
 // Inplannen bij een recept dat al in Mealie staat.
 function planButtonAttrs(recipe) {
-  return `data-plan-slug="${escapeHtml(recipe.slug || recipe.id)}" data-plan-id="${escapeHtml(recipe.recipeId || "")}" data-plan-name="${escapeHtml(recipe.name || "")}" data-plan-image="${escapeHtml(recipe.image || "")}"`;
+  return `data-plan-slug="${escapeHtml(recipe.slug || recipe.id)}" data-plan-id="${escapeHtml(recipe.recipeId || "")}" data-plan-name="${escapeHtml(recipe.name || "")}" data-plan-image="${escapeHtml(recipe.image || "")}"${planExtraAttrs(recipe)}`;
+}
+
+// De porties en de kcal per portie, voor het porties-veld in de plan-dialoog (issue #283); leeg als ze onbekend zijn.
+function planExtraAttrs(recipe) {
+  const portions = Number(recipe?.portions);
+  const kcal = recipeKcal(recipe);
+  return `${portions > 0 ? ` data-plan-portions="${escapeHtml(portions)}"` : ""}${kcal ? ` data-plan-kcal="${escapeHtml(Math.round(kcal))}"` : ""}`;
 }
 
 // Inplannen bij een recept van een winkel of maaltijdbox: de plan-dialoog zet het eerst in Mealie, of gebruikt het recept
 // dat er al staat (zelfde bron).
-function planSourceAttrs(store, id, name, image) {
-  return `data-plan-source="${escapeHtml(`${store}:${id}`)}" data-plan-name="${escapeHtml(name || "")}" data-plan-image="${escapeHtml(image || "")}"`;
+function planSourceAttrs(store, id, name, image, recipe = null) {
+  return `data-plan-source="${escapeHtml(`${store}:${id}`)}" data-plan-name="${escapeHtml(name || "")}" data-plan-image="${escapeHtml(image || "")}"${planExtraAttrs(recipe)}`;
 }
 
 // Het nummer van een Allerhande-recept: het id, of anders uit de link (R-R123).
@@ -1618,12 +1861,12 @@ function renderRecipeCard(recipe) {
   const id = ahRecipeNumber(recipe);
   return `
     <article class="recipe-card">
-      ${imageUrl ? `<img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(recipe.title)}" loading="lazy">` : ""}
-      <h3>${escapeHtml(recipe.title)}</h3>
+      ${imageUrl ? `<img src="${escapeHtml(storeImage(imageUrl))}" alt="" loading="lazy" data-hide-on-error>` : ""}
+      ${recipeCardTitle(recipe.title, id ? `ah:${id}` : "")}
       ${recipe.description ? `<p class="muted">${escapeHtml(recipe.description)}</p>` : ""}
-      ${totalTime || recipe.servings ? `<p class="muted">${totalTime ? escapeHtml(t("recipe.minutes", { n: totalTime })) : ""}${totalTime && recipe.servings ? " | " : ""}${recipe.servings ? escapeHtml(t("recipe.servings", { n: recipe.servings })) : ""}</p>` : ""}
+      ${totalTime || recipe.servings ? `<p class="muted">${totalTime ? escapeHtml(t("recipe.minutes", { n: totalTime })) : ""}${totalTime && recipe.servings ? " · " : ""}${recipe.servings ? escapeHtml(t("recipe.servings", { n: recipe.servings })) : ""}</p>` : ""}
       ${tags.length ? `<div class="tags">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
-      ${id ? recipeCardActions(`ah:${id}`, planSourceAttrs("ah", id, recipe.title, imageUrl)) : ""}
+      ${id ? recipeCardActions(planSourceAttrs("ah", id, recipe.title, imageUrl), recipe.title) : ""}
     </article>
   `;
 }
@@ -1648,7 +1891,7 @@ async function importUrl(url, button = null) {
     });
     return { ok: true, html: importedMessage(data) };
   } catch (error) {
-    return { ok: false, html: error.message };
+    return { ok: false, html: escapeHtml(error.message) }; // de tekst komt van de server of van Mealie: nooit als HTML
   } finally {
     if (button) {
       button.disabled = false;
@@ -1657,24 +1900,47 @@ async function importUrl(url, button = null) {
   }
 }
 
-// De blokken onder Beheer > Koppelen (Mealie, "Inloggen bij ..." per winkel en de AI-beoordeling) zijn inklapbaar en klappen in zodra de
-// koppeling er is (bij de AI-beoordeling: zodra er een sleutel is). Een keuze van de gebruiker blijft staan.
+// De blokken onder Instellingen > Koppelen zijn inklapbaar, in het compacte formaat van Weergave (.fold--compact). Mealie en de
+// winkels klappen in zodra de koppeling er is; de AI-beoordeling staat dicht tot je hem opent, de Aanbiedingen open. Een keuze van
+// de gebruiker blijft staan zolang de pagina open is. Per blok het begin van de id's van de knop en het inklapbare deel.
+const LINK_FOLDS = {
+  offers: "offers-sync",
+  ai: "ai-login",
+  mealie: "mealie-login",
+  ah: "ah-login",
+  jumbo: "jumbo-login",
+  picnic: "picnic-login",
+  crisp: "crisp-login",
+};
 state.storeFold = {};
 
-function applyStoreFold(store, linked) {
-  const toggle = $(`#${store}-login-toggle`);
+function applyStoreFold(store, closed) {
+  const toggle = $(`#${LINK_FOLDS[store]}-toggle`);
   if (!toggle) return;
-  const open = state.storeFold[store] ?? !linked;
+  const open = state.storeFold[store] ?? !closed;
   toggle.setAttribute("aria-expanded", String(open));
   toggle.title = t(open ? "sec.collapse" : "sec.expand");
-  $(`#${store}-login-body`).hidden = !open;
+  $(`#${LINK_FOLDS[store]}-body`).hidden = !open;
 }
 
-for (const store of ["mealie", "ah", "picnic", "jumbo", "ai"]) {
-  $(`#${store}-login-toggle`).addEventListener("click", () => {
-    const toggle = $(`#${store}-login-toggle`);
-    state.storeFold[store] = toggle.getAttribute("aria-expanded") !== "true";
+for (const store of Object.keys(LINK_FOLDS)) {
+  $(`#${LINK_FOLDS[store]}-toggle`).addEventListener("click", () => {
+    state.storeFold[store] = $(`#${LINK_FOLDS[store]}-toggle`).getAttribute("aria-expanded") !== "true";
     applyStoreFold(store, false);
+  });
+}
+
+// Naar het koppelblok van Mealie of een winkel onder Instellingen, Koppelen: uitgeklapt, in beeld en met de focus op de kop.
+// Tot 4.10.4 opende de knop Instellingen bovenaan, met het blok ergens verderop onder de hulpmiddelen.
+function openLinkBlock(store) {
+  openSettings();
+  state.storeFold[store] = true;
+  applyStoreFold(store, false);
+  const toggle = $(`#${LINK_FOLDS[store]}-toggle`);
+  if (!toggle || isRegularUser()) return;
+  requestAnimationFrame(() => {
+    toggle.scrollIntoView({ block: "center" });
+    toggle.focus({ preventScroll: true });
   });
 }
 
@@ -1682,6 +1948,8 @@ async function refreshAhStatus() {
   if (!$("#ah-status")) return;
   try {
     const data = await jsonFetch("/api/ah/auth/status");
+    state.ahConnected = Boolean(data.connected); // het weekmenu vraagt het na voordat het een controlelijst maakt (addToCart)
+    if ($("#ah-unlink")) $("#ah-unlink").hidden = !data.connected;
     renderLinkStatus("#ah-status", STORES.ah.name, data.connected ? "linked" : "unlinked");
     applyStoreFold("ah", Boolean(data.connected));
   } catch (error) {
@@ -1689,16 +1957,150 @@ async function refreshAhStatus() {
   }
 }
 
+// De volledige naam van een dag (0 = zondag ... 6 = zaterdag) in de gekozen taal. 4 januari 2026 is een zondag.
+function weekdayName(day) {
+  return new Date(2026, 0, 4 + day).toLocaleDateString(I18N.locale(), { weekday: "long" });
+}
+
+// De keuzelijst bij Mealie: zoals in Mealie (met de dag die Mealie nu zegt) of een vaste dag, maandag eerst.
+function renderWeekStartChoice(weekStart) {
+  const select = $("#mealie-week-start");
+  if (!select || !weekStart) return;
+  const follow =
+    weekStart.source === "mealie"
+      ? t("mealie.week_start_mealie", { day: weekdayName(weekStart.day) })
+      : weekStart.source === "default"
+        ? t("mealie.week_start_unknown", { day: weekdayName(weekStart.day) })
+        : t("mealie.week_start_follow");
+  select.replaceChildren(new Option(follow, ""), ...[1, 2, 3, 4, 5, 6, 0].map((day) => new Option(weekdayName(day), String(day))));
+  select.value = weekStart.setting || "";
+}
+
+// Waar de week begint, uit /api/mealie/status: een vaste dag van de beheerder, anders die uit Mealie, anders maandag.
+// Geeft true als de week nu op een andere dag begint.
+function applyWeekStart(weekStart) {
+  if (!weekStart) return false;
+  renderWeekStartChoice(weekStart);
+  const day = Number.isInteger(weekStart.day) && weekStart.day >= 0 && weekStart.day <= 6 ? weekStart.day : 1;
+  if (day === state.firstDayOfWeek) return false;
+  state.firstDayOfWeek = day;
+  // De week uit het adres is geteld met de oude eerste dag: opnieuw tellen, anders schuift een week die op zondag begint er een op.
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("week") && typeof routerApplyWeek === "function") state.weekOffset = weekOffsetOf(params.get("week"));
+  updateWeekLabel();
+  if (typeof offersWeekStartChanged === "function") offersWeekStartChanged();
+  return true;
+}
+
+async function saveWeekStart(event) {
+  const select = event.currentTarget;
+  message("#mealie-week-start-message", "");
+  select.disabled = true;
+  try {
+    await jsonFetch("/api/server-settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ weekStart: select.value === "" ? null : Number(select.value) }),
+    });
+    message("#mealie-week-start-message", t("mealie.week_start_saved"), "success");
+  } catch (error) {
+    message("#mealie-week-start-message", error.message);
+  } finally {
+    select.disabled = false;
+  }
+  await refreshMealieStatus();
+}
+
+// Tags voor vegetarisch, veganistisch, vlees, vis en gevogelte in Mealie zetten (4.22.0; alleen de beheerder kan opslaan).
+async function saveDietTags(event) {
+  const toggle = event.currentTarget;
+  message("#mealie-diet-tags-message", "");
+  toggle.disabled = true;
+  try {
+    const saved = await jsonFetch("/api/server-settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dietTags: toggle.checked }),
+    });
+    toggle.checked = saved.dietTags !== false;
+    message("#mealie-diet-tags-message", t(toggle.checked ? "mealie.diet_tags.on" : "mealie.diet_tags.off"), "success");
+  } catch (error) {
+    toggle.checked = !toggle.checked;
+    message("#mealie-diet-tags-message", error.message);
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
+// ---- Voedingswaarden van oude AH-recepten aanvullen (Instellingen, Koppelen, Mealie; alleen de beheerder, issue #283). De
+// server werkt de recepten een voor een af (recipe_nutrition.py); zolang dat loopt, vraagt de pagina elke twee seconden de stand.
+let nutritionBackfillTimer = 0;
+
+function renderNutritionBackfill(status) {
+  const running = status?.state === "running";
+  $("#mealie-nutrition-start").hidden = running;
+  $("#mealie-nutrition-stop").hidden = !running;
+  const counts = {};
+  for (const key of ["checked", "total", "updated", "skipped", "failed"]) counts[key] = I18N.formatNumber(Number(status?.[key]) || 0);
+  const texts = {
+    running: t("mealie.nutrition.running", counts),
+    done: t("mealie.nutrition.done", counts),
+    stopped: [t("mealie.nutrition.stopped", counts), status?.error || ""].filter(Boolean).join(" "),
+    error: t("mealie.nutrition.error", { ...counts, error: status?.error || "" }),
+  };
+  message("#mealie-nutrition-message", texts[status?.state] || "", status?.state === "error" ? "error" : "success");
+  clearTimeout(nutritionBackfillTimer);
+  if (running) nutritionBackfillTimer = setTimeout(pollNutritionBackfill, 2000);
+}
+
+async function pollNutritionBackfill() {
+  try {
+    renderNutritionBackfill(await jsonFetch("/api/mealie/nutrition/backfill"));
+  } catch (error) {
+    message("#mealie-nutrition-message", error.message);
+  }
+}
+
+async function startNutritionBackfill(event) {
+  const button = event.currentTarget;
+  setBusy(button, true);
+  try {
+    // Loopt het al (bijvoorbeeld gestart voor het herladen van de pagina), dan alleen de stand tonen.
+    const current = await jsonFetch("/api/mealie/nutrition/backfill");
+    renderNutritionBackfill(current.state === "running" ? current : await jsonFetch("/api/mealie/nutrition/backfill", { method: "POST" }));
+  } catch (error) {
+    message("#mealie-nutrition-message", error.message);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function stopNutritionBackfill() {
+  try {
+    renderNutritionBackfill(await jsonFetch("/api/mealie/nutrition/backfill", { method: "DELETE" }));
+  } catch (error) {
+    message("#mealie-nutrition-message", error.message);
+  }
+}
+
 function renderMealieStatus(data, { verified = false } = {}) {
   const setup = $("#mealie-setup");
   if (setup) setup.hidden = Boolean(data.configured);
   state.linkedStores.mealie = Boolean(data.configured); // Recepten zoeken zoekt dan ook in Mealie
+  if (typeof recipeSearchMealieChanged === "function") recipeSearchMealieChanged(); // en bladert er zonder zoekterm doorheen
+  const dietTags = $("#mealie-diet-tags");
+  if (dietTags && typeof data.dietTags === "boolean") dietTags.checked = data.dietTags; // tags uit de ingrediënten (4.22.0)
+  if (typeof renderAhPlannerButton === "function") renderAhPlannerButton(); // Naar weekmenu (ah_planner.js) vraagt Mealie
+  // Eerst de eerste dag van de week, zodat het weekmenu meteen de goede week ophaalt.
+  const weekChanged = applyWeekStart(data.weekStart);
   // Het weekmenu laadt vanzelf zodra Mealie gekoppeld is; zonder koppeling vervalt wat we onthouden hadden.
   if (!data.configured) {
     mealPlanCache.clear();
     state.planAutoLoaded = false;
   } else if (!state.planAutoLoaded) {
     state.planAutoLoaded = true;
+    loadMealPlan();
+  } else if (weekChanged) {
     loadMealPlan();
   }
   $("#mealie-unlink").hidden = data.source !== "ui";
@@ -1734,11 +2136,21 @@ async function refreshMealieStatus() {
     renderMealieStatus(await jsonFetch("/api/mealie/status"));
   } catch (error) {
     message("#mealie-status", error.message);
+  } finally {
+    weekStartSettled();
   }
 }
 
+// De eerste dag van de week is bekend (of het opvragen mislukte en maandag blijft). Aanbiedingen wacht daarop bij het openen: een
+// week die op zondag begint, hoort op zondag al bij de volgende bonusweek, en anders laadt de pagina eerst de verkeerde week.
+function weekStartSettled() {
+  if (state.weekStartKnown) return;
+  state.weekStartKnown = true;
+  if (typeof offersWeekStartKnown === "function") offersWeekStartKnown();
+}
+
 async function checkMealieConnection() {
-  message("#mealie-status", t("mealie.checking"), "success");
+  message("#mealie-status", t("mealie.checking"), "info");
   try {
     renderMealieStatus(await jsonFetch("/api/mealie/status?verify=1"), { verified: true });
   } catch (error) {
@@ -1774,6 +2186,30 @@ async function linkMealie(event) {
   }
 }
 
+// Ontkoppelen vraagt eerst (sinds 4.10.4): het was één klik, terwijl opnieuw koppelen bij Mealie een nieuw token vraagt en bij
+// Jumbo een computer met een console. De knop is bezig tot het antwoord er is, dus twee keer klikken doet niets.
+async function unlinkWithConfirm(button, name, unlink) {
+  if (!(await confirmDialog(t("links.unlink_confirm", { name }), { danger: true, confirm: t("links.unlink") }))) return;
+  setBusy(button, true);
+  try {
+    await unlink();
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+// Albert Heijn ontkoppelen (sinds 4.13.0; de andere winkels konden het al). Staat het token ook in de omgevingsvariabele
+// AH_REFRESH_TOKEN, dan blijft de app daarmee gekoppeld en zegt de melding wat de beheerder moet doen.
+async function unlinkAh() {
+  try {
+    const data = await jsonFetch("/api/ah/auth/logout", { method: "POST", body: "{}" });
+    await refreshAhStatus();
+    message("#token-message", data.fromEnvironment ? t("ah.unlink_environment") : t("ah.unlinked"), data.fromEnvironment ? "warning" : "success");
+  } catch (error) {
+    message("#token-message", error.message);
+  }
+}
+
 async function unlinkMealie() {
   try {
     const data = await jsonFetch("/api/mealie/auth/logout", { method: "POST", body: "{}" });
@@ -1786,7 +2222,7 @@ async function unlinkMealie() {
 }
 
 async function checkAhConnection() {
-  message("#ah-status", t("ah.checking"), "success");
+  message("#ah-status", t("ah.checking"), "info");
   try {
     const data = await jsonFetch("/api/ah/auth/status?verify=1");
     if (data.connected) {
@@ -1801,6 +2237,17 @@ async function checkAhConnection() {
   } catch (error) {
     message("#ah-status", error.message);
   }
+}
+
+// De hoogte waarmee een element precies tot de onderkant van de pagina reikt, zodat het daarbinnen scrolt in plaats van de
+// pagina: van waar het begint tot waar de pagina ophoudt, met wat er onder het element nog komt (de rand van het kader, de
+// marge van de pagina) meegerekend. Op een scherm smaller dan `minWidth` of voor een verborgen element null: dan scrolt de
+// pagina gewoon. De aankopentabel (orders.js) en de prijsgeschiedenis (offers_history.js) gebruiken dit.
+function pageFitHeight(element, { minWidth = 1200, min = 240 } = {}) {
+  if (!window.matchMedia(`(min-width: ${minWidth}px)`).matches || !element.offsetParent) return null;
+  const rect = element.getBoundingClientRect();
+  const shell = document.querySelector("main.shell").getBoundingClientRect();
+  return Math.max(min, window.innerHeight - (rect.top + window.scrollY) - (shell.bottom - rect.bottom));
 }
 
 function formatSyncTime(value) {
@@ -2028,7 +2475,8 @@ async function openAhList(listId, { push = true } = {}) {
   if (!state.ahOpenListId) state.ahListsScroll = window.scrollY;
   state.ahOpenListId = listId;
   state.ahOpenList = null;
-  if (push) history.pushState({ ahList: listId }, "");
+  state.ahListFromOverview = push; // geopend met een klik in het overzicht: terug is dan een stap terug in de browser
+  if (push && typeof routerSync === "function") routerSync();
   const known = state.ahLists.find((list) => list.id === listId);
   $("#ah-list-title").textContent = known?.name || t("list.default_title");
   $("#ah-list-meta").textContent = "";
@@ -2041,8 +2489,12 @@ async function openAhList(listId, { push = true } = {}) {
 }
 
 function closeAhList() {
-  if (history.state?.ahList) history.back();
-  else showAhListsOverview();
+  if (state.ahListFromOverview) {
+    history.back(); // router.js opent dan het overzicht weer
+    return;
+  }
+  showAhListsOverview();
+  if (typeof routerSync === "function") routerSync();
 }
 
 async function loadAhFavoriteListItems(listId, { keepScroll = false } = {}) {
@@ -2116,7 +2568,7 @@ function renderAhListItem(item, editable = false) {
   const url = item.url || product.url || "";
   const meta = [product.brand, product.unitSize].filter(Boolean).join(" · ");
   const body = `
-    ${product.image ? `<img src="${escapeHtml(product.image)}" alt="" loading="lazy">` : ""}
+    ${product.image ? `<img src="${escapeHtml(storeImage(product.image))}" alt="" loading="lazy" data-hide-on-error>` : ""}
     <div>
       <strong>${editable ? "" : `${escapeHtml(item.quantity)}x `}${escapeHtml(title)}</strong>
       ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
@@ -2193,7 +2645,7 @@ async function resetOpenAhList() {
   const button = $("#reset-ah-list");
   const edited = (state.ahOpenList?.items || []).filter((item) => item.edited).length;
   // Terugzetten gooit je aanpassingen weg; eerst bevestigen.
-  if (!window.confirm(tn("list.reset_confirm", edited))) return;
+  if (!(await confirmDialog(tn("list.reset_confirm", edited), { danger: true }))) return;
   setBusy(button, true);
   message("#ah-list-items-message", "");
   try {
@@ -2236,36 +2688,67 @@ async function addOpenAhListToCart() {
 function renderSavedRecipeCard(recipe) {
   const image = recipe.image || "";
   const id = ahRecipeNumber(recipe);
+  // De voedingswaarden per portie, zodra MealieShopper ze bij AH heeft opgehaald (ah_recipes.start_fill na Synchroniseren).
+  const kcal = factsWithKcal([], [["kcal.per_serving", recipeKcal(recipe)]]);
+  const meta = kcal + nutritionBrief(recipe.nutrition, Boolean(kcal));
   return `
-    <article class="recipe-card">
-      ${image ? `<img src="${escapeHtml(image)}" alt="${escapeHtml(recipe.title || "")}" loading="lazy">` : ""}
-      <h3>${escapeHtml(recipe.title || t("recipe.unknown"))}</h3>
-      ${id ? recipeCardActions(`ah:${id}`, planSourceAttrs("ah", id, recipe.title, image)) : ""}
+    <article class="recipe-card"${id ? ` data-store-recipe="ah:${escapeHtml(id)}"` : ""}>
+      ${image ? `<img src="${escapeHtml(storeImage(image))}" alt="" loading="lazy" data-hide-on-error>` : ""}
+      ${recipeCardTitle(recipe.title || t("recipe.unknown"), id ? `ah:${id}` : "")}
+      ${meta ? `<p class="muted">${meta}</p>` : ""}
+      ${id ? recipeCardActions(planSourceAttrs("ah", id, recipe.title, image, recipe), recipe.title || t("recipe.unknown")) : ""}
     </article>
   `;
+}
+
+// De keuzelijst met de receptgroepen van AH, zoals de receptenlijsten bij Jumbo: eerst alle recepten, dan elke groep.
+function renderAhRecipeGroups() {
+  const select = $("#ah-recipe-group");
+  const groups = state.ahRecipeGroups;
+  if (!groups.some((group) => group.id === state.ahRecipeGroup)) state.ahRecipeGroup = "";
+  const all = `<option value="">${escapeHtml(`${t("ah.recipes.all_groups")} (${I18N.formatNumber(state.ahRecipes.length)})`)}</option>`;
+  select.innerHTML =
+    all +
+    groups
+      .map((group) => `<option value="${escapeHtml(group.id)}">${escapeHtml(`${group.name} (${I18N.formatNumber(group.count)})`)}</option>`)
+      .join("");
+  select.value = state.ahRecipeGroup;
+  select.hidden = !groups.length; // zonder groepen valt er niets te kiezen
+}
+
+// De recepten van de gekozen groep, in de volgorde van die groep; zonder keuze alle bewaarde recepten.
+function savedRecipesOfGroup() {
+  const group = state.ahRecipeGroups.find((item) => item.id === state.ahRecipeGroup);
+  if (!group) return state.ahRecipes;
+  const byId = new Map(state.ahRecipes.map((recipe) => [String(recipe.id), recipe]));
+  return (group.recipeIds || []).map((id) => byId.get(String(id))).filter(Boolean);
 }
 
 function renderSavedRecipes() {
   const query = state.ahRecipeQuery.trim();
   const all = state.ahRecipes;
-  const recipes = query ? all.filter((recipe) => matchesWords(recipe.title, query)) : all;
+  const inGroup = savedRecipesOfGroup();
+  const recipes = query ? inGroup.filter((recipe) => matchesWords(recipe.title, query)) : inGroup;
   $("#ah-recipes").innerHTML = recipes.length
     ? recipes.map(renderSavedRecipeCard).join("")
     : "";
+  if (typeof recipeBulkDecorate === "function") recipeBulkDecorate("ah"); // selecteren en in bulk importeren (recipe_bulk.js)
   if (!all.length) return;
-  message(
-    "#ah-recipes-message",
-    recipes.length ? "" : t("saved.none_match", { query }),
-    "success"
-  );
+  let text = "";
+  if (!inGroup.length) text = t("ah.recipes.group_empty");
+  else if (!recipes.length) text = t("saved.none_match", { query });
+  message("#ah-recipes-message", text, "success");
 }
 
 function updateSavedRecipesStatus(data) {
   const total = Number(data.total ?? state.ahRecipes.length);
   const when = formatSyncTime(data.syncedAt);
   state.ahRecipesMeta = data;
+  // Voedingswaarden die nog bij AH opgehaald moeten worden (telkens een deel na Synchroniseren, zie ah_recipes.start_fill).
+  const pending = Number(data.nutritionPending) || 0;
   $("#ah-recipes-status").textContent =
-    tn("saved.status", total) + (when ? t("saved.status_when", { when }) : "") + t("saved.status_hint");
+    tn("saved.status", total) + (when ? t("saved.status_when", { when }) : "") +
+    (pending && caloriesShown() ? ` ${tn("saved.nutrition_pending", pending)}` : "");
 }
 
 // `cachedOnly`: alleen de lokale kopie tonen, nooit AH vragen (zo opent het tabblad zonder AH-verkeer).
@@ -2287,6 +2770,8 @@ async function loadSavedRecipes({ refresh = false, cachedOnly = false } = {}) {
     const query = refresh ? "?refresh=1" : cachedOnly ? "?cached=1" : "";
     const data = await jsonFetch(`/api/ah/recipes/saved${query}`);
     state.ahRecipes = data.recipes || [];
+    state.ahRecipeGroups = data.groups || [];
+    renderAhRecipeGroups();
     $("#ah-recipe-filter").disabled = !state.ahRecipes.length;
     button.dataset.label = data.syncedAt ? t("saved.refresh") : t("saved.fetch");
     state.ahRecipesFetched = Boolean(data.syncedAt);
@@ -2315,26 +2800,36 @@ async function loadSavedRecipes({ refresh = false, cachedOnly = false } = {}) {
   }
 }
 
-// Een scherm tonen. Een hoofdtab geeft zijn knop mee (die lichtt op); het profiel en de instellingen horen bij het avatar-menu:
-// op een klein scherm lichtt dan de avatar-knop in de tabbalk op.
+// Een scherm tonen. Een hoofdtab geeft zijn knop mee (die lichtt op); het profiel, de instellingen en Over horen bij het
+// avatar-menu, en op een klein scherm ook het mandje: dan lichtt de knop Meer in de tabbalk op. Die knop is er op een groot
+// scherm niet, en de tab Mandje niet op een klein scherm, dus er is steeds een zichtbare tab met aria-current.
+const MORE_MENU_PANELS = ["profile", "settings", "about", "basket"];
+
 function showPanel(panelId, tab = null) {
   document.querySelectorAll(".tab, .panel").forEach((item) => item.classList.remove("is-active"));
   document.querySelectorAll(".tab").forEach((item) => item.removeAttribute("aria-current"));
-  const highlighted = tab || (["profile", "settings", "about"].includes(panelId) ? $("#tab-avatar") : null);
-  if (highlighted) {
-    highlighted.classList.add("is-active");
-    highlighted.setAttribute("aria-current", "page");
-  }
+  const highlighted = [tab, MORE_MENU_PANELS.includes(panelId) ? $("#tab-more") : null].filter(Boolean);
+  highlighted.forEach((item) => {
+    item.classList.add("is-active");
+    item.setAttribute("aria-current", "page");
+  });
   $(`#${panelId}`).classList.add("is-active");
   // Zoals een native tabbalk: een andere tab begint bovenaan.
   window.scrollTo({ top: 0 });
+  // De focus gaat mee naar het nieuwe scherm (sinds 4.13.0), zodat Tab daar verdergaat en een schermlezer het scherm aankondigt.
+  // Niet bij het openen van de app of bij Terug: daar zet de router de focus en de plek zelf (router.js).
+  if (typeof router !== "undefined" && router.started && !router.applying) document.querySelector("#main")?.focus({ preventScroll: true });
+  if (panelId === "ah-items") itemsFollowPreferred();
   if (panelId === "ah-items" && !state.ahRecipesLoaded) loadSavedRecipes({ cachedOnly: true });
   if (panelId === "about" && !state.aboutLoaded) loadAbout();
   if (panelId === "basket") showBasket();
   if (panelId === "meal-kits" && typeof showMealKits === "function") showMealKits();
   if (panelId === "offers" && typeof showOffers === "function") showOffers();
   if (panelId === "recipes") ensureMealPlan();
-  if (panelId === "settings" && typeof loadOffersSyncStatus === "function") loadOffersSyncStatus();
+  if (panelId === "settings" && !isRegularUser() && typeof loadOffersSyncStatus === "function") loadOffersSyncStatus();
+  if (panelId === "settings" && !isRegularUser() && typeof loadLinkingBox === "function") loadLinkingBox();
+  if (typeof cookWakeUpdate === "function") cookWakeUpdate(); // een ander scherm: is er nog een recept in beeld?
+  if (typeof routerSync === "function") routerSync();
 }
 
 // Het navigatiemenu links (groot scherm) inklappen tot alleen de pictogrammen; de keuze blijft bewaard.
@@ -2407,14 +2902,40 @@ $("#items-store-list").addEventListener("click", (event) => {
   switchItemsStore(item.dataset.store);
 });
 
+// Een subtabbalk die op een telefoon horizontaal scrolt, laat zien dat er meer staat (sinds 4.13.0): de rand vervaagt aan de
+// kant waar nog tabbladen buiten beeld staan (has-more-start, has-more-end in styles.css). Zonder die aanwijzing zag je bij
+// Instellingen en Winkels niet dat de balk doorliep.
+function subtabsEdges(bar) {
+  const room = bar.scrollWidth - bar.clientWidth;
+  bar.classList.toggle("has-more-start", room > 2 && bar.scrollLeft > 2);
+  bar.classList.toggle("has-more-end", room > 2 && bar.scrollLeft < room - 2);
+}
+
+document.querySelectorAll(".subtabs").forEach((bar) => {
+  bar.addEventListener("scroll", () => subtabsEdges(bar), { passive: true });
+  // Ook als de balk in beeld komt (een ander scherm) of van breedte verandert (draaien, een andere taal).
+  if (typeof ResizeObserver === "function") new ResizeObserver(() => subtabsEdges(bar)).observe(bar);
+});
+
+// Het tabblad dat bij het laden open staat (is-active in de markup) krijgt ook aria-current; daarna zet de klik hieronder het.
+document.querySelectorAll(".subtab.is-active[data-subtab]").forEach((subtab) => subtab.setAttribute("aria-current", "page"));
 document.querySelectorAll(".subtab[data-subtab], .subtab-menu__item[data-subtab]").forEach((subtab) => {
   subtab.addEventListener("click", () => {
     const panel = subtab.closest(".panel");
     if (!panel) return;
     panel
       .querySelectorAll(".subtab, .subtab-menu__item[data-subtab], .subpanel")
-      .forEach((item) => item.classList.remove("is-active"));
+      .forEach((item) => {
+        item.classList.remove("is-active");
+        item.removeAttribute("aria-current");
+      });
     subtab.classList.add("is-active");
+    // Een schermlezer hoort welk tabblad open is, niet alleen een kleur (App-Guidance, web-app-design.md).
+    subtab.setAttribute("aria-current", "page");
+    // Op een telefoon is de balk één regel die horizontaal scrolt: het gekozen tabblad in beeld (App-Guidance, web-app-design.md).
+    const bar = subtab.closest(".subtabs");
+    if (bar && bar.scrollWidth > bar.clientWidth) subtab.scrollIntoView({ block: "nearest", inline: "center" });
+    if (bar) subtabsEdges(bar);
     const menu = subtab.closest(".subtab-menu");
     if (menu) {
       menu.querySelector(".subtab-menu__toggle").classList.add("is-active");
@@ -2422,23 +2943,36 @@ document.querySelectorAll(".subtab[data-subtab], .subtab-menu__item[data-subtab]
     }
     const target = panel.querySelector(`#${subtab.dataset.subtab}`);
     if (target) target.classList.add("is-active");
-    if (subtab.dataset.subtab === "planner") ensureMealPlan();
+    if (panel.id === "offers" && typeof showOffers === "function") showOffers();
+    if (subtab.dataset.subtab === "planner") {
+      closeShopView(); // Weekmenu is ook de weg terug uit de boodschappenlijst (shopping.js)
+      ensureMealPlan();
+    }
+    if (subtab.dataset.subtab === "search" && typeof showRecipeSearch === "function") showRecipeSearch();
     if (subtab.dataset.subtab === "settings-link" && typeof loadOffersSyncStatus === "function") loadOffersSyncStatus();
+    if (subtab.dataset.subtab === "settings-link" && typeof loadLinkingBox === "function") loadLinkingBox();
     if (subtab.dataset.subtab === "settings-link" && typeof loadAiReviewSettings === "function") loadAiReviewSettings();
     if (subtab.dataset.subtab === "settings-users" && typeof loadUsers === "function") loadUsers();
     if (subtab.dataset.subtab === "profile-ai" && typeof loadAi === "function") loadAi();
     if (subtab.dataset.subtab === "settings-audit" && typeof loadAudit === "function") loadAudit();
     if (subtab.dataset.subtab === "settings-system" && typeof loadBackup === "function") loadBackup();
-    if (subtab.dataset.subtab === "settings-system" && typeof loadDefaultPortions === "function") loadDefaultPortions();
+    if (subtab.dataset.subtab === "settings-system" && typeof loadPriceArchive === "function") loadPriceArchive();
+    if (subtab.dataset.subtab === "settings-system" && typeof loadImageCacheStatus === "function") loadImageCacheStatus();
     if (subtab.dataset.subtab === "ah-items-bestellingen" && typeof loadOrders === "function") loadOrders();
+    if (subtab.dataset.subtab === "ah-items-losse-aankopen" && typeof loadLooseNames === "function") loadLooseNames();
+    if (subtab.dataset.subtab === "ah-items-weekplanner" && typeof showAhPlanner === "function") showAhPlanner();
     if (subtab.dataset.subtab === "ah-items-picnic" && typeof loadPicnicRecipes === "function" && !picnicRecipes.loaded) loadPicnicRecipes();
     if (subtab.dataset.subtab === "ah-items-picnic-favorieten" && typeof loadPicnicFavorites === "function" && !picnicFavorites.loaded) loadPicnicFavorites({ refresh: false });
     if (subtab.dataset.subtab === "ah-items-picnic-bestellingen" && typeof loadPicnicOrders === "function" && !picnicOrders.loaded) loadPicnicOrders();
     if (subtab.dataset.subtab === "ah-items-jumbo-recepten" && typeof loadJumboFavorites === "function" && !jumboFavorites.loaded) loadJumboFavorites();
+    if (subtab.dataset.subtab === "ah-items-crisp-recepten" && typeof loadCrispRecipes === "function" && !crispRecipes.loaded) loadCrispRecipes();
+    if (subtab.dataset.subtab === "ah-items-crisp-favorieten" && typeof loadCrispFavorites === "function" && !crispFavorites.loaded) loadCrispFavorites();
+    if (subtab.dataset.subtab === "ah-items-crisp-bestellingen" && typeof loadCrispOrders === "function" && !crispOrders.loaded) loadCrispOrders();
     if (subtab.dataset.subtab === "ah-items-lijstjes" && !state.ahListsLoaded) {
       state.ahListsLoaded = true;
       loadAhFavoriteLists();
     }
+    if (typeof routerSync === "function") routerSync();
   });
 });
 
@@ -2495,27 +3029,53 @@ function openProfile(subtab = "profile-general") {
   openSubtab("profile", subtab);
 }
 
-function openSettings(subtab = "settings-link") {
-  openSubtab("settings", subtab);
+function isRegularUser() {
+  return document.documentElement.classList.contains("is-regular-user");
 }
 
-$("#prev-week").addEventListener("click", () => {
-  state.weekOffset -= 1;
+// Een gewone gebruiker ziet onder Instellingen alleen Voorkeuren.
+function openSettings(subtab = "settings-link") {
+  openSubtab("settings", isRegularUser() ? "settings-appearance" : subtab);
+}
+
+// Een andere week in het weekmenu: de week staat daarna in het adres, zonder een stap in de geschiedenis per week.
+function changePlanWeek(offset) {
+  state.weekOffset = offset;
   updateWeekLabel();
   loadMealPlan();
-});
-$("#next-week").addEventListener("click", () => {
-  state.weekOffset += 1;
-  updateWeekLabel();
-  loadMealPlan();
-});
+  if (typeof routerSync === "function") routerSync({ replace: true });
+}
+
+$("#this-week").addEventListener("click", () => changePlanWeek(0));
+$("#prev-week").addEventListener("click", () => changePlanWeek(state.weekOffset - 1));
+$("#next-week").addEventListener("click", () => changePlanWeek(state.weekOffset + 1));
 $("#load-plan").addEventListener("click", () => loadMealPlan({ force: true }));
 $("#meal-days").addEventListener("click", (event) => {
+  // In de bewerkstand (plan_drag.js) sleep je een maaltijd; een tik erop opent dan niets.
+  if (event.target.closest(".is-arranging .meal--planned")) return;
   const add = event.target.closest("[data-plan-add]");
   if (add) return openPlanDialog({ date: add.dataset.planAdd });
-  const edit = event.target.closest("[data-plan-edit]");
-  const entry = edit && (state.entries || []).find((item) => String(item.id) === edit.dataset.planEdit);
+  const button = event.target.closest("[data-plan-view], [data-plan-edit]");
+  if (!button) return;
+  const id = button.dataset.planView ?? button.dataset.planEdit;
+  const entry = (state.entries || []).find((item) => String(item.id) === id);
+  if (!entry) return;
+  if (button.dataset.planView != null) openMealRecipe(entry);
+  else openPlanDialog({ entry });
+});
+// Het recept van een maaltijd (openMealRecipe): Wijzigen gaat naar het plan-venster; Sluiten, Esc of een tik naast het venster sluit.
+// "Start met koken" in het venster opent de kookmodus (#cook-mode, recipe_view.js) erbovenop; dat is een eigen venster ernaast.
+$("#meal-recipe-edit").addEventListener("click", () => {
+  const entry = mealRecipe.entry;
+  $("#meal-recipe-dialog").close();
   if (entry) openPlanDialog({ entry });
+});
+$("#meal-recipe-close").addEventListener("click", () => $("#meal-recipe-dialog").close());
+$("#meal-recipe-dialog").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) event.currentTarget.close();
+});
+$("#meal-recipe-image").addEventListener("error", (event) => {
+  event.target.hidden = true;
 });
 // "Inplannen" bij een recept uit Mealie of na een import (`data-plan-slug`), of bij een recept van een winkel of maaltijdbox
 // (`data-plan-source`, dat bij het opslaan eerst in Mealie komt): de plan-dialoog met het recept al gekozen.
@@ -2524,9 +3084,10 @@ document.addEventListener("click", (event) => {
   if (!button) return;
   const data = button.dataset;
   const [store, ...rest] = (data.planSource || "").split(":");
+  const extra = { portions: Number(data.planPortions) || null, kcal: Number(data.planKcal) || null };
   const recipe = data.planSource
-    ? { source: { store, id: rest.join(":") }, name: data.planName || "", image: data.planImage || "" }
-    : { slug: data.planSlug, recipeId: data.planId || "", name: data.planName || "", image: data.planImage || "" };
+    ? { source: { store, id: rest.join(":") }, name: data.planName || "", image: data.planImage || "", ...extra }
+    : { slug: data.planSlug, recipeId: data.planId || "", name: data.planName || "", image: data.planImage || "", ...extra };
   const target =
     button.closest(".message")?.parentElement ||
     button.closest(".recipe-card")?.querySelector(".recipe-import-result") ||
@@ -2566,21 +3127,37 @@ $("#plan-recipe-query").addEventListener("keydown", (event) => {
 $("#plan-recipe-results").addEventListener("click", (event) => {
   const pick = event.target.closest("[data-plan-pick]");
   if (!pick) return;
-  planDialog.recipe = planDialog.results[Number(pick.dataset.planPick)] || null;
   message("#plan-message", "");
-  renderPlanRecipe();
+  choosePlanRecipe(planDialog.results[Number(pick.dataset.planPick)] || null);
 });
 $("#plan-recipe-chosen").addEventListener("click", (event) => {
+  const step = event.target.closest("[data-servings-step]");
+  if (step) return setPlanServings((planDialog.servings || planBase(planDialog.recipe)) + Number(step.dataset.servingsStep));
   if (!event.target.closest("#plan-recipe-change")) return;
   planDialog.recipe = null;
   renderPlanRecipe();
   $("#plan-recipe-query").focus();
   if (!planDialog.results.length) searchPlanRecipes();
 });
+$("#plan-recipe-chosen").addEventListener("change", (event) => {
+  if (event.target.id === "plan-servings") setPlanServings(event.target.value);
+});
+// De filters op voedingswaarden (kcal per persoon en Meer filters) in de receptkiezer: zoeken zodra je stopt met typen.
+["#plan-kcal-min", "#plan-kcal-max", ...NUTRITION_FILTERS.slice(1).flatMap(([name]) => [`#plan-${name}-min`, `#plan-${name}-max`])].forEach((selector) => {
+  $(selector).addEventListener("input", () => {
+    clearTimeout(planDialog.searchTimer);
+    planDialog.searchTimer = setTimeout(searchPlanRecipes, 400);
+  });
+  $(selector).addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    searchPlanRecipes();
+  });
+});
 $("#import-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const result = await importUrl($("#import-url").value.trim());
-  $("#import-message").innerHTML = `<div class="message ${result.ok ? "success" : "error"}">${result.html}</div>`;
+  $("#import-message").innerHTML = `<div class="message ${result.ok ? "success" : "error"}" role="${result.ok ? "status" : "alert"}">${result.html}</div>`;
 });
 $("#verify-token").addEventListener("click", async () => {
   const token = $("#token-input").value.trim();
@@ -2601,17 +3178,22 @@ $("#verify-token").addEventListener("click", async () => {
 $("#check-ah").addEventListener("click", checkAhConnection);
 $("#mealie-form").addEventListener("submit", linkMealie);
 $("#check-mealie").addEventListener("click", checkMealieConnection);
-$("#mealie-unlink").addEventListener("click", unlinkMealie);
-$("#open-mealie-setup").addEventListener("click", () => {
-  openSettings();
-  state.storeFold.mealie = true;
-  applyStoreFold("mealie", false);
-});
+$("#mealie-unlink").addEventListener("click", (event) => unlinkWithConfirm(event.currentTarget, "Mealie", unlinkMealie));
+$("#ah-unlink").addEventListener("click", (event) => unlinkWithConfirm(event.currentTarget, STORES.ah.name, unlinkAh));
+$("#mealie-week-start").addEventListener("change", saveWeekStart);
+$("#mealie-diet-tags").addEventListener("change", saveDietTags);
+$("#mealie-nutrition-start").addEventListener("click", startNutritionBackfill);
+$("#mealie-nutrition-stop").addEventListener("click", stopNutritionBackfill);
+$("#open-mealie-setup").addEventListener("click", () => openLinkBlock("mealie"));
 $("#load-ah-lists").addEventListener("click", loadAhFavoriteLists);
 $("#sync-all-ah-lists").addEventListener("click", syncAllAhLists);
 $("#load-ah-recipes").addEventListener("click", () => loadSavedRecipes({ refresh: true }));
 $("#ah-recipe-filter").addEventListener("input", (event) => {
   state.ahRecipeQuery = event.target.value;
+  renderSavedRecipes();
+});
+$("#ah-recipe-group").addEventListener("change", (event) => {
+  state.ahRecipeGroup = event.target.value;
   renderSavedRecipes();
 });
 $("#ah-list-filter").addEventListener("input", onAhListFilter);
@@ -2641,10 +3223,7 @@ $("#ah-recipes").addEventListener("click", (event) => {
 });
 // De browser zou bij terug zelf een scrollstand kiezen; wij zetten hem terug op de plek in het overzicht.
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
-window.addEventListener("popstate", (event) => {
-  if (event.state?.ahList) openAhList(event.state.ahList, { push: false });
-  else if (state.ahOpenListId) showAhListsOverview();
-});
+// Terug en vooruit (ook naar een lijstje) regelt router.js.
 // Een plaatje dat niet laadt (bijvoorbeeld een recept zonder afbeelding in Mealie) verdwijnt netjes.
 document.addEventListener(
   "error",
@@ -2662,9 +3241,19 @@ $("#mfa-cancel").addEventListener("click", cancelMfa);
 $("#mfa-recovery-toggle").addEventListener("click", toggleRecoveryInput);
 $("#login-passkey").addEventListener("click", handlePasskeyLogin);
 $("#add-passkey").addEventListener("click", addPasskey);
-$("#auth-logout").addEventListener("click", async () => {
-  await jsonFetch("/api/auth/logout", { method: "POST", body: "{}" });
-  await refreshAuthStatus();
+$("#auth-logout").addEventListener("click", async (event) => {
+  // Mislukt het uitloggen (geen verbinding), dan zeggen we dat: op een gedeeld toestel mag je niet denken dat je weg bent.
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    if (typeof cookPushForget === "function") await cookPushForget(); // de meldingen van de kooktimers stoppen (cook_timers.js)
+    await jsonFetch("/api/auth/logout", { method: "POST", body: "{}" });
+    await refreshAuthStatus();
+  } catch (error) {
+    toast(t("auth.logout_failed", { error: error.message }), "error");
+  } finally {
+    button.disabled = false;
+  }
 });
 
 const params = new URLSearchParams(window.location.search);
@@ -2672,17 +3261,17 @@ if (params.get("ah_refresh")) {
   openSettings();
   $("#token-input").value = params.get("ah_refresh");
   message("#token-message", t("ah.refresh_received"), "success");
-  history.replaceState({}, "", "/");
+  history.replaceState({}, "", "/settings");
 }
 if (params.get("ah_connected")) {
   openSettings();
   message("#token-message", t("ah.saved"), "success");
-  history.replaceState({}, "", "/");
+  history.replaceState({}, "", "/settings");
 }
 if (params.get("ah_error")) {
   openSettings();
   message("#token-message", t("ah.redirect_failed", { error: params.get("ah_error") }));
-  history.replaceState({}, "", "/");
+  history.replaceState({}, "", "/settings");
 }
 
 // Een andere taal: alles wat uit gegevens is opgebouwd opnieuw tekenen (de vaste teksten doet i18n.js).
@@ -2693,6 +3282,7 @@ window.addEventListener("ms:languagechange", () => {
   renderCredentials();
   renderAhLists();
   if (state.ahOpenListId) loadAhFavoriteListItems(state.ahOpenListId, { keepScroll: true });
+  renderAhRecipeGroups();
   renderSavedRecipes();
   refreshSavedRecipesStatus();
   renderAbout();
@@ -2714,3 +3304,31 @@ document.addEventListener("DOMContentLoaded", async () => {
     $("#auth-gate").hidden = false;
   });
 });
+
+// ---- adressen van schermen (router.js gebruikt ze, en de links elders in de app ook). Hier, omdat app.js als eerste laadt.
+
+function routerQuery(params) {
+  const text = new URLSearchParams(Object.entries(params).filter(([, value]) => value)).toString();
+  return text ? `?${text}` : "";
+}
+
+function storesPath(store, section = "", id = "") {
+  return ["/stores", store, section, id].filter(Boolean).map((part, index) => (index ? encodeURIComponent(part) : part)).join("/");
+}
+
+function offersPath(sub = "", params = {}) {
+  return `/offers${sub ? `/${sub}` : ""}${routerQuery(params)}`;
+}
+
+// De prijsgeschiedenis van een product: de naam zoekt hem op, het id kiest hem in de lijst.
+function priceHistoryPath(store, title, productId = "") {
+  return offersPath("history", { store: offersStoreParam(store), q: title || "", product: productId ? String(productId) : "" });
+}
+
+// Waar een aankoop vandaan komt: een bestelling of kassabon heeft een eigen adres, als de app hem kan tonen.
+function purchasePath(store, source, ref) {
+  if (!ref) return "";
+  if (source === "receipt" && store === "ah") return storesPath("ah", "receipts", ref);
+  if (source === "order" && (store === "ah" || store === "jumbo")) return storesPath(store, "orders", ref);
+  return "";
+}

@@ -1,5 +1,5 @@
 // Winkels > Picnic (recepten, favorieten, bestellingen) en Winkels > Jumbo (lijstjes, bestellingen, recepten).
-const { DISHES, dish, product } = require("../demo");
+const { DISHES, dish, product, openSubtab } = require("../demo");
 
 // De data-uri's zijn lang; een scenario gebruikt ze per naam.
 const P = {
@@ -30,7 +30,7 @@ async function openStore(page, store, subtab) {
   await page.click(`#items-store-list [data-store="${store}"]`);
   await page.waitForTimeout(600);
   if (subtab) {
-    await page.click(`[data-subtab="${subtab}"]`);
+    await openSubtab(page, subtab);
     await page.waitForTimeout(700);
   }
 }
@@ -128,7 +128,16 @@ const jumboOrders = [
   ["o5", "2026-09-25", "17:00", "19:00", 54.95, 14],
 ].map((order) => (Array.isArray(order)
   ? { id: order[0], kind: "delivered", deliveryDate: order[1], slotStart: atSummer(order[1], order[2]), slotEnd: atSummer(order[1], order[3]), total: order[4], itemsSynced: true, itemCount: order[5] }
-  : order));
+  : order))
+  // De productfoto's van een bestelling: sinds 4.13.0 staan de aankopen op een telefoon standaard als kaarten, met een collage
+  // van die foto's (zonder foto's een leeg vak met een winkelwagentje). De status zoals de server hem geeft
+  // (purchase_lines.status_kind: Jumbo heeft geen eigen statustekst); zonder statusKind valt de badge terug op Kassabon.
+  .map((order, at) => ({
+    ...order,
+    images: Object.values(P).slice(at % 6, (at % 6) + 6),
+    statusKind: order.kind === "delivered" ? "delivered" : "planned",
+    statusText: null,
+  }));
 
 module.exports = [
   {
@@ -209,8 +218,8 @@ module.exports = [
       await openStore(page, "jumbo");
       await page.click('[data-store-open="jumbo:j1"]');
       await page.waitForTimeout(800);
-      // De foto is groot: scrol naar de ingrediënten, zodat ook de bereiding, de tip en de voedingswaarden in beeld komen.
-      await page.evaluate(() => window.scrollTo(0, document.querySelector("#jumbo-recipe-body h3").getBoundingClientRect().top + window.scrollY - 130));
+      // De foto is groot: scrol naar de kookweergave (de balk met Start met koken), met de ingrediënten naast de bereiding.
+      await page.evaluate(() => window.scrollTo(0, document.querySelector("#jumbo-recipe-body .cook__bar").getBoundingClientRect().top + window.scrollY - 130));
     },
   },
 ];

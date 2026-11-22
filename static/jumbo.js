@@ -20,6 +20,7 @@ async function refreshJumboStatus() {
   } catch (error) {
     message("#jumbo-status", error.message);
   }
+  state.storeStatusKnown.jumbo = true; // gekoppeld of niet: Aanbiedingen en Winkels hoeven er niet meer op te wachten
   renderStoreChoice();
 }
 
@@ -33,15 +34,20 @@ async function showJumboBasket() {
       return `<li class="basket-line"><span class="basket-title">${escapeHtml(item.title || "-")}</span><span class="basket-qty">${escapeHtml(item.quantity)}\u00d7</span><span class="basket-price">${price}</span><span></span></li>`;
     })
     .join("");
-  const total = cart.totalPrice ? `<p><strong>${escapeHtml(t("picnic.basket_total", { amount: formatPrice(cart.totalPrice) }))}</strong></p>` : "";
+  const stats = items.length
+    ? basketStats([
+        [t("basket.stat.total"), cart.totalPrice ? formatPrice(cart.totalPrice) : ""],
+        [t("basket.stat.products"), cart.totalCount ? I18N.formatNumber(cart.totalCount) : ""],
+      ])
+    : "";
   $("#basket-content").innerHTML = `
+    ${stats}
     ${items.length ? `<ul class="basket-lines">${lines}</ul>` : `<p class="muted">${escapeHtml(t("basket.jumbo_empty"))}</p>`}
-    ${total}
     <p class="muted">${escapeHtml(t("basket.jumbo_hint"))}</p>`;
 }
 
 async function checkJumboConnection() {
-  message("#jumbo-status", t("ah.checking"), "success");
+  message("#jumbo-status", t("ah.checking"), "info");
   try {
     const data = await jsonFetch("/api/jumbo/auth/status?verify=1");
     if (data.verified) renderLinkStatus("#jumbo-status", STORES.jumbo.name, "working");
@@ -114,7 +120,7 @@ async function runJumboExplore() {
 
 $("#jumbo-link").addEventListener("click", linkJumbo);
 $("#jumbo-check").addEventListener("click", checkJumboConnection);
-$("#jumbo-unlink").addEventListener("click", unlinkJumbo);
+$("#jumbo-unlink").addEventListener("click", (event) => unlinkWithConfirm(event.currentTarget, STORES.jumbo.name, unlinkJumbo));
 $("#jumbo-explore-run").addEventListener("click", runJumboExplore);
 $("#jumbo-explore-copy").addEventListener("click", async (event) => {
   const text = $("#jumbo-explore-output").textContent;
@@ -164,6 +170,7 @@ function renderJumboFavorites() {
   $("#jumbo-favorites-status").textContent = data.recipes.length ? t("rsearch.count", { shown: I18N.formatNumber(data.recipes.length), total: I18N.formatNumber(data.total) }) : "";
   $("#jumbo-favorites-more").hidden = !data.hasNext;
   if (data.loaded && !data.recipes.length) message("#jumbo-favorites-message", t("jumbo.favorites.none"), "success");
+  if (typeof recipeBulkDecorate === "function") recipeBulkDecorate("jumbo"); // selecteren en in bulk importeren (recipe_bulk.js)
 }
 
 async function loadJumboFavorites(append = false) {

@@ -1,28 +1,54 @@
+import asyncio
 import datetime
 import json
 import logging
 import math
 import re
 import sqlite3
+import ssl
 import time
+import unicodedata
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from os import environ
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
+import httpx
 
-from . import ah, auth, ingredients, jumbo, jumbo_recipes
+from . import ah, auth, http_client, ingredients, jumbo, jumbo_recipes, nutrition
 from .i18n import tr
 
 log = logging.getLogger(__name__)
 
+TIMEOUT: float = 30.0  # seconden, de standaard van de client: elk verzoek geeft zijn eigen time-out mee
+RECIPE_WORKERS: int = 8  # recepten tegelijk ophalen voor het weekmenu, zoals de threadpool van voorheen
+
+# Mealie niet bereikbaar: de verbinding kwam er niet, of viel weg voordat het antwoord binnen was.
+UNREACHABLE: tuple[type[httpx.HTTPError], ...] = (httpx.NetworkError, httpx.RemoteProtocolError)
+
+
+def _client() -> httpx.AsyncClient:
+    """De gedeelde client voor Mealie. Het token gaat niet in de client maar per verzoek mee (`_headers`): het kan
+    wisselen via Instellingen > Koppelen > Mealie. Volgt doorverwijzingen, zoals voor de omzetting naar httpx. Een verzoek
+    dat dat niet mag, geeft zelf `follow_redirects=False` mee. Een receptpagina gaat via `http_client.session`."""
+    return http_client.client("mealie", timeout=TIMEOUT)
+
+
+def _certificate_error(exc: BaseException) -> bool:
+    """Of een verbindingsfout van httpx uit ssl komt (een certificaat dat niet klopt). httpx heeft daar geen eigen soort
+    fout voor: de fout van ssl hangt als oorzaak aan de `ConnectError`."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ssl.SSLError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
 }
@@ -53,11 +79,11 @@ def normalize_url(value: Any) -> str:
 _db_warned = False
 
 
-def _ui_secret(key: str) -> str:
+async def _ui_secret(key: str) -> str:
     """Lees een in de UI opgeslagen waarde; een onleesbare database laat de omgevingsvariabelen intact."""
     global _db_warned
     try:
-        return auth.get_secret(key).strip()
+        return (await auth.get_secret(key)).strip()
     except (sqlite3.Error, OSError) as exc:
         if not _db_warned:
             _db_warned = True
@@ -65,9 +91,9 @@ def _ui_secret(key: str) -> str:
         return ""
 
 
-def _config() -> tuple[str, str, str | None]:
+async def _config() -> tuple[str, str, str | None]:
     """(adres, token, bron). Adres en token komen altijd uit dezelfde bron, nooit gemengd."""
-    ui_url, ui_token = _ui_secret(SECRET_URL), _ui_secret(SECRET_TOKEN)
+    ui_url, ui_token = await _ui_secret(SECRET_URL), await _ui_secret(SECRET_TOKEN)
     if ui_url and ui_token:
         return ui_url.rstrip("/"), ui_token, "ui"
     env_url, env_token = environ.get("MEALIE_URL", "").strip(), environ.get("MEALIE_API_TOKEN", "").strip()
@@ -76,88 +102,98 @@ def _config() -> tuple[str, str, str | None]:
     return "", "", None
 
 
-def mealie_url() -> str:
-    return _config()[0]
+async def mealie_url() -> str:
+    return (await _config())[0]
 
 
-def mealie_token() -> str:
-    return _config()[1]
+async def mealie_token() -> str:
+    return (await _config())[1]
 
 
-def auth_headers() -> dict[str, str]:
+def _headers(token: str) -> dict[str, str]:
     return {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {mealie_token()}",
+        "Authorization": f"Bearer {token}",
     }
 
 
-def ensure_configured() -> None:
-    if not mealie_url() or not mealie_token():
+async def auth_headers() -> dict[str, str]:
+    """De headers voor een verzoek aan Mealie, met het token van dit moment."""
+    return _headers(await mealie_token())
+
+
+async def _endpoint() -> tuple[str, str]:
+    """Adres en token voor een verzoek aan Mealie uit een keer `_config()`: per verzoek een keer lezen, en adres en token
+    altijd van hetzelfde moment. Leeg als Mealie niet gekoppeld is."""
+    url, token, _ = await _config()
+    return url, token
+
+
+async def _configured() -> tuple[str, str]:
+    """Zoals `_endpoint`, maar met de fout van `ensure_configured` als Mealie niet gekoppeld is."""
+    url, token = await _endpoint()
+    if not url or not token:
         raise RuntimeError(
             tr(
                 "Mealie is niet gekoppeld. Koppel Mealie bij Instellingen > Koppelen > Mealie.",
                 "Mealie is not linked. Link Mealie under Settings > Link > Mealie.",
             )
         )
+    return url, token
 
 
-def check_connection(url: str, token: str) -> dict[str, Any]:
+async def ensure_configured() -> None:
+    await _configured()
+
+
+async def check_connection(url: str, token: str) -> dict[str, Any]:
     """Controleer adres en token bij Mealie zelf; geeft gebruiker en versie, of een duidelijke fout."""
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
-        response = requests.get(
-            f"{url}/api/users/self", headers=headers, timeout=15, allow_redirects=False
-        )
-    except requests.exceptions.SSLError:
-        raise RuntimeError(
-            "Het certificaat van Mealie wordt niet vertrouwd. Controleer het adres of het certificaat."
-        ) from None
-    except requests.exceptions.Timeout:
+        response = await _client().get(f"{url}/api/users/self", headers=headers, timeout=15, follow_redirects=False)
+    except httpx.TimeoutException:
         raise RuntimeError("Mealie reageert niet (time-out). Controleer het adres en je verbinding.") from None
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            f"Mealie is niet bereikbaar op {url}. Controleer het adres en of deze server erbij kan."
-        ) from None
-    except requests.RequestException as exc:
+    except UNREACHABLE as exc:
+        if _certificate_error(exc):
+            raise RuntimeError("Het certificaat van Mealie wordt niet vertrouwd. Controleer het adres of het certificaat.") from None
+        raise RuntimeError(f"Mealie is niet bereikbaar op {url}. Controleer het adres en of deze server erbij kan.") from None
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         raise RuntimeError(f"Verbinding met Mealie mislukt: {exc}") from None
 
     status = response.status_code
     if 300 <= status < 400:
         location = response.headers.get("Location", "")
         raise RuntimeError(
-            f"Mealie stuurt door naar {location}. Gebruik dat adres." if location
+            f"Mealie stuurt door naar {location}. Gebruik dat adres."
+            if location
             else "Mealie stuurt door naar een ander adres. Gebruik het adres waar je Mealie in de browser opent."
         )
     if status in (401, 403):
-        raise RuntimeError(
-            f"Mealie weigert de token ({status}). Maak een nieuwe API-token en controleer of hij niet is verlopen."
-        )
+        raise RuntimeError(f"Mealie weigert de token ({status}). Maak een nieuwe API-token en controleer of hij niet is verlopen.")
     if status == 404:
         raise RuntimeError("Op dit adres is geen Mealie-API gevonden (404). Controleer het adres.")
-    if not response.ok:
+    if response.status_code >= 400:
         raise RuntimeError(f"Mealie gaf een fout ({status}): {response.text[:200]}")
     try:
         data = response.json()
     except ValueError:
-        raise RuntimeError(
-            "Dit adres geeft geen Mealie-antwoord (geen JSON). Controleer het adres en je reverse proxy."
-        ) from None
+        raise RuntimeError("Dit adres geeft geen Mealie-antwoord (geen JSON). Controleer het adres en je reverse proxy.") from None
     if not isinstance(data, dict) or "username" not in data:
         raise RuntimeError("Dit adres lijkt geen Mealie te zijn: het antwoord mist een gebruiker.")
 
     version = None
     try:
-        about = requests.get(f"{url}/api/app/about", timeout=10, allow_redirects=False)
-        if about.ok:
+        about = await _client().get(f"{url}/api/app/about", timeout=10, follow_redirects=False)
+        if about.status_code < 400:
             version = (about.json() or {}).get("version")
-    except (requests.RequestException, ValueError):
+    except (httpx.HTTPError, ValueError):
         pass  # de versie is een extraatje
     return {"username": data.get("username"), "version": version}
 
 
-def status(verify: bool = False) -> dict[str, Any]:
+async def status(verify: bool = False) -> dict[str, Any]:
     """Toestand van de koppeling; bevat nooit de token."""
-    url, token, source = _config()
+    url, token, source = await _config()
     result: dict[str, Any] = {
         "configured": bool(url and token),
         "url": url,
@@ -165,16 +201,18 @@ def status(verify: bool = False) -> dict[str, Any]:
     }
     if verify and result["configured"]:
         result["verified"] = True
+        _week_start_cache.pop(url, None)  # Koppeling controleren: een andere eerste dag in Mealie meteen overnemen
         try:
-            result.update(check_connection(url, token))
+            result.update(await check_connection(url, token))
             result["connected"] = True
         except RuntimeError as exc:
             result["connected"] = False
             result["error"] = str(exc)
+    result["weekStart"] = await week_start()
     return result
 
 
-def link(url: Any, token: Any) -> dict[str, Any]:
+async def link(url: Any, token: Any) -> dict[str, Any]:
     """Controleer en bewaar (versleuteld) het adres en de token. Mislukt de controle, dan wordt niets bewaard."""
     clean_url = normalize_url(url)
     clean_token = str(token or "").strip()
@@ -182,36 +220,40 @@ def link(url: Any, token: Any) -> dict[str, Any]:
         raise ValueError("Plak de API-token van Mealie.")
     if re.search(r"\s", clean_token):
         raise ValueError("De token bevat spaties of regeleinden. Kopieer hem opnieuw uit Mealie.")
-    checked = check_connection(clean_url, clean_token)
-    auth.set_secret(SECRET_URL, clean_url)
-    auth.set_secret(SECRET_TOKEN, clean_token)
-    return {**status(), **checked, "verified": True, "connected": True}
+    checked = await check_connection(clean_url, clean_token)
+    await auth.set_secret(SECRET_URL, clean_url)
+    await auth.set_secret(SECRET_TOKEN, clean_token)
+    return {**(await status()), **checked, "verified": True, "connected": True}
 
 
-def clear() -> dict[str, Any]:
+async def clear() -> dict[str, Any]:
     """Verwijder de koppeling uit de UI; daarna geldt weer een eventuele omgevingsconfiguratie."""
-    auth.delete_secret(SECRET_URL)
-    auth.delete_secret(SECRET_TOKEN)
-    return status()
+    await auth.delete_secret(SECRET_URL)
+    await auth.delete_secret(SECRET_TOKEN)
+    return await status()
 
 
-def import_via_url(url: str) -> str:
-    response = requests.post(
-        f"{mealie_url()}/api/recipes/create/url",
-        headers=auth_headers(),
+async def import_via_url(url: str) -> str:
+    base, token = await _endpoint()
+    response = await _client().post(
+        f"{base}/api/recipes/create/url",
+        headers=_headers(token),
         json={"url": url, "include_tags": True, "include_categories": True},
         timeout=60,
     )
-    if not response.ok:
+    if response.status_code >= 400:
         raise MealieImportError(f"Mealie kon de pagina niet importeren ({response.status_code}): {response.text[:200]}", response.status_code)
-    return parse_imported_ingredients(response.json())
+    return await parse_imported_ingredients(response.json())
 
 
-def import_via_html(url: str) -> str:
-    page_response = requests.get(url, headers=BROWSER_HEADERS, timeout=60)
-    if not page_response.ok:
+async def import_via_html(url: str) -> str:
+    # Een eigen sessie, niet de gedeelde client: zet de site bij een doorverwijzing een cookie (toestemming, een
+    # cookiecontrole), dan gaat die mee naar de volgende stap. Na deze ene pagina sluit de sessie met haar cookies.
+    async with http_client.session("mealie-page", headers=BROWSER_HEADERS, timeout=60, follow_redirects=True) as page:
+        page_response = await page.get(url)
+    if page_response.status_code >= 400:
         raise RuntimeError(f"Kon de pagina niet ophalen ({page_response.status_code})")
-    return _post_html_or_json(url, page_response.text)
+    return await _post_html_or_json(url, page_response.text)
 
 
 class MealieImportError(RuntimeError):
@@ -222,15 +264,50 @@ class MealieImportError(RuntimeError):
         self.status_code = status_code
 
 
-def import_via_jsonld(url: str, recipe: dict[str, Any]) -> str:
-    """Importeer een schema.org Recipe (JSON-LD); Mealie hoeft de pagina dan niet op te halen."""
-    return _post_html_or_json(url, json.dumps(recipe))
+# Mealie leest een recept met recipe-scrapers, en dat kiest zijn scraper op de host van de link die we meegeven. Voor deze hosts
+# heeft het een eigen scraper die alleen de pagina van die site leest en de JSON-LD die wij sturen negeert: dan komen alleen
+# de titel en de foto in Mealie, zonder ingrediënten en bereiding (#242). Zo'n recept sturen we onder een neutrale link
+# (`.invalid` bestaat nooit), zodat de algemene schema.org-scraper het leest, en daarna zetten we de echte bron terug.
+JSONLD_IGNORING_HOSTS = frozenset({"picnic.app"})
+NEUTRAL_SOURCE = "https://mealieshopper.invalid/recipe"
 
 
-def _post_html_or_json(url: str, data: str) -> str:
-    response = requests.post(
-        f"{mealie_url()}/api/recipes/create/html-or-json",
-        headers=auth_headers(),
+def _scrape_url(url: str) -> str:
+    """De link waaronder Mealie een recept uit JSON-LD leest: de bron zelf, of `NEUTRAL_SOURCE` voor een host uit
+    `JSONLD_IGNORING_HOSTS` (ook met `www.` of een subdomein ervoor)."""
+    host = (urlparse(url).hostname or "").lower()
+    if any(host == known or host.endswith(f".{known}") for known in JSONLD_IGNORING_HOSTS):
+        return NEUTRAL_SOURCE
+    return url
+
+
+async def import_via_jsonld(url: str, recipe: dict[str, Any], catalog: "Catalog | None" = None) -> str:
+    """Importeer een schema.org Recipe (JSON-LD); Mealie hoeft de pagina dan niet op te halen. `url` is de bron die
+    Mealie bij het recept bewaart (en waarop `find_recipe_by_source` zoekt).
+
+    `catalog`: bij een reeks imports (de bulkimport) de eenheden en ingrediënten van Mealie, één keer opgehaald.
+    """
+    return await _post_html_or_json(_scrape_url(url), json.dumps(recipe), catalog, source=url)
+
+
+async def _set_source(slug: str, source: str) -> None:
+    """Zet de bron (`orgURL`) van een recept. Best effort: lukt het niet, dan staat het recept er al wel, met alles erin."""
+    try:
+        base, token = await _endpoint()
+        response = await _client().patch(f"{base}/api/recipes/{slug}", headers=_headers(token), json={"orgURL": source}, timeout=30)
+        if response.status_code >= 400:
+            log.warning("Bron van %s niet gezet (%s)", slug, response.status_code)
+    except httpx.HTTPError:
+        log.warning("Bron van %s niet gezet door een verbindingsfout", slug)
+
+
+async def _post_html_or_json(url: str, data: str, catalog: "Catalog | None" = None, *, source: str | None = None) -> str:
+    """Stuur HTML of JSON-LD naar Mealie onder link `url`. Is `source` een andere link (zie `_scrape_url`), dan wordt die
+    daarna de bron van het recept."""
+    base, token = await _endpoint()
+    response = await _client().post(
+        f"{base}/api/recipes/create/html-or-json",
+        headers=_headers(token),
         json={
             "data": data,
             "url": url,
@@ -239,85 +316,256 @@ def _post_html_or_json(url: str, data: str) -> str:
         },
         timeout=60,
     )
-    if not response.ok:
+    if response.status_code >= 400:
         raise MealieImportError(f"Mealie import mislukt ({response.status_code}): {response.text}", response.status_code)
-    return parse_imported_ingredients(response.json())
+    slug = response.json()
+    if source and source != url:
+        await _set_source(slug, source)
+    return await parse_imported_ingredients(slug) if catalog is None else await parse_imported_ingredients(slug, catalog)
 
 
-def import_from_url(url: str) -> str:
-    ensure_configured()
+async def import_from_url(url: str) -> str:
+    await ensure_configured()
     errors: list[str] = []
 
     # Allerhande-recepten komen via de AH-API: de websitepagina van AH blokkeert servers (403).
     recipe_id = ah.allerhande_recipe_id(url)
     if recipe_id:
         try:
-            return import_via_jsonld(url, ah.get_recipe_jsonld(recipe_id))
+            return await import_via_jsonld(url, await ah.get_recipe_jsonld(recipe_id))
         except Exception as exc:  # noqa: BLE001 - val terug op de pagina-import
             errors.append(f"AH-API: {exc}")
 
     # Jumbo-recepten ook via de API: jumbo.com weert servers, en zo komen ingrediënten en bereiding zeker mee.
     jumbo_id = jumbo_recipes.recipe_id_from_url(url)
-    if jumbo_id and jumbo.configured_refresh_token():
+    if jumbo_id and await jumbo.configured_refresh_token():
         try:
-            recipe = jumbo_recipes.get_recipe(jumbo_id)
-            return import_via_jsonld(jumbo_recipes.source_url(recipe), jumbo_recipes.jsonld(recipe))
+            recipe = await jumbo_recipes.get_recipe(jumbo_id)
+            return await import_via_jsonld(jumbo_recipes.source_url(recipe), jumbo_recipes.jsonld(recipe))
         except Exception as exc:  # noqa: BLE001 - val terug op de pagina-import
             errors.append(f"Jumbo-API: {exc}")
 
     try:
-        return import_via_url(url)
+        return await import_via_url(url)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"Mealie: {exc}")
     try:
-        return import_via_html(url)
+        return await import_via_html(url)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pagina: {exc}")
     raise RuntimeError("; ".join(errors))
 
 
-def find_recipe_by_source(source_url: Any) -> str | None:
-    """De slug van een recept dat al uit deze bron in Mealie staat, of None.
+class MealieLookupError(RuntimeError):
+    """Mealie kon niet zoeken op bron. Bij een bulkimport stoppen we dan: anders komt alles er dubbel in."""
+
+
+_JUMBO_BARE_URL = re.compile(r"^https?://(?:www\.)?jumbo\.com/recepten/(\d{1,20}(?:-\d{1,3})?)/?$", re.I)
+
+
+def _source_filter(url: str) -> str:
+    """Het `queryFilter` waarmee Mealie een recept uit deze bron vindt.
+
+    Allerhande en Jumbo op het receptnummer: de link staat er met of zonder (dezelfde) naam in, en Jumbo past de naam
+    in de link aan als een recept een andere titel krijgt. Andere links als geheel.
+    """
+    recipe_id = ah.allerhande_recipe_id(url)
+    if recipe_id:
+        return f'org_url LIKE "%/r-r{recipe_id}/%" OR org_url LIKE "%/r-r{recipe_id}"'
+    jumbo_id = jumbo_recipes.recipe_id_from_url(url) or next(iter(_JUMBO_BARE_URL.findall(url)), None)
+    if jumbo_id:
+        return (
+            f'org_url LIKE "%jumbo.com/recepten/%-{jumbo_id}" OR org_url LIKE "%jumbo.com/recepten/%-{jumbo_id}/" '
+            f'OR org_url LIKE "%jumbo.com/recepten/{jumbo_id}" OR org_url LIKE "%jumbo.com/recepten/{jumbo_id}/"'
+        )
+    return f'org_url LIKE "{url}"'
+
+
+async def find_recipe_summary_by_source(source_url: Any, *, strict: bool = False) -> dict[str, Any] | None:
+    """Het recept (zoals in de receptenlijst van Mealie, met `slug`, `tags` en `recipeCategory`) dat al uit deze bron
+    in Mealie staat, of None.
 
     Mealie bewaart bij elke import de meegegeven link als `org_url` en kan daarop zoeken (`queryFilter` met `LIKE`,
-    hoofdletterongevoelig). Allerhande zoeken we op het receptnummer, want de link staat er met of zonder naam in.
-    Best effort: lukt het zoeken niet (een oudere Mealie, een vreemde link), dan None en wordt er gewoon geïmporteerd.
+    hoofdletterongevoelig); zie `_source_filter`. Lukt het zoeken niet (een oudere Mealie, Mealie niet bereikbaar),
+    dan None, of met `strict` een `MealieLookupError`. Een link die niet te zoeken is (leeg, te lang, met een
+    aanhalingsteken) geeft altijd None.
     """
     url = str(source_url or "").strip()
-    if not url or '"' in url or len(url) > 1000 or not mealie_url() or not mealie_token():
+    if not url or '"' in url or len(url) > 1000:
         return None
-    recipe_id = ah.allerhande_recipe_id(url)
-    query = f'org_url LIKE "%/r-r{recipe_id}/%" OR org_url LIKE "%/r-r{recipe_id}"' if recipe_id else f'org_url LIKE "{url}"'
+    base, token = await _endpoint()
+    if not base or not token:
+        return None
     try:
-        response = requests.get(
-            f"{mealie_url()}/api/recipes",
-            headers=auth_headers(),
-            params={"queryFilter": query, "page": 1, "perPage": 1},
+        response = await _client().get(
+            f"{base}/api/recipes",
+            headers=_headers(token),
+            params={"queryFilter": _source_filter(url), "page": 1, "perPage": 1},
             timeout=15,
         )
-        if not response.ok:
-            log.info("Mealie kon niet zoeken op bron (%s); er wordt geïmporteerd.", response.status_code)
+        if response.status_code >= 400:
+            log.info("Mealie kon niet zoeken op bron (%s).", response.status_code)
+            if strict:
+                raise MealieLookupError(f"Zoeken op bron mislukt ({response.status_code})")
             return None
         items = (response.json() or {}).get("items") or []
-    except (requests.RequestException, ValueError, AttributeError) as exc:
-        log.info("Zoeken op bron in Mealie mislukt (%s); er wordt geïmporteerd.", exc)
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        log.info("Zoeken op bron in Mealie mislukt (%s).", exc)
+        if strict:
+            raise MealieLookupError(f"Zoeken op bron mislukt ({type(exc).__name__})") from exc
         return None
-    slug = items[0].get("slug") if items and isinstance(items[0], dict) else None
-    return str(slug) if slug else None
+    found = items[0] if items and isinstance(items[0], dict) and items[0].get("slug") else None
+    return found
 
 
-def _catalog(kind: str) -> list[dict[str, Any]]:
+async def find_recipe_by_source(source_url: Any) -> str | None:
+    """De slug van een recept dat al uit deze bron in Mealie staat, of None.
+
+    Best effort: lukt het zoeken niet (een oudere Mealie, een vreemde link), dan None en wordt er gewoon geïmporteerd.
+    """
+    found = await find_recipe_summary_by_source(source_url)
+    return str(found["slug"]) if found else None
+
+
+class OrganizerError(RuntimeError):
+    """Mealie geeft of maakt een tag of categorie niet. `forbidden`: de gekoppelde gebruiker mag niet organiseren."""
+
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def forbidden(self) -> bool:
+        return self.status in (401, 403)
+
+
+def _organizer_slug(name: str) -> str:
+    """Ongeveer het slug dat Mealie van een naam maakt (kleine letters, zonder accenten, met streepjes)."""
+    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+
+
+def _organizer_ref(item: Any) -> dict[str, str] | None:
+    if not isinstance(item, dict) or not item.get("id") or not str(item.get("name") or "").strip():
+        return None
+    return {"id": str(item["id"]), "name": str(item["name"]).strip(), "slug": str(item.get("slug") or "")}
+
+
+async def _organizer(kind: str, name: Any) -> dict[str, str]:
+    """De tag of categorie (`kind`: tags of categories) met deze naam, hoofdletters maken niet uit; anders een nieuwe.
+
+    Eerst zoeken op naam, dan op slug (een oudere Mealie kent `search` niet), en pas daarna aanmaken. Aanmaken vraagt
+    in Mealie het recht *organiseren*; zonder dat recht volgt een `OrganizerError` met `forbidden`.
+    """
+    label = " ".join(str(name or "").split())[:100]
+    if not label:
+        raise ValueError("Naam ontbreekt")
+    root, token = await _endpoint()
+    base = f"{root}/api/organizers/{kind}"
+    wanted = label.casefold()
+    response = await _client().get(base, headers=_headers(token), params={"search": label, "page": 1, "perPage": 100}, timeout=15)
+    if response.status_code in (401, 403):
+        raise OrganizerError(f"{kind} opzoeken geweigerd ({response.status_code})", response.status_code)
+    if response.status_code < 400:
+        items = (response.json() or {}).get("items") or []
+        for item in items:
+            found = _organizer_ref(item)
+            if found and found["name"].casefold() == wanted:
+                return found
+    slug = _organizer_slug(label)
+    if slug:
+        response = await _client().get(f"{base}/slug/{slug}", headers=_headers(token), timeout=15)
+        found = _organizer_ref(response.json()) if response.status_code < 400 else None
+        if found and found["name"].casefold() == wanted:
+            return found
+    response = await _client().post(base, headers=_headers(token), json={"name": label}, timeout=15)
+    if response.status_code >= 400:
+        raise OrganizerError(f"{kind} aanmaken mislukt ({response.status_code})", response.status_code)
+    created = _organizer_ref(response.json())
+    if not created:
+        raise OrganizerError(f"{kind} aanmaken gaf geen id terug")
+    return created
+
+
+async def ensure_tag(name: Any) -> dict[str, str]:
+    """De tag met deze naam in Mealie (`{id, name, slug}`); bestaat hij nog niet, dan wordt hij aangemaakt."""
+    return await _organizer("tags", name)
+
+
+async def ensure_category(name: Any) -> dict[str, str]:
+    """De categorie met deze naam in Mealie (`{id, name, slug}`); bestaat ze nog niet, dan wordt ze aangemaakt."""
+    return await _organizer("categories", name)
+
+
+async def add_organizers(
+    slug: str,
+    tags: list[dict[str, str]] | None = None,
+    categories: list[dict[str, str]] | None = None,
+    current: dict[str, Any] | None = None,
+) -> bool:
+    """Zet tags en categorieën bij een recept, naast wat het al heeft. Geeft True als er iets bij kwam.
+
+    `current`: het recept zoals Mealie het in de lijst geeft (uit `find_recipe_summary_by_source`); staan de tags en
+    categorieën daarin, dan hoeft het niet opnieuw opgehaald te worden. Er gaat alleen een PATCH uit als er iets
+    ontbreekt (op id of op naam), zodat niets dubbel komt. Bewust niet `bulk-actions/tag` van Mealie: dat voegt toe
+    zonder te kijken wat het recept al heeft.
+    """
+    if not tags and not categories:
+        return False
+    known = isinstance(current, dict) and isinstance(current.get("tags"), list) and isinstance(current.get("recipeCategory"), list)
+    recipe = current if known else await _fetch_recipe(slug)
+    changes: dict[str, list[dict[str, Any]]] = {}
+    for field, wanted in (("tags", tags or []), ("recipeCategory", categories or [])):
+        current = [item for item in (recipe.get(field) or []) if isinstance(item, dict)]
+        ids = {str(item.get("id")) for item in current if item.get("id")}
+        names = {str(item.get("name") or "").strip().casefold() for item in current}
+        slugs = {str(item.get("slug") or "") for item in current if item.get("slug")}
+        missing = [
+            item
+            for item in wanted
+            if item["id"] not in ids and item["name"].casefold() not in names and not (item.get("slug") and item["slug"] in slugs)
+        ]
+        if missing:
+            changes[field] = current + missing
+    if not changes:
+        return False
+    base, token = await _endpoint()
+    response = await _client().patch(f"{base}/api/recipes/{slug}", headers=_headers(token), json=changes, timeout=30)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Tags en categorieën zetten mislukt ({response.status_code})")
+    return True
+
+
+async def change_tags(slug: str, add: list[dict[str, str]], remove: list[str]) -> list[dict[str, Any]]:
+    """Zet tags bij een recept en haal tags weg (op naam, hoofdletters maken niet uit). Haalt het recept eerst opnieuw op,
+    zodat een wijziging die intussen in Mealie gebeurde blijft staan. Geeft de tags zoals ze nu zijn."""
+    recipe = await _fetch_recipe(slug)
+    gone = {name.casefold() for name in remove}
+    current = [item for item in (recipe.get("tags") or []) if isinstance(item, dict) and str(item.get("name") or "").strip().casefold() not in gone]
+    names = {str(item.get("name") or "").strip().casefold() for item in current}
+    tags = current + [item for item in add if item["name"].casefold() not in names]
+    if len(tags) == len(recipe.get("tags") or []) and not add and not remove:
+        return tags
+    base, token = await _endpoint()
+    response = await _client().patch(f"{base}/api/recipes/{slug}", headers=_headers(token), json={"tags": tags}, timeout=30)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Tags zetten mislukt ({response.status_code})")
+    return tags
+
+
+async def _catalog(kind: str) -> list[dict[str, Any]]:
     """Alle eenheden (`units`) of ingrediënten (`foods`) die Mealie kent."""
     items: list[dict[str, Any]] = []
     page, per_page = 1, 500
     while True:
-        response = requests.get(
-            f"{mealie_url()}/api/{kind}",
-            headers=auth_headers(),
+        base, token = await _endpoint()
+        response = await _client().get(
+            f"{base}/api/{kind}",
+            headers=_headers(token),
             params={"page": page, "perPage": per_page},
             timeout=30,
         )
-        if not response.ok:
+        if response.status_code >= 400:
             raise RuntimeError(f"{kind} ophalen mislukt ({response.status_code})")
         data = response.json()
         batch = data.get("items", []) if isinstance(data, dict) else []
@@ -341,14 +589,15 @@ def _catalog_index(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return index
 
 
-def _create_catalog_item(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-    response = requests.post(f"{mealie_url()}/api/{kind}", headers=auth_headers(), json=payload, timeout=30)
-    if not response.ok:
+async def _create_catalog_item(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    base, token = await _endpoint()
+    response = await _client().post(f"{base}/api/{kind}", headers=_headers(token), json=payload, timeout=30)
+    if response.status_code >= 400:
         raise RuntimeError(f"{kind} aanmaken mislukt ({response.status_code}): {response.text[:200]}")
     return response.json()
 
 
-def _link_to_catalog(parsed: dict[str, Any], units: dict[str, Any], foods: dict[str, Any]) -> dict[str, Any]:
+async def _link_to_catalog(parsed: dict[str, Any], units: dict[str, Any], foods: dict[str, Any]) -> dict[str, Any]:
     """Zet de eenheid en het ingrediënt van een geanalyseerde regel om in de objecten van Mealie (met id).
 
     `units` en `foods` zijn de indexen uit `_catalog_index`; wat ontbreekt wordt aangemaakt en erin gezet.
@@ -358,21 +607,43 @@ def _link_to_catalog(parsed: dict[str, Any], units: dict[str, Any], foods: dict[
     if unit_name:
         unit = next((units[key] for key in ingredients.unit_lookup_names(unit_name) if key in units), None)
         if unit is None:
-            unit = _create_catalog_item("units", ingredients.unit_definition(unit_name))
+            unit = await _create_catalog_item("units", ingredients.unit_definition(unit_name))
             units.update(_catalog_index([unit]))
     food = None
     food_name = parsed["food"]["name"].strip() if isinstance(parsed.get("food"), dict) else ""
     if food_name:
         food = foods.get(food_name.lower())
         if food is None:
-            food = _create_catalog_item("foods", {"name": food_name})
+            food = await _create_catalog_item("foods", {"name": food_name})
             foods.update(_catalog_index([food]))
     linked = {**parsed, "unit": unit, "food": food, "isFood": bool(food)}
     linked.pop("analyzedByMealieShopper", None)
     return linked
 
 
-def parse_imported_ingredients(slug: str) -> str:
+class Catalog:
+    """De eenheden en ingrediënten van Mealie, één keer opgehaald voor een reeks imports (de bulkimport).
+
+    Zonder dit object haalt elke import de hele lijst opnieuw op. Wat tijdens het koppelen wordt aangemaakt, komt er
+    meteen bij (`_link_to_catalog` werkt de indexen bij), zodat het volgende recept het niet nog eens aanmaakt.
+    """
+
+    def __init__(self) -> None:
+        self.units: dict[str, dict[str, Any]] | None = None
+        self.foods: dict[str, dict[str, Any]] | None = None
+
+    def reset(self) -> None:
+        self.units = self.foods = None
+
+    async def indexes(self) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        if self.units is None:
+            self.units = _catalog_index(await _catalog("units"))
+        if self.foods is None:
+            self.foods = _catalog_index(await _catalog("foods"))
+        return self.units, self.foods
+
+
+async def parse_imported_ingredients(slug: str, catalog: Catalog | None = None) -> str:
     """Zet de ingrediëntregels van een net geïmporteerd recept om in aantal, eenheid en ingrediënt.
 
     Mealie bewaart een geïmporteerde regel als losse tekst ("200 ml melk") in de notitie. Hier halen we aantal,
@@ -381,27 +652,30 @@ def parse_imported_ingredients(slug: str) -> str:
     Geeft altijd het slug terug: lukt dit niet, dan blijft het recept zoals Mealie het importeerde.
     """
     try:
-        recipe = _fetch_recipe(slug)
+        recipe = await _fetch_recipe(slug)
         lines = recipe.get("recipeIngredient") if isinstance(recipe, dict) else None
         parsed_lines = [ingredients.normalize(line) for line in lines or []]
         if not any(new is not old for new, old in zip(parsed_lines, lines or [])):
             return slug
-        units = _catalog_index(_catalog("units"))
-        foods = _catalog_index(_catalog("foods"))
-        linked = [
-            _link_to_catalog(new, units, foods) if new is not old else old
-            for new, old in zip(parsed_lines, lines)
-        ]
-        response = requests.patch(
-            f"{mealie_url()}/api/recipes/{slug}",
-            headers=auth_headers(),
+        if catalog is not None:
+            units, foods = await catalog.indexes()
+        else:
+            units, foods = _catalog_index(await _catalog("units")), _catalog_index(await _catalog("foods"))
+        # Na elkaar, niet tegelijk: een eenheid die de eerste regel aanmaakt, vindt de volgende regel in de index.
+        linked = [await _link_to_catalog(new, units, foods) if new is not old else old for new, old in zip(parsed_lines, lines)]
+        base, token = await _endpoint()
+        response = await _client().patch(
+            f"{base}/api/recipes/{slug}",
+            headers=_headers(token),
             json={"recipeIngredient": linked},
             timeout=60,
         )
-        if not response.ok:
+        if response.status_code >= 400:
             raise RuntimeError(f"Recept bijwerken mislukt ({response.status_code}): {response.text[:200]}")
     except Exception as exc:  # noqa: BLE001 - het recept is al geïmporteerd; analyseren is een extra
         log.warning("Ingrediënten van %s niet geanalyseerd: %s", slug, exc)
+        if catalog is not None:
+            catalog.reset()  # bijvoorbeeld een ingrediënt dat iemand anders net aanmaakte: het volgende recept haalt opnieuw op
     return slug
 
 
@@ -410,13 +684,13 @@ GROUP_SLUG_RETRY = 60  # na een mislukte poging proberen we het pas na zoveel se
 _group_slug_cache: dict[str, tuple[float, str | None]] = {}
 
 
-def group_slug() -> str | None:
+async def group_slug() -> str | None:
     """De groep (slug) van de gekoppelde gebruiker, zoals Mealie die in het adres van een recept zet (/g/<groep>/r/<recept>).
 
     Wordt een uur onthouden. Geeft None als Mealie het niet zegt (een oudere versie) of niet te bereiken is; dan gebruiken we het
     oude adres. Een mislukte poging blokkeert niets en wordt na een minuut opnieuw geprobeerd.
     """
-    base = mealie_url()
+    base, token = await _endpoint()
     if not base:
         return None
     now = time.time()
@@ -425,21 +699,85 @@ def group_slug() -> str | None:
         return cached[1]
     slug: str | None = None
     try:
-        response = requests.get(f"{base}/api/users/self", headers=auth_headers(), timeout=10)
-        if response.ok:
+        response = await _client().get(f"{base}/api/users/self", headers=_headers(token), timeout=10)
+        if response.status_code < 400:
             value = (response.json() or {}).get("groupSlug")
             slug = str(value).strip() or None if value else None
-    except (requests.RequestException, ValueError):
+    except (httpx.HTTPError, ValueError):
         slug = None
     _group_slug_cache[base] = (now + (GROUP_SLUG_TTL if slug else GROUP_SLUG_RETRY), slug)
     return slug
+
+
+# De eerste dag van de week. Zelfde nummering als Mealie en JavaScript (getDay): 0 = zondag, 1 = maandag ... 6 = zaterdag.
+SETTING_WEEK_START = "WEEK_START"  # "" = zoals in Mealie (standaard), "0".."6" = een vaste dag die de beheerder koos
+WEEK_START_DEFAULT = 1  # maandag: als Mealie niet gekoppeld is of het niet zegt
+WEEK_START_TTL = 600  # seconden dat we de keuze uit Mealie onthouden; Koppeling controleren vraagt het meteen opnieuw
+_week_start_cache: dict[str, tuple[float, int | None]] = {}
+
+
+def _weekday(value: Any) -> int | None:
+    """Een dag van 0 (zondag) tot 6 (zaterdag), of None. True/False tellen niet als getal."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 6:
+        return value
+    return None
+
+
+async def first_day_of_week() -> int | None:
+    """De eerste dag van de week zoals het huishouden in Mealie die heeft ingesteld (0 = zondag), tien minuten onthouden.
+
+    Mealie (v2 en later) geeft die in `GET /api/households/preferences` als `firstDayOfWeek`; elke gebruiker met een token mag dat
+    lezen. Geeft None als Mealie niet gekoppeld of niet te bereiken is, of geen geldige dag geeft; na een minuut proberen we het opnieuw.
+    """
+    base, token = await _endpoint()
+    if not base:
+        return None
+    now = time.time()
+    cached = _week_start_cache.get(base)
+    if cached and now < cached[0]:
+        return cached[1]
+    day: int | None = None
+    try:
+        response = await _client().get(f"{base}/api/households/preferences", headers=_headers(token), timeout=10)
+        if response.status_code < 400:
+            day = _weekday((response.json() or {}).get("firstDayOfWeek"))
+    except Exception:  # noqa: BLE001 - de eerste dag is een extra: een fout mag de status of het koppelen nooit breken
+        day = None
+    _week_start_cache[base] = (now + (WEEK_START_TTL if day is not None else GROUP_SLUG_RETRY), day)
+    return day
+
+
+async def week_start_setting() -> str:
+    """De keuze van de beheerder: "" (zoals in Mealie) of "0".."6". Een onleesbare of ongeldige waarde telt als "zoals in Mealie"."""
+    try:
+        value = (await auth.get_setting(SETTING_WEEK_START)).strip()
+    except (sqlite3.Error, OSError):
+        return ""
+    return value if value in {str(day) for day in range(7)} else ""
+
+
+async def week_start() -> dict[str, Any]:
+    """Op welke dag de week begint, voor het weekmenu en de MCP-tool.
+
+    Een vaste dag van de beheerder gaat voor (bron "setting", zonder Mealie te vragen); anders de dag uit Mealie (bron "mealie");
+    en zegt Mealie niets, dan maandag (bron "default"). `mealie` is wat Mealie zelf zegt (None als dat niet bekend is).
+    """
+    setting = await week_start_setting()
+    from_mealie = await first_day_of_week() if not setting else None
+    if setting:
+        day, source = int(setting), "setting"
+    elif from_mealie is not None:
+        day, source = from_mealie, "mealie"
+    else:
+        day, source = WEEK_START_DEFAULT, "default"
+    return {"day": day, "source": source, "setting": setting, "mealie": from_mealie}
 
 
 PUBLIC_URL_ENV = "MEALIE_PUBLIC_URL"
 _public_url_warned = False
 
 
-def public_url() -> str:
+async def public_url() -> str:
     """Het adres van Mealie voor links die de gebruiker in zijn browser opent.
 
     MealieShopper bereikt Mealie soms op een adres dat alleen de server kent, zoals http://mealie:9000 in Docker. Is
@@ -456,43 +794,49 @@ def public_url() -> str:
             if not _public_url_warned:
                 _public_url_warned = True
                 log.warning("%s wordt genegeerd (%s); links gebruiken het adres van de koppeling.", PUBLIC_URL_ENV, exc)
-    return mealie_url()
+    return await mealie_url()
 
 
-def recipe_page_url(slug: str) -> str:
+async def recipe_page_url(slug: str) -> str:
     """Het adres van een recept in Mealie: /g/<groep>/r/<recept>, of het oude /recipe/<recept> als de groep onbekend is."""
-    base = public_url()
-    group = group_slug()
+    base = await public_url()
+    group = await group_slug()
     return f"{base}/g/{group}/r/{slug}" if group else f"{base}/recipe/{slug}"
 
 
-def get_meal_plan(start_date: str, end_date: str) -> list[dict[str, Any]]:
-    ensure_configured()
-    response = requests.get(
-        f"{mealie_url()}/api/households/mealplans",
-        headers=auth_headers(),
+async def get_meal_plan(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    base, token = await _configured()
+    response = await _client().get(
+        f"{base}/api/households/mealplans",
+        headers=_headers(token),
         params={"start_date": start_date, "end_date": end_date, "perPage": "50"},
         timeout=30,
     )
-    if not response.ok:
+    if response.status_code >= 400:
         raise RuntimeError(f"Weekmenu ophalen mislukt ({response.status_code}): {response.text}")
     return response.json().get("items", [])
 
 
-def _fetch_recipe(slug: str) -> dict[str, Any]:
-    response = requests.get(
-        f"{mealie_url()}/api/recipes/{slug}",
-        headers=auth_headers(),
+async def _fetch_recipe(slug: str) -> dict[str, Any]:
+    base, token = await _endpoint()
+    response = await _client().get(
+        f"{base}/api/recipes/{slug}",
+        headers=_headers(token),
         timeout=30,
     )
-    if not response.ok:
+    if response.status_code >= 400:
         raise RuntimeError(f"Recept ophalen mislukt ({response.status_code})")
     return response.json()
 
 
-def get_recipe(slug: str) -> dict[str, Any]:
+async def get_recipe(slug: str) -> dict[str, Any]:
+    # Late import: recipe_nutrition gebruikt zelf dit module om recepten op te halen.
+    from . import recipe_nutrition
+
     # Regels die Mealie niet analyseerde ("1" + "200 ml melk") krijgen aantal, eenheid en ingrediënt.
-    return ingredients.normalize_recipe(_fetch_recipe(slug))
+    recipe = ingredients.normalize_recipe(await _fetch_recipe(slug))
+    await recipe_nutrition.remember(recipe)  # elk opgehaald recept houdt de calorieën bij, om op te kunnen zoeken
+    return recipe
 
 
 def _image_path(recipe: dict[str, Any] | None) -> str | None:
@@ -502,40 +846,52 @@ def _image_path(recipe: dict[str, Any] | None) -> str | None:
     return mealie_images.image_path(recipe)
 
 
-def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str, Any]]:
-    """Het weekmenu met per maaltijd het recept (`recipeDetail`, omgerekend), een afbeelding en de porties (`servings`).
+async def _recipes(slugs: list[str]) -> dict[str, dict[str, Any] | None]:
+    """De recepten bij `slugs`, hooguit `RECIPE_WORKERS` tegelijk (een semafoor per aanroep). Een recept dat niet lukt, is None."""
+    slots = asyncio.Semaphore(RECIPE_WORKERS)
 
-    De factor komt uit portions.effective: de schaal uit Mealie, of de standaard porties van het huishouden als niemand
-    de porties van die maaltijd instelde. De standaard geldt alleen hier; er gaat niets naar Mealie.
-    """
-    # Late import: portions gebruikt zelf dit module om porties naar Mealie te schrijven.
-    from . import portions
+    async def one(slug: str) -> dict[str, Any] | None:
+        async with slots:
+            try:
+                return await get_recipe(slug)
+            except Exception:  # noqa: BLE001 - de maaltijd staat er dan zonder details, zoals bij de threadpool
+                return None
 
-    entries = get_meal_plan(start_date, end_date)
+    found: list[dict[str, Any] | None] = await asyncio.gather(*(one(slug) for slug in slugs))
+    return dict(zip(slugs, found))
+
+
+async def get_meal_plan_with_recipes(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    entries = await get_meal_plan(start_date, end_date)
     # Een notitie zonder recept ("Uit eten") heeft "recipe": null, niet een ontbrekend veld.
     slugs = sorted({(entry.get("recipe") or {}).get("slug") for entry in entries if (entry.get("recipe") or {}).get("slug")})
-
-    recipe_map: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_map = {executor.submit(get_recipe, slug): slug for slug in slugs}
-        for future, slug in future_map.items():
-            try:
-                recipe_map[slug] = future.result()
-            except Exception:
-                recipe_map[slug] = None
+    recipe_map = await _recipes(slugs)
 
     result = []
     for entry in entries:
         recipe = entry.get("recipe") or {}
         enriched = dict(entry)
         detail = recipe_map.get(recipe.get("slug"))
-        # Zonder het hele recept (ophalen mislukt) geeft de samenvatting in de maaltijd de opbrengst.
-        effective = portions.effective(entry, detail or recipe) if recipe else None
-        scale = effective["scale"] if effective else 1.0
+        scale = recipe_scale(entry)
         # Een kopie per maaltijd: hetzelfde recept kan twee keer in de week staan, met een andere schaal.
         enriched["recipeDetail"] = ingredients.scale_recipe(detail, scale) if detail else detail
-        enriched["servings"] = _servings(detail or recipe, scale, effective) if recipe else None
+        enriched["servings"] = _servings(detail or recipe, scale) if recipe else None
+        # De calorieën per portie (issue #283) en voor de geplande porties samen; None als Mealie ze niet heeft.
+        per_serving = nutrition.kcal(detail.get("nutrition")) if detail else None
+        enriched["kcal"] = (
+            {"perServing": round(per_serving), "total": nutrition.total(per_serving, (enriched["servings"] or {}).get("planned"))}
+            if per_serving is not None
+            else None
+        )
+        found = nutrition.values(detail.get("nutrition")) if detail else {}
+        enriched["nutrition"] = nutrition.items(found)  # per portie, voor het venster
+        # En voor de geplande porties samen (de kolom Totaal in het venster); None zonder porties of voedingswaarden.
+        total = nutrition.scaled(found, (enriched["servings"] or {}).get("planned"))
+        enriched["nutritionTotal"] = nutrition.items(total) if total else None
         enriched["imageUrl"] = _image_path(detail) or _image_path(recipe)
+        # Voor het recept in een venster (een tik op de maaltijd): de bereidingstijd en de link naar het recept in Mealie.
+        enriched["recipeMinutes"] = _minutes(detail.get("totalTime")) if detail else None
+        enriched["recipeUrl"] = await recipe_page_url(recipe["slug"]) if recipe.get("slug") else None
         result.append(enriched)
     return result
 
@@ -552,33 +908,13 @@ def recipe_scale(entry: dict[str, Any]) -> float:
     return float(value)
 
 
-def planned_portions(base: float, scale: float) -> int | float:
-    """De geplande porties: opbrengst x schaal op één decimaal, een int als het een heel getal is (2,5 blijft 2,5).
-
-    De enige afronding van porties: het weekmenu (`servings.planned`), portions.effective en daarmee de kaart,
-    get_week_menu en set_meal_portions rekenen er allemaal mee.
-    """
-    planned = round(base * scale, 1)
-    return int(planned) if float(planned).is_integer() else planned
-
-
-def _servings(recipe: dict[str, Any], scale: float, effective: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Porties van een maaltijd: `base` uit het recept (None als Mealie het niet weet), `planned` = `base` x `scale`.
-
-    Met `effective` (portions.effective) ook `source`: set, default, recipe, unknown of unsupported, en dan is `planned`
-    precies de porties van `effective` (bij de standaard dus de standaard, zonder afrondingsfout). Bij "unknown" zijn
-    `base` en `planned` None: alleen `recipeServings` of `recipeYieldQuantity` telt als opbrengst, de vrije tekst
-    `recipeYield` ("4 personen") niet. `_portions` leest die tekst wel, voor de receptkaarten; die beschrijven het
-    recept, niet de geplande maaltijd.
-    """
-    base = None if effective and effective["source"] == "unknown" else _portions(recipe)
-    planned = planned_portions(base, scale) if base else None
-    servings: dict[str, Any] = {"scale": scale, "base": base, "planned": planned}
-    if effective:
-        servings["source"] = effective["source"]
-        if effective["portions"] is not None:
-            servings["planned"] = effective["portions"]
-    return servings
+def _servings(recipe: dict[str, Any], scale: float) -> dict[str, Any]:
+    """Porties van een maaltijd: `base` uit het recept (None als Mealie het niet weet), `planned` = `base` x `scale`."""
+    base = _portions(recipe)
+    planned = round(base * scale, 1) if base else None
+    if planned is not None and float(planned).is_integer():
+        planned = int(planned)
+    return {"scale": scale, "base": base, "planned": planned}
 
 
 # --- Het weekmenu plannen ------------------------------------------------------------------------
@@ -588,6 +924,8 @@ def _servings(recipe: dict[str, Any], scale: float, effective: dict[str, Any] | 
 ENTRY_TYPES = ("breakfast", "lunch", "dinner", "side")
 EXTRA_ENTRY_TYPES = ("snack", "drink", "dessert")  # Mealie kent deze pas vanaf v3.7.0; een ouder Mealie geeft 422
 EXTRA_ENTRY_TYPES_SINCE = (3, 7, 0)
+RECIPE_SCALE_SINCE = (3, 29, 0)  # sindsdien heeft een maaltijd porties (`recipeScale`, PR mealie-recipes/mealie#8701)
+MAX_RECIPE_SCALE = 20.0  # hoogstens twintig keer het recept (een recept voor 4 voor 80 personen)
 TITLE_MAX = 200
 TEXT_MAX = 1000
 SEARCH_PAGE = 24
@@ -598,9 +936,9 @@ _READ_ONLY_ENTRY_FIELDS = ("recipe", "householdId", "updatedAt", "createdAt", "u
 _version_cache: dict[str, tuple[float, str | None]] = {}
 
 
-def version() -> str | None:
+async def version() -> str | None:
     """De versie van de gekoppelde Mealie ("v3.7.0"), een uur onthouden zoals `group_slug`. None als Mealie het niet zegt."""
-    base = mealie_url()
+    base = await mealie_url()
     if not base:
         return None
     now = time.time()
@@ -609,10 +947,10 @@ def version() -> str | None:
         return cached[1]
     value: str | None = None
     try:
-        response = requests.get(f"{base}/api/app/about", timeout=10, allow_redirects=False)
-        if response.ok:
+        response = await _client().get(f"{base}/api/app/about", timeout=10, follow_redirects=False)
+        if response.status_code < 400:
             value = str((response.json() or {}).get("version") or "").strip() or None
-    except (requests.RequestException, ValueError, AttributeError):
+    except (httpx.HTTPError, ValueError, AttributeError):
         value = None
     _version_cache[base] = (now + (GROUP_SLUG_TTL if value else GROUP_SLUG_RETRY), value)
     return value
@@ -623,14 +961,38 @@ def _version_tuple(text: Any) -> tuple[int, ...] | None:
     return tuple(int(part or 0) for part in match.groups()) if match else None
 
 
-def entry_types() -> list[str]:
+async def entry_types() -> list[str]:
     """De maaltijden die de gekoppelde Mealie kent; bij een onbekende versie alleen de vier die elke versie kent."""
-    parsed = _version_tuple(version())
+    parsed = _version_tuple(await version())
     extra = parsed is not None and parsed >= EXTRA_ENTRY_TYPES_SINCE
     return list(ENTRY_TYPES + (EXTRA_ENTRY_TYPES if extra else ()))
 
 
-def _mealie_error(response: Any, nl: str, en: str) -> RuntimeError:
+async def supports_recipe_scale() -> bool:
+    """Of de gekoppelde Mealie porties per maaltijd kent (`recipeScale`, v3.29.0); bij een onbekende versie niet."""
+    parsed = _version_tuple(await version())
+    return parsed is not None and parsed >= RECIPE_SCALE_SINCE
+
+
+async def _recipe_scale(value: Any) -> float:
+    """De schaal van een maaltijd uit een verzoek (porties gedeeld door de porties van het recept), voor Mealie."""
+    try:
+        scale = float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        scale = math.nan
+    if isinstance(value, bool) or not math.isfinite(scale) or scale <= 0 or scale > MAX_RECIPE_SCALE:
+        raise ValueError(tr("Kies een geldig aantal porties.", "Choose a valid number of servings."))
+    if not await supports_recipe_scale():
+        raise ValueError(
+            tr(
+                "Porties instellen kan vanaf Mealie 3.29; werk Mealie bij of plan zonder porties.",
+                "Setting servings needs Mealie 3.29; update Mealie or plan without servings.",
+            )
+        )
+    return round(scale, 4)
+
+
+def _mealie_error(response: httpx.Response, nl: str, en: str) -> RuntimeError:
     """Een leesbare fout uit een weigering van Mealie; het volledige antwoord gaat alleen naar het logboek."""
     detail = ""
     try:
@@ -658,12 +1020,12 @@ def _plan_date(value: Any) -> str:
         raise ValueError(tr("Kies een geldige datum (JJJJ-MM-DD).", "Choose a valid date (YYYY-MM-DD).")) from None
 
 
-def _entry_type(value: Any) -> str:
+async def _entry_type(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in ENTRY_TYPES:
         return text
     if text in EXTRA_ENTRY_TYPES:
-        if text in entry_types():
+        if text in await entry_types():
             return text
         raise ValueError(
             tr(
@@ -698,11 +1060,12 @@ def _recipe_uuid(value: Any) -> str:
         raise ValueError(tr("Ongeldig recept.", "Invalid recipe.")) from None
 
 
-def _clean_entry(values: dict[str, Any], partial: bool = False) -> dict[str, Any]:
+async def _clean_entry(values: dict[str, Any], partial: bool = False) -> dict[str, Any]:
     """Controleer de velden van een maaltijd en geef ze zoals Mealie ze wil.
 
-    `values` kent `date`, `entryType`, `recipeId`, `recipeSlug` (wordt een `recipeId`), `title` en `text`. Bij `partial`
-    (wijzigen) alleen wat is meegegeven; een lege `recipeId` haalt het recept weg (de maaltijd wordt een notitie).
+    `values` kent `date`, `entryType`, `recipeId`, `recipeSlug` (wordt een `recipeId`), `title`, `text` en `recipeScale` (de
+    porties, als schaal van het recept; vanaf Mealie 3.29). Bij `partial` (wijzigen) alleen wat is meegegeven; een lege
+    `recipeId` haalt het recept weg (de maaltijd wordt een notitie).
     """
     if not isinstance(values, dict):
         raise ValueError(tr("Ongeldige invoer.", "Invalid input."))
@@ -710,7 +1073,7 @@ def _clean_entry(values: dict[str, Any], partial: bool = False) -> dict[str, Any
     if not partial or "date" in values:
         fields["date"] = _plan_date(values.get("date"))
     if not partial or "entryType" in values:
-        fields["entryType"] = _entry_type(values.get("entryType") or ("" if partial else "dinner"))
+        fields["entryType"] = await _entry_type(values.get("entryType") or ("" if partial else "dinner"))
     if not partial or "title" in values:
         fields["title"] = " ".join(str(values.get("title") or "").split())[:TITLE_MAX]
     if not partial or "text" in values:
@@ -718,9 +1081,11 @@ def _clean_entry(values: dict[str, Any], partial: bool = False) -> dict[str, Any
     if values.get("recipeId"):
         fields["recipeId"] = _recipe_uuid(values["recipeId"])
     elif values.get("recipeSlug"):
-        fields["recipeId"] = _recipe_uuid(_fetch_recipe(valid_slug(values["recipeSlug"])).get("id"))
+        fields["recipeId"] = _recipe_uuid((await _fetch_recipe(valid_slug(values["recipeSlug"]))).get("id"))
     elif "recipeId" in values or not partial:
         fields["recipeId"] = None
+    if values.get("recipeScale") not in (None, ""):
+        fields["recipeScale"] = await _recipe_scale(values["recipeScale"])
     return fields
 
 
@@ -729,24 +1094,23 @@ def _require_recipe_or_title(fields: dict[str, Any]) -> None:
         raise ValueError(tr("Kies een recept of schrijf een notitie.", "Choose a recipe or write a note."))
 
 
-def create_meal_plan_entry(values: dict[str, Any]) -> dict[str, Any]:
+async def create_meal_plan_entry(values: dict[str, Any]) -> dict[str, Any]:
     """Zet een recept of een notitie op een dag in het weekmenu van Mealie."""
-    ensure_configured()
-    fields = _clean_entry(values)
+    base, token = await _configured()
+    fields = await _clean_entry(values)
     _require_recipe_or_title(fields)
-    response = requests.post(
-        f"{mealie_url()}/api/households/mealplans", headers=auth_headers(), json=fields, timeout=30
-    )
-    if not response.ok:
+    if not fields.get("recipeId"):
+        fields.pop("recipeScale", None)  # een notitie heeft geen porties
+    response = await _client().post(f"{base}/api/households/mealplans", headers=_headers(token), json=fields, timeout=30)
+    if response.status_code >= 400:
         raise _mealie_error(response, "Mealie kon de maaltijd niet plannen", "Mealie could not plan the meal")
     return response.json()
 
 
-def _get_entry(entry_id: int) -> dict[str, Any]:
-    response = requests.get(
-        f"{mealie_url()}/api/households/mealplans/{entry_id}", headers=auth_headers(), timeout=30
-    )
-    if not response.ok:
+async def _get_entry(entry_id: int) -> dict[str, Any]:
+    base, token = await _endpoint()
+    response = await _client().get(f"{base}/api/households/mealplans/{entry_id}", headers=_headers(token), timeout=30)
+    if response.status_code >= 400:
         raise _mealie_error(response, "Maaltijd ophalen uit Mealie mislukt", "Could not fetch the meal from Mealie")
     data = response.json()
     if not isinstance(data, dict):
@@ -754,80 +1118,53 @@ def _get_entry(entry_id: int) -> dict[str, Any]:
     return data
 
 
-def set_meal_plan_scale(entry_id: Any, scale: Any) -> dict[str, Any]:
-    """Zet alleen de schaal (`recipeScale`) van één maaltijd, voor de porties (portions.py).
-
-    Net als update_meal_plan_entry: Mealie wil het hele item, dus eerst ophalen, de velden die Mealie alleen bij het lezen
-    geeft eruit, en terugsturen met de nieuwe schaal. Mealie onbereikbaar of een weigering wordt een RuntimeError, zodat de
-    aanroeper niets onthoudt van een wijziging die niet gelukt is.
-    """
-    ensure_configured()
-    number = _entry_id(entry_id)
-    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
-        raise ValueError(tr("Ongeldige porties.", "Invalid portions."))
-    try:
-        current = _get_entry(number)
-        body = {key: value for key, value in current.items() if key not in _READ_ONLY_ENTRY_FIELDS}
-        body["id"] = number
-        body["recipeScale"] = float(scale)
-        response = requests.put(
-            f"{mealie_url()}/api/households/mealplans/{number}", headers=auth_headers(), json=body, timeout=30
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(tr(
-            f"Mealie is niet bereikbaar ({exc.__class__.__name__})", f"Mealie is not reachable ({exc.__class__.__name__})"
-        )) from exc
-    if not response.ok:
-        raise _mealie_error(response, "Porties opslaan in Mealie mislukt", "Could not save the portions in Mealie")
-    return response.json()
-
-
 def _same_recipe(new: Any, old: Any) -> bool:
     return str(new or "").strip().lower() == str(old or "").strip().lower()
 
 
-def update_meal_plan_entry(entry_id: Any, values: dict[str, Any]) -> dict[str, Any]:
+async def update_meal_plan_entry(entry_id: Any, values: dict[str, Any]) -> dict[str, Any]:
     """Verplaats of wijzig een maaltijd. Mealie wil bij wijzigen het hele item, dus eerst ophalen en dan samenvoegen."""
-    ensure_configured()
+    base, token = await _configured()
     number = _entry_id(entry_id)
-    changes = _clean_entry(values, partial=True)
-    current = _get_entry(number)
+    changes = await _clean_entry(values, partial=True)
+    current = await _get_entry(number)
     # `recipeScale` (Mealie v3.29+) gaat zo mee terug; zonder dat veld zet Mealie de porties weer op 1.
     merged = {key: value for key, value in current.items() if key not in _READ_ONLY_ENTRY_FIELDS}
     merged.update(changes)
     merged["id"] = number
-    if "recipeScale" in current and "recipeId" in changes and not _same_recipe(changes["recipeId"], current.get("recipeId")):
+    if (
+        "recipeScale" in current
+        and "recipeScale" not in changes
+        and "recipeId" in changes
+        and not _same_recipe(changes["recipeId"], current.get("recipeId"))
+    ):
         merged["recipeScale"] = 1.0  # een ander recept (of een notitie): de porties van het oude gelden niet, net als in Mealie
+    if not merged.get("recipeId") and "recipeScale" in changes:
+        merged["recipeScale"] = 1.0  # een notitie heeft geen porties
     _require_recipe_or_title(merged)
-    response = requests.put(
-        f"{mealie_url()}/api/households/mealplans/{number}", headers=auth_headers(), json=merged, timeout=30
-    )
-    if not response.ok:
+    response = await _client().put(f"{base}/api/households/mealplans/{number}", headers=_headers(token), json=merged, timeout=30)
+    if response.status_code >= 400:
         raise _mealie_error(response, "Mealie kon de maaltijd niet wijzigen", "Mealie could not change the meal")
     return response.json()
 
 
-def delete_meal_plan_entry(entry_id: Any) -> dict[str, Any]:
+async def delete_meal_plan_entry(entry_id: Any) -> dict[str, Any]:
     """Haal een maaltijd uit het weekmenu. Het recept zelf blijft in Mealie staan."""
-    ensure_configured()
+    base, token = await _configured()
     number = _entry_id(entry_id)
-    response = requests.delete(
-        f"{mealie_url()}/api/households/mealplans/{number}", headers=auth_headers(), timeout=30
-    )
-    if not response.ok:
+    response = await _client().delete(f"{base}/api/households/mealplans/{number}", headers=_headers(token), timeout=30)
+    if response.status_code >= 400:
         raise _mealie_error(response, "Mealie kon de maaltijd niet verwijderen", "Mealie could not remove the meal")
     return {"id": number, "deleted": True}
 
 
-def random_meal_plan_entry(values: dict[str, Any]) -> dict[str, Any]:
+async def random_meal_plan_entry(values: dict[str, Any]) -> dict[str, Any]:
     """Laat Mealie een recept kiezen volgens de planregels van het huishouden en zet het meteen in het weekmenu."""
-    ensure_configured()
+    base, token = await _configured()
     if not isinstance(values, dict):
         raise ValueError(tr("Ongeldige invoer.", "Invalid input."))
-    payload = {"date": _plan_date(values.get("date")), "entryType": _entry_type(values.get("entryType") or "dinner")}
-    response = requests.post(
-        f"{mealie_url()}/api/households/mealplans/random", headers=auth_headers(), json=payload, timeout=30
-    )
+    payload = {"date": _plan_date(values.get("date")), "entryType": await _entry_type(values.get("entryType") or "dinner")}
+    response = await _client().post(f"{base}/api/households/mealplans/random", headers=_headers(token), json=payload, timeout=30)
     if response.status_code == 404:
         raise RuntimeError(
             tr(
@@ -835,7 +1172,7 @@ def random_meal_plan_entry(values: dict[str, Any]) -> dict[str, Any]:
                 "Mealie found no recipe that matches your meal plan rules. Choose a recipe yourself, or change the rules in Mealie.",
             )
         )
-    if not response.ok:
+    if response.status_code >= 400:
         raise _mealie_error(response, "Mealie kon geen recept kiezen", "Mealie could not pick a recipe")
     return response.json()
 
@@ -853,6 +1190,15 @@ def _minutes(value: Any) -> int | None:
     if hours or minutes:
         return int(hours.group(1) if hours else 0) * 60 + int(minutes.group(1) if minutes else 0) or None
     return (int(text) or None) if text.isdigit() else None
+
+
+def recipe_minutes(recipe: dict[str, Any]) -> int | None:
+    """De bereidingstijd in minuten: de totale tijd, of anders de voorbereiding plus de kook- of oventijd (issue #322)."""
+    total = _minutes(recipe.get("totalTime"))
+    if total:
+        return total
+    parts = [_minutes(recipe.get("prepTime")), _minutes(recipe.get("cookTime")) or _minutes(recipe.get("performTime"))]
+    return sum(part for part in parts if part) or None
 
 
 def _portions(recipe: dict[str, Any]) -> int | None:
@@ -875,16 +1221,16 @@ def recipe_card(recipe: dict[str, Any]) -> dict[str, Any]:
         "recipeId": recipe.get("id"),
         "name": str(recipe.get("name") or slug),
         "image": _image_path(recipe),
-        "minutes": _minutes(recipe.get("totalTime")),
+        "minutes": recipe_minutes(recipe),
         "portions": _portions(recipe),
         "rating": rating if isinstance(rating, (int, float)) and rating > 0 else None,
         "tags": tags[:3],
     }
 
 
-def search_recipes(query: Any, page: Any = 1, per_page: int = SEARCH_PAGE) -> dict[str, Any]:
+async def search_recipes(query: Any, page: Any = 1, per_page: int = SEARCH_PAGE) -> dict[str, Any]:
     """Zoek in de recepten van Mealie. Zonder zoekterm alle recepten op naam."""
-    ensure_configured()
+    base, token = await _configured()
     try:
         number = max(1, int(page or 1))
     except (TypeError, ValueError):
@@ -896,56 +1242,163 @@ def search_recipes(query: Any, page: Any = 1, per_page: int = SEARCH_PAGE) -> di
         params["search"] = text  # Mealie sorteert dan zelf op relevantie
     else:
         params.update({"orderBy": "name", "orderDirection": "asc"})
-    response = requests.get(f"{mealie_url()}/api/recipes", headers=auth_headers(), params=params, timeout=30)
-    if not response.ok:
+    response = await _client().get(f"{base}/api/recipes", headers=_headers(token), params=params, timeout=30)
+    if response.status_code >= 400:
         raise _mealie_error(response, "Zoeken in Mealie mislukt", "Searching Mealie failed")
     data = response.json()
     items = [item for item in (data.get("items") if isinstance(data, dict) else None) or [] if isinstance(item, dict) and item.get("slug")]
     total = data.get("total") if isinstance(data, dict) and isinstance(data.get("total"), int) else len(items)
     total_pages = data.get("total_pages") if isinstance(data, dict) else None
     more = number < total_pages if isinstance(total_pages, int) else len(items) >= size
-    return {"recipes": [recipe_card(item) for item in items], "total": total, "page": number, "more": bool(more)}
+    return {"recipes": await with_nutrition([recipe_card(item) for item in items]), "total": total, "page": number, "more": bool(more)}
 
 
-def recipe_detail(slug: Any) -> dict[str, Any]:
+async def with_nutrition(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Zet de bekende voedingswaarden per portie bij de kaarten: `kcal` (of None) en `nutrition` (items, zie nutrition.py).
+    De lijst van Mealie zelf heeft ze niet; ze komen uit de cache van recipe_nutrition.py."""
+    from . import recipe_nutrition  # late import, zie get_recipe
+
+    known = await recipe_nutrition.lookup([card["slug"] for card in cards])
+    return [recipe_nutrition.card_with(card, known.get(card["slug"]) or {}) for card in cards]
+
+
+async def recipe_detail(slug: Any) -> dict[str, Any]:
     """Een Mealie-recept met ingrediënten en bereiding, in de vorm van het detailscherm bij Recepten zoeken."""
-    ensure_configured()
+    await ensure_configured()
     clean = valid_slug(slug)
-    recipe = get_recipe(clean)
+    recipe = await get_recipe(clean)
+    # Een kopje in Mealie ("Voor de saus") is de `title` van het eerste ingrediënt eronder; staat het op een regel zonder
+    # tekst, dan schuift het door naar de volgende regel. De kookweergave (static/recipe_view.js) toont het als sectie.
+    # De koppelingen tussen stappen en ingrediënten (issue #309): elk ingrediënt heeft in Mealie een `referenceId`, en een stap
+    # noemt in `ingredientReferences` welke erbij horen. De kookmodus toont ze bij de stap en kan ze wijzigen (`stepIds`).
     ingredients = []
+    section = ""
     for item in recipe.get("recipeIngredient") or []:
-        if isinstance(item, dict):
-            line = " ".join(str(item.get("display") or item.get("note") or "").split())
-            if line:
-                ingredients.append({"line": line})
-    steps = [
-        str(step.get("text")).strip()
-        for step in recipe.get("recipeInstructions") or []
-        if isinstance(step, dict) and str(step.get("text") or "").strip()
-    ]
-    return {
+        if not isinstance(item, dict):
+            continue
+        section = " ".join(str(item.get("title") or "").split()) or section
+        line = " ".join(str(item.get("display") or item.get("note") or "").split())
+        if line:
+            ref = _reference(item.get("referenceId"))
+            ingredients.append({"line": line, **({"section": section} if section else {}), **({"ref": ref} if ref else {})})
+            section = ""
+    steps, titles, ids, refs = [], [], [], []
+    for step in recipe.get("recipeInstructions") or []:
+        if isinstance(step, dict) and str(step.get("text") or "").strip():
+            steps.append(str(step.get("text")).strip())
+            titles.append(" ".join(str(step.get("title") or "").split()))
+            ids.append(_reference(step.get("id")))
+            refs.append(step_references(step))
+    kcal = nutrition.kcal(recipe.get("nutrition"))
+    detail = {
         **recipe_card(recipe),
         "description": str(recipe.get("description") or "").strip(),
         "ingredients": ingredients,
         "steps": steps,
-        "url": recipe_page_url(clean),
+        "url": await recipe_page_url(clean),
+        "nutrition": nutrition.items(recipe.get("nutrition")),  # per portie, zoals bij de winkels
+        "kcal": round(kcal) if kcal is not None else None,
     }
+    if any(titles):
+        detail["stepTitles"] = titles  # even lang als steps; "" is een stap zonder titel
+    if any(ids):
+        detail["stepIds"] = ids  # even lang als steps; "" is een stap zonder id (die kan niet gekoppeld worden)
+        detail["stepRefs"] = refs  # per stap de referenceId's van de gekoppelde ingrediënten
+    return detail
 
 
-def list_recipes(limit: int = 500) -> list[dict[str, Any]]:
-    """Alle recepten in Mealie (naam, slug, afbeelding), voor het zoeken naar receptvoorstellen."""
-    ensure_configured()
+def _reference(value: Any) -> str:
+    """Een `referenceId` of `id` van Mealie als nette UUID-tekst; "" als het er geen is."""
+    try:
+        return str(uuid.UUID(str(value).strip())) if value else ""
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
+def step_references(step: Any) -> list[str]:
+    """De `referenceId`'s die een stap van Mealie in `ingredientReferences` noemt, zonder dubbele en zonder kapotte."""
+    found: list[str] = []
+    for item in (step.get("ingredientReferences") if isinstance(step, dict) else None) or []:
+        ref = _reference(item.get("referenceId")) if isinstance(item, dict) else ""
+        if ref and ref not in found:
+            found.append(ref)
+    return found
+
+
+MAX_STEP_REFERENCES = 200
+
+
+async def link_step_ingredients(slug: Any, step_id: Any, references: Any) -> dict[str, Any]:
+    """Koppel ingrediënten aan één stap van een recept in Mealie (issue #309): `ingredientReferences` van die stap wordt
+    `references` (referenceId's van ingrediënten uit hetzelfde recept; een lege lijst ontkoppelt alles).
+
+    Mealie vervangt bij een `PATCH` de hele lijst `recipeInstructions`, dus we halen het recept vers op en sturen alle stappen
+    terug, met alleen bij deze stap andere koppelingen. Een stap of ingrediënt dat er niet (meer) is, geeft een ValueError.
+    """
+    clean = valid_slug(slug)
+    step = _reference(step_id)
+    if not step:
+        raise ValueError(tr("Ongeldige stap.", "Invalid step."))
+    if not isinstance(references, list) or len(references) > MAX_STEP_REFERENCES:
+        raise ValueError(tr("Ongeldige ingrediënten.", "Invalid ingredients."))
+    wanted: list[str] = []
+    for value in references:
+        ref = _reference(value) if isinstance(value, str) else ""
+        if not ref:
+            raise ValueError(tr("Ongeldige ingrediënten.", "Invalid ingredients."))
+        if ref not in wanted:
+            wanted.append(ref)
+    base, token = await _configured()
+    recipe = await _fetch_recipe(clean)
+    known = {_reference(item.get("referenceId")) for item in recipe.get("recipeIngredient") or [] if isinstance(item, dict)}
+    if any(ref not in known for ref in wanted):
+        raise ValueError(
+            tr(
+                "Een ingrediënt staat niet (meer) in dit recept; open het recept opnieuw.",
+                "An ingredient is no longer in this recipe; open the recipe again.",
+            )
+        )
+    instructions = [item for item in recipe.get("recipeInstructions") or [] if isinstance(item, dict)]
+    if not any(_reference(item.get("id")) == step for item in instructions):
+        raise ValueError(
+            tr("Deze stap staat niet (meer) in het recept; open het recept opnieuw.", "This step is no longer in the recipe; open the recipe again.")
+        )
+    changed = [
+        {**item, "ingredientReferences": [{"referenceId": ref} for ref in wanted]} if _reference(item.get("id")) == step else item
+        for item in instructions
+    ]
+    response = await _client().patch(f"{base}/api/recipes/{clean}", headers=_headers(token), json={"recipeInstructions": changed}, timeout=30)
+    if response.status_code >= 400:
+        raise _mealie_error(response, "Ingrediënten koppelen in Mealie mislukt", "Linking the ingredients in Mealie failed")
+    return {"slug": clean, "stepId": step, "refs": wanted}
+
+
+async def update_recipe_nutrition(slug: str, fields: dict[str, str]) -> None:
+    """Zet de voedingswaarden van een recept in Mealie (`PATCH /api/recipes/{slug}`). Mealie vervangt het hele blok, dus
+    `fields` bevat ook wat er al stond; tekst zonder eenheid, zoals Mealie ze na een import zelf bewaart."""
+    base, token = await _configured()
+    response = await _client().patch(f"{base}/api/recipes/{valid_slug(slug)}", headers=_headers(token), json={"nutrition": fields}, timeout=30)
+    if response.status_code >= 400:
+        raise _mealie_error(response, "Voedingswaarden bijwerken in Mealie mislukt", "Updating the nutrition in Mealie failed")
+
+
+async def list_recipes(limit: int = 500, search: str = "") -> list[dict[str, Any]]:
+    """Alle recepten in Mealie (de samenvattingen: naam, slug, afbeelding, `updatedAt`, bron), voor het zoeken naar
+    receptvoorstellen en de calorieën (recipe_nutrition.py). Met `search` alleen de treffers, in de volgorde van Mealie."""
+    base, token = await _configured()
     items: list[dict[str, Any]] = []
     page = 1
     per_page = 100
+    text = " ".join(str(search or "").split())[:200]
+    order: dict[str, Any] = {"search": text} if text else {"orderBy": "name", "orderDirection": "asc"}
     while len(items) < limit:
-        response = requests.get(
-            f"{mealie_url()}/api/recipes",
-            headers=auth_headers(),
-            params={"page": page, "perPage": per_page, "orderBy": "name", "orderDirection": "asc"},
+        response = await _client().get(
+            f"{base}/api/recipes",
+            headers=_headers(token),
+            params={"page": page, "perPage": per_page, **order},
             timeout=30,
         )
-        if not response.ok:
+        if response.status_code >= 400:
             raise RuntimeError(f"Recepten ophalen mislukt ({response.status_code})")
         data = response.json()
         batch = data.get("items", []) if isinstance(data, dict) else []

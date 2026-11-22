@@ -25,20 +25,71 @@ def normalize_quantity(value: Any) -> int:
 
 _MASS_UNITS = {"g": 1, "gr": 1, "gram": 1, "kg": 1000, "kilo": 1000, "kilogram": 1000}
 _VOLUME_UNITS = {
-    "ml": 1, "milliliter": 1, "cl": 10, "centiliter": 10,
-    "dl": 100, "deciliter": 100, "l": 1000, "liter": 1000,
+    "ml": 1,
+    "milliliter": 1,
+    "cl": 10,
+    "centiliter": 10,
+    "dl": 100,
+    "deciliter": 100,
+    "l": 1000,
+    "liter": 1000,
 }
 _COUNT_UNITS = {"", "stuk", "stuks", "st"}
 # Eenheden die een verpakking zijn: "2 potten witte bonen" is twee keer een product, hoe groot een pot ook is.
 _CONTAINER_UNITS = {
-    "pot", "potje", "potjes", "potten", "blik", "blikje", "blikjes", "blikken",
-    "zak", "zakje", "zakjes", "zakken", "pak", "pakje", "pakjes", "pakken",
-    "fles", "flesje", "flesjes", "flessen", "bak", "bakje", "bakjes", "bakken",
-    "doos", "doosje", "doosjes", "dozen", "kuipje", "kuipjes", "beker", "bekers", "bekertje", "bekertjes",
-    "tube", "tubes",
+    "pot",
+    "potje",
+    "potjes",
+    "potten",
+    "blik",
+    "blikje",
+    "blikjes",
+    "blikken",
+    "zak",
+    "zakje",
+    "zakjes",
+    "zakken",
+    "pak",
+    "pakje",
+    "pakjes",
+    "pakken",
+    "fles",
+    "flesje",
+    "flesjes",
+    "flessen",
+    "bak",
+    "bakje",
+    "bakjes",
+    "bakken",
+    "doos",
+    "doosje",
+    "doosjes",
+    "dozen",
+    "kuipje",
+    "kuipjes",
+    "beker",
+    "bekers",
+    "bekertje",
+    "bekertjes",
+    "tube",
+    "tubes",
     # Engelse eenheden, zoals de recepten-parser ze ook kent
-    "can", "cans", "jar", "jars", "tin", "tins", "bottle", "bottles", "bag", "bags",
-    "pack", "packs", "package", "packages", "box", "boxes",
+    "can",
+    "cans",
+    "jar",
+    "jars",
+    "tin",
+    "tins",
+    "bottle",
+    "bottles",
+    "bag",
+    "bags",
+    "pack",
+    "packs",
+    "package",
+    "packages",
+    "box",
+    "boxes",
 }
 _PACK_SIZE_RE = re.compile(
     r"(?:(\d+)\s*[x\u00d7]\s*)?(\d+(?:[.,]\d+)?)\s*"
@@ -66,9 +117,13 @@ def parse_pack_size(unit_size: Any) -> tuple[float, str] | None:
         return None
     match = _PACK_SIZE_RE.search(text)
     if match:
-        multiplier = int(match.group(1) or 1)
-        amount = float(match.group(2).replace(",", ".")) * multiplier
-        return _measure(amount, match.group(3))
+        try:
+            multiplier: int = int(match.group(1) or 1)
+            amount: float = float(match.group(2).replace(",", ".")) * multiplier
+            measured: tuple[float, str] | None = _measure(amount, match.group(3))
+        except (ValueError, OverflowError):
+            return None
+        return measured if measured and math.isfinite(measured[0]) else None
     if re.search(r"\bper stuk\b|\bstuk\b", text):
         return 1.0, "count"
     return None

@@ -4,6 +4,7 @@
 const AI_REVIEW_PROVIDERS = ["anthropic", "openai"];
 const AI_REVIEW_ENV = { anthropic: "ANTHROPIC_API_KEY", openai: "OPENAI_API_KEY" };
 const AI_SEARCH_POLL_MS = 2000;
+const AI_SEARCH_POLL_MISSES = 10; // zoveel mislukte statusvragen op rij voordat de pagina de ronde als verloren meldt
 const aiReviewState = { status: null, running: false, timer: 0 };
 
 // Het tabblad Recepten bij Aanbiedingen is zichtbaar met een AI-sleutel (of de omgevingsvariabele); na het opslaan van een sleutel zonder herladen.
@@ -14,10 +15,21 @@ function setOffersRecipesTab(visible) {
   if (!visible && tab.classList.contains("is-active")) document.querySelector('.subtab[data-subtab="offers-items"]')?.click();
 }
 
-function aiReviewStatusText(info, provider) {
+function aiReviewKeyText(info, provider) {
   if (!info.configured) return t("aireview.status.none");
   if (info.source === "env") return t("aireview.status.env", { hint: info.hint, env: AI_REVIEW_ENV[provider] });
   return t("aireview.status.app", { hint: info.hint });
+}
+
+// Met ANTHROPIC_BASE_URL of OPENAI_BASE_URL gaan de aanvragen naar een ander adres (een proxy als LiteLLM); dat staat erbij.
+function aiReviewEndpointText(info) {
+  if (info.endpointError) return info.endpointError;
+  if (info.endpointSource === "env") return t("aireview.status.endpoint", { endpoint: info.endpoint, env: info.baseEnv });
+  return "";
+}
+
+function aiReviewStatusText(info, provider) {
+  return [aiReviewKeyText(info, provider), aiReviewEndpointText(info)].filter(Boolean).join(" ");
 }
 
 function applyAiReviewStatus(status) {
@@ -30,8 +42,9 @@ function applyAiReviewStatus(status) {
     $(`#ai-model-${provider}`).placeholder = info.defaultModel;
     $(`#ai-clear-${provider}`).hidden = info.source !== "app";
   }
+  $("#ai-loose-nightly").checked = Boolean(status.looseNightly);
   setOffersRecipesTab(status.recipesTab);
-  applyStoreFold("ai", AI_REVIEW_PROVIDERS.some((provider) => status.providers[provider].configured));
+  applyStoreFold("ai", true); // standaard dicht, ook zonder sleutel: het blok is optioneel en lang
 }
 
 async function loadAiReviewSettings() {
@@ -51,10 +64,12 @@ async function saveAiReview(extra = {}) {
     if (key) keys[provider] = key;
     models[provider] = $(`#ai-model-${provider}`).value.trim();
   }
+  // Het vinkje voor 's nachts gaat alleen mee als de stand al bekend is: anders zou een mislukte lading hem uitzetten.
+  const loose = aiReviewState.status ? { looseNightly: $("#ai-loose-nightly").checked } : {};
   const status = await jsonFetch("/api/offers/ai", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider: $("#ai-provider").value || "auto", models, keys, ...extra }),
+    body: JSON.stringify({ provider: $("#ai-provider").value || "auto", models, keys, ...loose, ...extra }),
   });
   for (const provider of AI_REVIEW_PROVIDERS) $(`#ai-key-${provider}`).value = "";
   applyAiReviewStatus(status);
@@ -154,11 +169,17 @@ function watchAiSearch(job) {
   aiReviewState.running = true;
   setAiSearchBusy(job);
   clearInterval(aiReviewState.timer);
+  let misses = 0;
   const tick = async () => {
     let current;
     try {
       current = await jsonFetch("/api/offers/ai/search/status");
+      misses = 0;
     } catch (error) {
+      // Een weggevallen verbinding stopt de ronde op de server niet (sinds 4.12.0): opnieuw vragen, zoals de back-up en de
+      // bulkimport doen. Pas na tien missers op rij (twintig seconden) geven we het op.
+      misses += 1;
+      if (misses < AI_SEARCH_POLL_MISSES) return;
       current = { state: "error", error: error.message };
     }
     if (current.state === "running") {
@@ -188,7 +209,7 @@ async function runAiSearch() {
       message("#offers-recipes-message", t("aisearch.nothing"), "success");
       return;
     }
-    if (!window.confirm(t("aisearch.confirm", { recipes: plan.chosen, name: info.name, tokens: I18N.formatNumber(plan.estimatedTokens) }))) return;
+    if (!(await confirmDialog(t("aisearch.confirm", { recipes: plan.chosen, name: info.name, tokens: I18N.formatNumber(plan.estimatedTokens) })))) return;
     const job = await jsonFetch("/api/offers/ai/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

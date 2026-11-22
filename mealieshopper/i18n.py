@@ -3,9 +3,10 @@
 De browser zet de gekozen taal (nl of en) in de cookie `ms_lang`. Zonder cookie, of met een
 andere waarde, blijft het Nederlands. Meldingen schrijf je als `tr("Nederlands", "English")`.
 """
+
 from __future__ import annotations
 
-from flask import has_request_context, request
+from quart import has_request_context, request
 
 LANGUAGES = ("nl", "en")
 COOKIE_NAME = "ms_lang"

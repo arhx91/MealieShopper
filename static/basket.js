@@ -1,12 +1,20 @@
-// Het tabblad Mandje: het echte winkelmandje van AH, Picnic of Jumbo, voor zover gekoppeld.
-// Laadt na picnic.js, jumbo.js en orders.js; elk van die scripts weet zelf hoe zijn mandje eruitziet
-// (showPicnicBasket, showJumboBasket, showAhBasket). Dit script kiest alleen de winkel.
+// Het tabblad Mandje: het echte winkelmandje van AH, Picnic, Jumbo of Crisp, voor zover gekoppeld.
+// Laadt na picnic.js, jumbo.js, crisp.js en orders.js; elk van die scripts weet zelf hoe zijn mandje eruitziet
+// (showPicnicBasket, showJumboBasket, showCrispBasket, showAhBasket). Dit script kiest alleen de winkel.
 
-const BASKET_STORES = ["ah", "picnic", "jumbo"];
+const BASKET_STORES = ["ah", "picnic", "jumbo", "crisp"];
 const basketState = { store: "ah" };
 
 function basketStores() {
   return BASKET_STORES.filter((key) => key === "ah" || state.linkedStores[key]);
+}
+
+// De kerncijfers bovenaan een mandje (sinds 4.8.0; daarvoor een regel tekst met het totaal ergens in het midden): een klein label
+// boven een vet, tabulair getal, naar .stats van App-Guidance. rows: [[label, waarde], ...]; een lege waarde valt weg.
+function basketStats(rows) {
+  const shown = rows.filter(([, value]) => value !== "" && value != null);
+  if (!shown.length) return "";
+  return `<dl class="stats">${shown.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>`;
 }
 
 function basketTabActive() {
@@ -49,11 +57,14 @@ async function showBasket() {
   renderBasketStoreChoice();
   message("#basket-message", "");
   const content = $("#basket-content");
-  content.innerHTML = `<p class="muted">${escapeHtml(t("basket.loading"))}</p>`;
-  const stores = { ah: showAhBasket, picnic: showPicnicBasket, jumbo: showJumboBasket };
+  content.innerHTML = loadingHtml(t("basket.loading"));
+  const stores = { ah: showAhBasket, picnic: showPicnicBasket, jumbo: showJumboBasket, crisp: showCrispBasket };
+  const store = basketState.store;
   try {
-    await stores[basketState.store]();
+    await stores[store]();
   } catch (error) {
+    // Intussen een andere winkel gekozen: die toont zijn eigen mandje, een fout van deze winkel hoort daar niet bij.
+    if (basketState.store !== store) return;
     content.innerHTML = "";
     message("#basket-message", error.message);
   }

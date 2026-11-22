@@ -4,9 +4,16 @@ import tempfile
 import unittest
 from unittest import mock
 
+import httpx
+
 os.environ.setdefault("MEALIESHOPPER_DATA_DIR", tempfile.mkdtemp())
 
-from mealieshopper import ah, mealie  # noqa: E402
+from helpers import routes, run, sent_json, served  # noqa: E402
+
+from mealieshopper import ah, mealie, picnic_recipes  # noqa: E402
+
+CREATE_HTML = "http://mealie/api/recipes/create/html-or-json"
+CREATE_URL = "http://mealie/api/recipes/create/url"
 
 RECIPE = {
     "id": 1234,
@@ -23,14 +30,12 @@ RECIPE = {
 
 
 def graphql_ok(recipe):
-    response = mock.Mock(ok=True)
-    response.json.return_value = {"data": {"recipe": recipe}}
+    response = httpx.Response(200, json={"data": {"recipe": recipe}})
     return response
 
 
 def graphql_error(message):
-    response = mock.Mock(ok=True)
-    response.json.return_value = {"errors": [{"message": message}]}
+    response = httpx.Response(200, json={"errors": [{"message": message}]})
     return response
 
 
@@ -50,9 +55,8 @@ class AllerhandeRecipeIdTest(unittest.TestCase):
 
 class RecipeJsonLdTest(unittest.TestCase):
     def build(self, responses):
-        with mock.patch.object(ah, "get_token", return_value="anon"), \
-                mock.patch.object(ah.requests, "post", side_effect=responses) as post:
-            return ah.get_recipe_jsonld(1234), post
+        with mock.patch.object(ah, "get_token", return_value="anon"), served(side_effect=responses) as post:
+            return run(ah.get_recipe_jsonld(1234)), post
 
     def test_schema_org_recipe(self):
         ld, post = self.build([graphql_ok(RECIPE)])
@@ -68,15 +72,102 @@ class RecipeJsonLdTest(unittest.TestCase):
         self.assertEqual(ld["recipeYield"], "4 personen")
         self.assertEqual(ld["cookTime"], "PT20M")
         self.assertEqual(ld["totalTime"], "PT25M")
-        self.assertEqual(post.call_args.kwargs["json"]["variables"], {"id": 1234})
+        self.assertEqual(sent_json(post.calls.last)["variables"], {"id": 1234})
         json.dumps(ld)  # serialiseerbaar voor Mealie
+
+    def test_nutrition_per_person_goes_along_as_schema_org(self):
+        n = lambda value, unit: {"value": value, "unit": unit}  # noqa: E731
+        recipe = dict(
+            RECIPE,
+            nutritions={
+                "energy": n(490, "kcal"),
+                "protein": n(27, "g"),
+                "fat": n(23, "g"),
+                "saturatedFat": n(8, "g"),
+                "carbohydrates": n(41, "g"),
+                "sugar": n(6, "g"),
+                "fibers": None,
+                "sodium": n(200, "mg"),
+            },
+        )
+        ld, post = self.build([graphql_ok(recipe)])
+        self.assertIn("nutritions {", sent_json(post.calls.last)["query"])
+        self.assertEqual(
+            ld["nutrition"],
+            {
+                "@type": "NutritionInformation",
+                "calories": "490 kcal",
+                "proteinContent": "27 g",
+                "fatContent": "23 g",
+                "saturatedFatContent": "8 g",
+                "carbohydrateContent": "41 g",
+                "sugarContent": "6 g",
+                "sodiumContent": "200 mg",
+            },
+        )
+
+    def test_against_the_shape_of_ah_the_first_question_brings_the_nutrition(self):
+        # Zo antwoordt AH (9 november 2026): `preparation.steps` is een lijst van teksten, dus `steps { text }` is een fout.
+        # In 4.4.0 stonden de voedingswaarden alleen in een variant met `{ text }` en kwamen ze nooit mee (#283).
+        n = lambda value, unit: {"value": value, "unit": unit}  # noqa: E731
+        recipe = dict(
+            RECIPE, preparation={"steps": ["Kook de aardappelen.", "Stamp alles."]}, nutritions={"energy": n(490, "kcal"), "sodium": n(200, "mg")}
+        )
+
+        def like_ah(request):
+            query = json.loads(request.content)["query"]
+            if "steps { text }" in query:
+                return graphql_error('Field "steps" must not have a selection since type "String" has no subfields.')
+            return graphql_ok(recipe)
+
+        ld, post = self.build(like_ah)
+        self.assertEqual(post.call_count, 1, "de eerste vraag heeft de vorm van AH")
+        query = sent_json(post.calls.last)["query"]
+        self.assertIn("nutritions {", query)
+        self.assertNotIn("steps { text }", query)
+        self.assertEqual(ld["nutrition"], {"@type": "NutritionInformation", "calories": "490 kcal", "sodiumContent": "200 mg"})
+        self.assertEqual([step["text"] for step in ld["recipeInstructions"]], ["Kook de aardappelen.", "Stamp alles."])
+
+    def test_the_nutrition_comes_along_if_ah_switches_back_to_steps_with_text(self):
+        n = lambda value, unit: {"value": value, "unit": unit}  # noqa: E731
+        recipe = dict(RECIPE, nutritions={"energy": n(490, "kcal")})
+
+        def old_shape(request):
+            query = json.loads(request.content)["query"]
+            return (
+                graphql_ok(recipe)
+                if "steps { text }" in query
+                else graphql_error('Field "steps" of type "[Step]" must have a selection of subfields.')
+            )
+
+        ld, post = self.build(old_shape)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(ld["nutrition"]["calories"], "490 kcal")
+
+    def test_nutrition_in_other_units_is_converted_and_an_empty_block_is_left_out(self):
+        self.assertEqual(
+            ah.recipe_nutrition({"energy": {"value": 2092, "unit": "kJ"}, "sodium": {"value": 0.2, "unit": "g"}}),
+            {"calories": 2092 / 4.184, "sodiumContent": 200.0},
+        )
+        self.assertEqual(ah.recipe_nutrition({"energy": {"value": 0, "unit": "kcal"}, "fat": {"value": None, "unit": "g"}}), {})
+        self.assertEqual(ah.recipe_nutrition(None), {})
+        ld, _ = self.build([graphql_ok(dict(RECIPE, nutritions=None))])
+        self.assertNotIn("nutrition", ld)
+
+    def test_without_the_nutrition_field_the_import_still_works(self):
+        missing = graphql_error('Cannot query field "nutritions" on type "Recipe".')
+        ld, post = self.build([missing, missing, graphql_ok(RECIPE)])
+        self.assertEqual(post.call_count, 3, "beide vormen van de stappen met voedingswaarden, dan zonder")
+        self.assertNotIn("nutritions", sent_json(post.calls.last)["query"])
+        self.assertNotIn("nutrition", ld)
+        self.assertEqual(ld["recipeYield"], "4 personen")
 
     def test_falls_back_to_simpler_query_and_string_steps(self):
         minimal = dict(RECIPE, preparation={"steps": ["Kook.", "Stamp."]})
         for key in ("servings", "images", "ovenTime", "waitTime"):
             minimal.pop(key)
-        ld, post = self.build([graphql_error("Unknown field"), graphql_error("Unknown field"), graphql_ok(minimal)])
-        self.assertEqual(post.call_count, 3)
+        ld, post = self.build([graphql_error("Unknown field")] * 4 + [graphql_ok(minimal)])
+        self.assertEqual(post.call_count, 5)
         self.assertEqual([step["text"] for step in ld["recipeInstructions"]], ["Kook.", "Stamp."])
         self.assertNotIn("image", ld)
         self.assertNotIn("recipeYield", ld)
@@ -107,51 +198,147 @@ class ImportFromUrlTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         # Het analyseren van de ingrediënten na de import heeft zijn eigen tests (test_ingredients).
-        parser = mock.patch.object(mealie, "parse_imported_ingredients", side_effect=lambda slug: slug)
+        parser = mock.patch.object(mealie, "parse_imported_ingredients", new_callable=mock.AsyncMock, side_effect=lambda slug: slug)
         parser.start()
         self.addCleanup(parser.stop)
 
-    def response(self, ok=True, status=200, body="slug"):
-        response = mock.Mock(ok=ok, status_code=status, text=str(body))
-        response.json.return_value = body
-        return response
+    def response(self, status=200, body="slug"):
+        return httpx.Response(status, json=body) if status < 400 else httpx.Response(status, text=str(body))
 
     def test_ah_recipe_goes_through_the_api_without_fetching_the_page(self):
         ld = {"@type": "Recipe", "name": "X"}
-        with mock.patch.object(ah, "get_recipe_jsonld", return_value=ld), \
-                mock.patch.object(mealie.requests, "post", return_value=self.response(body="stamppot")) as post, \
-                mock.patch.object(mealie.requests, "get") as get:
-            slug = mealie.import_from_url(self.URL)
+        with mock.patch.object(ah, "get_recipe_jsonld", return_value=ld), routes() as api:
+            post = api.post(CREATE_HTML).mock(return_value=self.response(body="stamppot"))
+            get = api.get()
+            slug = run(mealie.import_from_url(self.URL))
         self.assertEqual(slug, "stamppot")
-        get.assert_not_called()
-        self.assertEqual(post.call_args.args[0], "http://mealie/api/recipes/create/html-or-json")
-        sent = post.call_args.kwargs["json"]
+        self.assertFalse(get.called)
+        sent = sent_json(post.calls.last)
         self.assertEqual(json.loads(sent["data"]), ld)
         self.assertEqual(sent["url"], self.URL)
 
     def test_ah_api_failure_falls_back_to_mealie_url_import(self):
-        with mock.patch.object(ah, "get_recipe_jsonld", side_effect=RuntimeError("niet gevonden")), \
-                mock.patch.object(mealie.requests, "post", return_value=self.response(body="via-url")) as post:
-            self.assertEqual(mealie.import_from_url(self.URL), "via-url")
-        self.assertEqual(post.call_args.args[0], "http://mealie/api/recipes/create/url")
+        with mock.patch.object(ah, "get_recipe_jsonld", side_effect=RuntimeError("niet gevonden")), routes() as api:
+            post = api.post(CREATE_URL).mock(return_value=self.response(body="via-url"))
+            self.assertEqual(run(mealie.import_from_url(self.URL)), "via-url")
+        self.assertEqual(sent_json(post.calls.last), {"url": self.URL, "include_tags": True, "include_categories": True})
 
     def test_non_ah_url_skips_the_ah_api(self):
-        with mock.patch.object(ah, "get_recipe_jsonld", side_effect=AssertionError("niet aanroepen")), \
-                mock.patch.object(mealie.requests, "post", return_value=self.response(body="ok")):
-            self.assertEqual(mealie.import_from_url("https://example.com/r"), "ok")
+        with mock.patch.object(ah, "get_recipe_jsonld", side_effect=AssertionError("niet aanroepen")), routes() as api:
+            api.post(CREATE_URL).mock(return_value=self.response(body="ok"))
+            self.assertEqual(run(mealie.import_from_url("https://example.com/r")), "ok")
+
+    def test_the_html_of_a_page_keeps_its_address_for_the_scraper_of_that_site(self):
+        with routes() as api:
+            page = api.get("https://www.example.com/soep").mock(return_value=httpx.Response(200, text="<html>recept</html>"))
+            post = api.post(CREATE_HTML).mock(return_value=self.response(body="soep"))
+            self.assertEqual(run(mealie.import_via_html("https://www.example.com/soep")), "soep")
+        sent = sent_json(post.calls.last)
+        self.assertEqual((sent["data"], sent["url"]), ("<html>recept</html>", "https://www.example.com/soep"))
+        self.assertEqual(page.calls.last.request.headers["User-Agent"], mealie.BROWSER_HEADERS["User-Agent"], "de pagina krijgt een browser")
+        self.assertNotIn("Authorization", page.calls.last.request.headers, "het token gaat alleen naar Mealie")
+
+    def test_a_cookie_from_a_redirect_goes_along_to_the_page(self):
+        # Een cookiemuur: eerst een 302 met een cookie, en pas met die cookie komt de pagina zelf.
+        with routes() as api:
+            page = api.get("https://www.example.com/soep").mock(
+                side_effect=[
+                    httpx.Response(302, headers={"Location": "https://www.example.com/soep", "Set-Cookie": "consent=yes; Path=/"}),
+                    httpx.Response(200, text="<html>recept</html>"),
+                ]
+            )
+            post = api.post(CREATE_HTML).mock(return_value=self.response(body="soep"))
+            self.assertEqual(run(mealie.import_via_html("https://www.example.com/soep")), "soep")
+        self.assertNotIn("Cookie", page.calls[0].request.headers)
+        self.assertEqual(page.calls[1].request.headers["Cookie"], "consent=yes")
+        self.assertEqual(sent_json(post.calls.last)["data"], "<html>recept</html>")
+        self.assertNotIn("Cookie", post.calls.last.request.headers, "de cookie gaat niet mee naar Mealie")
+
+    def test_the_page_follows_a_redirect(self):
+        with routes() as api:
+            api.get("https://example.com/soep").mock(return_value=httpx.Response(301, headers={"Location": "https://www.example.com/soep"}))
+            api.get("https://www.example.com/soep").mock(return_value=httpx.Response(200, text="<html>recept</html>"))
+            post = api.post(CREATE_HTML).mock(return_value=self.response(body="soep"))
+            self.assertEqual(run(mealie.import_via_html("https://example.com/soep")), "soep")
+        self.assertEqual(sent_json(post.calls.last)["data"], "<html>recept</html>")
 
     def test_all_failures_are_reported_together(self):
-        mealie_error = self.response(ok=False, status=400, body="Recipe scrape failed")
-        page_error = self.response(ok=False, status=403, body="Access Denied")
-        with mock.patch.object(ah, "get_recipe_jsonld", side_effect=RuntimeError("niet gevonden")), \
-                mock.patch.object(mealie.requests, "post", return_value=mealie_error), \
-                mock.patch.object(mealie.requests, "get", return_value=page_error):
+        with mock.patch.object(ah, "get_recipe_jsonld", side_effect=RuntimeError("niet gevonden")), routes() as api:
+            api.post(CREATE_URL).mock(return_value=self.response(status=400, body="Recipe scrape failed"))
+            api.get(self.URL).mock(return_value=self.response(status=403, body="Access Denied"))
             with self.assertRaises(RuntimeError) as ctx:
-                mealie.import_from_url(self.URL)
+                run(mealie.import_from_url(self.URL))
         message = str(ctx.exception)
         self.assertIn("AH-API: niet gevonden", message)
         self.assertIn("Mealie: Mealie kon de pagina niet importeren (400): Recipe scrape failed", message)
         self.assertIn("pagina: Kon de pagina niet ophalen (403)", message)
+
+
+class JsonLdSourceTest(unittest.TestCase):
+    """#242: Mealie leest JSON-LD met recipe-scrapers, en dat kiest zijn scraper op de host van de link. Voor picnic.app heeft
+    het een eigen scraper die de JSON-LD negeert: in Mealie stonden dan alleen de titel en de foto. Zo'n recept gaat onder een
+    neutrale link naar Mealie, en daarna krijgt het zijn echte bron terug."""
+
+    LD = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        "name": "Pasta pesto",
+        "recipeIngredient": ["200 g pasta"],
+        "recipeInstructions": [{"@type": "HowToStep", "text": "Kook de pasta."}],
+    }
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"MEALIE_URL": "http://mealie", "MEALIE_API_TOKEN": "t"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        parser = mock.patch.object(mealie, "parse_imported_ingredients", new_callable=mock.AsyncMock, side_effect=lambda slug, *args: slug)
+        self.parser = parser.start()
+        self.addCleanup(parser.stop)
+
+    def response(self, status=200, body="pasta-pesto"):
+        return httpx.Response(status, json=body) if status < 400 else httpx.Response(status, text=str(body))
+
+    def test_a_picnic_recipe_is_read_under_a_neutral_link_and_keeps_its_source(self):
+        source = picnic_recipes.source_url("r1")
+        with routes() as api:
+            post = api.post(CREATE_HTML).mock(return_value=self.response())
+            patch = api.patch("http://mealie/api/recipes/pasta-pesto").mock(return_value=self.response(body={}))
+            self.assertEqual(run(mealie.import_via_jsonld(source, self.LD)), "pasta-pesto")
+        sent = sent_json(post.calls.last)
+        self.assertEqual(sent["url"], mealie.NEUTRAL_SOURCE)
+        self.assertEqual(json.loads(sent["data"]), self.LD, "de JSON-LD zelf verandert niet")
+        self.assertEqual(sent_json(patch.calls.last), {"orgURL": source}, "de bron blijft de link naar Picnic")
+        self.parser.assert_awaited_once_with("pasta-pesto")
+
+    def test_every_picnic_link_counts_and_other_stores_keep_their_own_link(self):
+        for url in ("https://picnic.app/#recipe-r1", "https://www.picnic.app/nl/recepten/x", "https://PICNIC.app/r"):
+            self.assertEqual(mealie._scrape_url(url), mealie.NEUTRAL_SOURCE, url)
+        for url in (
+            "https://www.ah.nl/allerhande/recept/R-R1234/stamppot",  # recipe-scrapers leest daar de JSON-LD wel
+            "https://www.jumbo.com/recepten/romige-pasta-123",
+            "https://crisp.nl/#recipe-123",
+            "https://www.hellofresh.nl/recipes/pasta-abc",
+            "https://notpicnic.app/r",
+        ):
+            self.assertEqual(mealie._scrape_url(url), url, url)
+
+    def test_another_source_is_sent_as_is_and_not_patched(self):
+        url = "https://www.jumbo.com/recepten/romige-pasta-123"
+        with routes() as api:
+            post = api.post(CREATE_HTML).mock(return_value=self.response())
+            patch = api.patch()
+            self.assertEqual(run(mealie.import_via_jsonld(url, self.LD)), "pasta-pesto")
+        self.assertEqual(sent_json(post.calls.last)["url"], url)
+        self.assertFalse(patch.called)
+
+    def test_a_failed_source_update_keeps_the_imported_recipe(self):
+        for failure in ({"return_value": self.response(status=403, body="Forbidden")}, {"side_effect": httpx.ConnectError("weg")}):
+            with self.subTest(failure=failure), routes() as api, self.assertLogs(mealie.log, "WARNING") as logs:
+                api.post(CREATE_HTML).mock(return_value=self.response())
+                api.patch("http://mealie/api/recipes/pasta-pesto").mock(**failure)
+                self.assertEqual(run(mealie.import_via_jsonld(picnic_recipes.source_url("r1"), self.LD)), "pasta-pesto")
+            self.assertNotIn("Forbidden", " ".join(logs.output))
+            self.assertNotIn("weg", " ".join(logs.output))
 
 
 if __name__ == "__main__":

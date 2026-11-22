@@ -3,7 +3,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+import httpx
+
 os.environ.setdefault("MEALIESHOPPER_DATA_DIR", tempfile.mkdtemp())
+
+from helpers import run, sent_json, served  # noqa: E402
 
 from mealieshopper import ah  # noqa: E402
 
@@ -13,61 +17,71 @@ BROWSER_RESULT = {"recipes": [{"id": "2", "title": "Stamppot", "image": "", "url
 
 class SavedRecipesEntryPointTest(unittest.TestCase):
     def test_not_linked(self):
-        with mock.patch.object(ah, "configured_refresh_token", return_value=""), \
-                mock.patch.object(ah, "_get_saved_recipes_api", side_effect=AssertionError("niet aanroepen")):
+        with (
+            mock.patch.object(ah, "configured_refresh_token", return_value=""),
+            mock.patch.object(ah, "_get_saved_recipes_api", side_effect=AssertionError("niet aanroepen")),
+        ):
             with self.assertRaises(RuntimeError) as ctx:
-                ah.get_saved_recipes()
+                run(ah.get_saved_recipes())
         self.assertIn("Instellingen > Koppelen > Albert Heijn", str(ctx.exception))
 
     def test_linked_uses_the_api_and_passes_paging(self):
-        with mock.patch.object(ah, "configured_refresh_token", return_value="tok"), \
-                mock.patch.object(ah, "_get_saved_recipes_api", return_value=API_RESULT) as api:
-            self.assertEqual(ah.get_saved_recipes(page=2, size=10), API_RESULT)
+        with (
+            mock.patch.object(ah, "configured_refresh_token", return_value="tok"),
+            mock.patch.object(ah, "_get_saved_recipes_api", return_value=API_RESULT) as api,
+        ):
+            self.assertEqual(run(ah.get_saved_recipes(page=2, size=10)), API_RESULT)
         api.assert_called_once_with(2, 10)
 
     def test_api_error_is_not_swallowed(self):
-        with mock.patch.object(ah, "configured_refresh_token", return_value="tok"), \
-                mock.patch.object(ah, "_get_saved_recipes_api", side_effect=RuntimeError("collectie: 404")):
+        with (
+            mock.patch.object(ah, "configured_refresh_token", return_value="tok"),
+            mock.patch.object(ah, "_get_saved_recipes_api", side_effect=RuntimeError("collectie: 404")),
+        ):
             with self.assertRaises(RuntimeError) as ctx:
-                ah.get_saved_recipes()
+                run(ah.get_saved_recipes())
         self.assertIn("collectie: 404", str(ctx.exception))
 
 
 def graphql_ok(data):
-    response = mock.Mock(ok=True)
-    response.json.return_value = {"data": data}
+    response = httpx.Response(200, json={"data": data})
     return response
 
 
 def graphql_error(message):
-    response = mock.Mock(ok=True)
-    response.json.return_value = {"errors": [{"message": message}]}
+    response = httpx.Response(200, json={"errors": [{"message": message}]})
     return response
 
 
 class SavedRecipesCollectionsTest(unittest.TestCase):
     def run_collections(self, responses, page=0, size=50):
-        with mock.patch.object(ah, "get_user_token", return_value="tok"), \
-                mock.patch.object(ah.requests, "post", side_effect=responses) as post:
-            return ah._get_saved_recipes_collections(page, size), post
+        with mock.patch.object(ah, "get_user_token", return_value="tok"), served(side_effect=responses) as post:
+            return run(ah._get_saved_recipes_collections(page, size)), post
 
     def test_ids_are_deduplicated_and_hydrated(self):
-        collections = graphql_ok({"recipeCollectionCategories": [
-            {"id": 1, "name": "Alles", "isDefault": True, "recipes": [{"id": 11}, {"id": 12}]},
-            {"id": 2, "name": "Taarten", "isDefault": False, "recipes": [{"id": 12}, {"id": 13}]},
-        ]})
-        summaries = graphql_ok({"recipeSummaries": [
-            {"id": 11, "title": "Soep", "slug": "soep", "images": [{"url": "https://img/11.jpg"}]},
-            {"id": 12, "title": "Stamppot", "slug": "", "images": []},
-            {"id": 13, "title": "Taart", "slug": "taart"},
-        ]})
+        collections = graphql_ok(
+            {
+                "recipeCollectionCategories": [
+                    {"id": 1, "name": "Alles", "isDefault": True, "recipes": [{"id": 11}, {"id": 12}]},
+                    {"id": 2, "name": "Taarten", "isDefault": False, "recipes": [{"id": 12}, {"id": 13}]},
+                ]
+            }
+        )
+        summaries = graphql_ok(
+            {
+                "recipeSummaries": [
+                    {"id": 11, "title": "Soep", "slug": "soep", "images": [{"url": "https://img/11.jpg"}]},
+                    {"id": 12, "title": "Stamppot", "slug": "", "images": []},
+                    {"id": 13, "title": "Taart", "slug": "taart"},
+                ]
+            }
+        )
         result, post = self.run_collections([collections, summaries])
         self.assertEqual(result["total"], 3)
-        self.assertEqual(post.call_args_list[1].kwargs["json"]["variables"], {"ids": [11, 12, 13]})
+        self.assertEqual(sent_json(post.calls[1])["variables"], {"ids": [11, 12, 13]})
         self.assertEqual(
             result["recipes"][0],
-            {"id": "11", "title": "Soep", "image": "https://img/11.jpg",
-             "url": "https://www.ah.nl/allerhande/recept/R-R11/soep"},
+            {"id": "11", "title": "Soep", "image": "https://img/11.jpg", "url": "https://www.ah.nl/allerhande/recept/R-R11/soep"},
         )
         self.assertEqual(result["recipes"][1]["url"], "https://www.ah.nl/allerhande/recept/R-R12")
         self.assertEqual(result["recipes"][2]["image"], "")
@@ -86,17 +100,14 @@ class SavedRecipesCollectionsTest(unittest.TestCase):
         result, _ = self.run_collections([collections, broken, broken])
         self.assertEqual(
             result["recipes"],
-            [{"id": "7", "title": "Recept 7", "image": "",
-              "url": "https://www.ah.nl/allerhande/recept/R-R7"}],
+            [{"id": "7", "title": "Recept 7", "image": "", "url": "https://www.ah.nl/allerhande/recept/R-R7"}],
         )
 
     def test_paging_hydrates_only_the_requested_page(self):
-        collections = graphql_ok({"recipeCollectionCategories": [
-            {"id": 1, "recipes": [{"id": n} for n in (1, 2, 3)]}
-        ]})
+        collections = graphql_ok({"recipeCollectionCategories": [{"id": 1, "recipes": [{"id": n} for n in (1, 2, 3)]}]})
         summaries = graphql_ok({"recipeSummaries": [{"id": 3, "title": "Drie", "slug": "drie"}]})
         result, post = self.run_collections([collections, summaries], page=1, size=2)
-        self.assertEqual(post.call_args_list[1].kwargs["json"]["variables"], {"ids": [3]})
+        self.assertEqual(sent_json(post.calls[1])["variables"], {"ids": [3]})
         self.assertEqual((result["total"], [r["id"] for r in result["recipes"]]), (3, ["3"]))
 
     def test_no_collections_is_empty(self):
@@ -106,12 +117,60 @@ class SavedRecipesCollectionsTest(unittest.TestCase):
 
     def test_validation_error_names_every_variant(self):
         errors = [graphql_error("Unknown argument 'x'"), graphql_error("Cannot query field recipes")]
-        with mock.patch.object(ah, "get_user_token", return_value="tok"), \
-                mock.patch.object(ah.requests, "post", side_effect=errors):
+        with mock.patch.object(ah, "get_user_token", return_value="tok"), served(side_effect=errors):
             with self.assertRaises(RuntimeError) as ctx:
-                ah._get_saved_recipes_collections(0, 50)
+                run(ah._get_saved_recipes_collections(0, 50))
         self.assertIn("Unknown argument 'x'", str(ctx.exception))
         self.assertIn("Cannot query field recipes", str(ctx.exception))
+
+
+class SavedRecipeGroupsTest(unittest.TestCase):
+    def run_groups(self, responses):
+        with (
+            mock.patch.object(ah, "configured_refresh_token", return_value="tok"),
+            mock.patch.object(ah, "get_user_token", return_value="tok"),
+            served(side_effect=responses) as post,
+        ):
+            return run(ah.get_saved_recipe_groups()), post
+
+    def test_every_group_keeps_its_name_and_own_recipes(self):
+        collections = graphql_ok(
+            {
+                "recipeCollectionCategories": [
+                    {"id": 1, "name": "Alles", "isDefault": True, "recipes": [{"id": 11}, {"id": 12}, {"id": 11}]},
+                    {"id": 2, "name": " Taarten  en  cake ", "isDefault": False, "recipes": [{"id": 13}, {"id": 12}, {"id": "x"}]},
+                    {"id": 3, "name": None, "recipes": None},
+                    {"name": "Zonder id", "recipes": [{"id": 14}]},
+                    {"id": 2, "name": "Dubbel", "recipes": [{"id": 15}]},
+                ]
+            }
+        )
+        groups, post = self.run_groups([collections])
+        self.assertEqual(post.call_count, 1, "geen receptdetails nodig voor de groepen")
+        self.assertEqual(
+            groups,
+            [
+                {"id": "1", "name": "Alles", "isDefault": True, "recipeIds": [11, 12]},
+                {"id": "2", "name": "Taarten en cake", "isDefault": False, "recipeIds": [13, 12]},
+                {"id": "3", "name": "Groep 3", "isDefault": False, "recipeIds": []},
+            ],
+        )
+
+    def test_scalar_recipe_ids_after_selection_error(self):
+        rejected = graphql_error('Field "recipes" must not have a selection since type "[Int!]" has no subfields')
+        scalar = graphql_ok({"recipeCollectionCategories": [{"id": 9, "name": "Soepen", "isDefault": False, "recipes": [5, 6, 5]}]})
+        groups, post = self.run_groups([rejected, scalar])
+        self.assertEqual(groups, [{"id": "9", "name": "Soepen", "isDefault": False, "recipeIds": [5, 6]}])
+        self.assertEqual(post.call_count, 2)
+
+    def test_not_linked(self):
+        with (
+            mock.patch.object(ah, "configured_refresh_token", return_value=""),
+            mock.patch.object(ah, "_collection_categories", side_effect=AssertionError("niet aanroepen")),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                run(ah.get_saved_recipe_groups())
+        self.assertIn("Instellingen > Koppelen > Albert Heijn", str(ctx.exception))
 
 
 class SavedRecipesCookbookTest(unittest.TestCase):
@@ -121,10 +180,9 @@ class SavedRecipesCookbookTest(unittest.TestCase):
             "page": {"total": 3, "hasNextPage": False},
         }
         response = graphql_ok({"cookBookRecipesCollectedMember": collected})
-        with mock.patch.object(ah, "get_user_token", return_value="tok"), \
-                mock.patch.object(ah.requests, "post", return_value=response):
-            first = ah._get_saved_recipes_cookbook(page=0, size=2)
-            second = ah._get_saved_recipes_cookbook(page=1, size=2)
+        with mock.patch.object(ah, "get_user_token", return_value="tok"), served(return_value=response):
+            first = run(ah._get_saved_recipes_cookbook(page=0, size=2))
+            second = run(ah._get_saved_recipes_cookbook(page=1, size=2))
         self.assertEqual(first["total"], 3)
         self.assertEqual(
             first["recipes"][0],
@@ -135,9 +193,8 @@ class SavedRecipesCookbookTest(unittest.TestCase):
 
     def test_empty_result(self):
         response = graphql_ok({"cookBookRecipesCollectedMember": None})
-        with mock.patch.object(ah, "get_user_token", return_value="tok"), \
-                mock.patch.object(ah.requests, "post", return_value=response):
-            self.assertEqual(ah._get_saved_recipes_cookbook(0, 50), {"recipes": [], "total": 0})
+        with mock.patch.object(ah, "get_user_token", return_value="tok"), served(return_value=response):
+            self.assertEqual(run(ah._get_saved_recipes_cookbook(0, 50)), {"recipes": [], "total": 0})
 
 
 class SavedRecipesApiChainTest(unittest.TestCase):
@@ -149,6 +206,7 @@ class SavedRecipesApiChainTest(unittest.TestCase):
                 if isinstance(value, Exception):
                     raise value
                 return value
+
             return call
 
         return (
@@ -161,7 +219,7 @@ class SavedRecipesApiChainTest(unittest.TestCase):
         for patch in patches:
             patch.start()
         try:
-            return ah._get_saved_recipes_api(0, 50)
+            return run(ah._get_saved_recipes_api(0, 50))
         finally:
             mock.patch.stopall()
 

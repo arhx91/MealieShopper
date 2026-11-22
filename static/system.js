@@ -3,6 +3,28 @@
 // Laadt na app.js en gebruikt daar de hulpfuncties van ($, message, jsonFetch, t, base64urlToBuffer, ...).
 
 const factoryResetState = { info: null, busy: false };
+
+// De regel onder Opschonen: hoeveel winkelfoto's de afbeeldingencache op schijf heeft (image_cache.py), en per winkel die nu in pauze
+// staat tot wanneer er geen nieuwe foto's komen. Mislukt het, dan blijven de regels leeg: het is informatie, geen functie.
+async function loadImageCacheStatus() {
+  const line = $("#system-images");
+  const paused = $("#system-images-paused");
+  if (!line) return;
+  try {
+    const stats = await jsonFetch("/api/system/images");
+    line.textContent = t("system.images_line", { count: stats.count, size: (stats.bytes / (1024 * 1024)).toFixed(1) });
+    if (paused) {
+      const lines = (stats.paused || []).map((pause) =>
+        t("system.images_paused", { store: (STORES[pause.store] || OFFER_ONLY_STORES[pause.store])?.name || pause.host, until: formatSyncTime(pause.until) || pause.until }),
+      );
+      paused.textContent = lines.join(" ");
+      paused.hidden = !lines.length;
+    }
+  } catch {
+    line.textContent = "";
+    if (paused) paused.hidden = true;
+  }
+}
 const FACTORY_RESET_POLL_MS = 2000;
 const FACTORY_RESET_GIVE_UP_MS = 90000;
 
@@ -102,7 +124,7 @@ async function submitFactoryReset(event) {
       return;
     }
   }
-  if (!window.confirm(t("system.reset_confirm"))) return;
+  if (!(await confirmDialog(t("system.reset_confirm"), { danger: true }))) return;
 
   factoryResetState.busy = true;
   $("#reset-submit").disabled = true;
@@ -130,67 +152,3 @@ async function submitFactoryReset(event) {
 $("#reset-open").addEventListener("click", openFactoryReset);
 $("#reset-cancel").addEventListener("click", closeFactoryReset);
 $("#reset-form").addEventListener("submit", submitFactoryReset);
-
-// Standaard porties (Instellingen > Systeem): voor hoeveel personen een maaltijd telt als niemand haar porties
-// instelde. De waarde in de app gaat voor op MEALIESHOPPER_DEFAULT_PORTIONS; een leeg veld zet de app-waarde uit.
-const defaultPortionsState = { settings: null };
-
-function renderDefaultPortions() {
-  const settings = defaultPortionsState.settings;
-  if (!settings) return;
-  const input = $("#default-portions");
-  const fromApp = settings.defaultPortionsSource === "setting";
-  if (document.activeElement !== input) input.value = fromApp ? String(settings.defaultPortions) : "";
-  input.placeholder = settings.defaultPortionsSource === "env" ? String(settings.defaultPortions) : "";
-  const note = {
-    setting: "system.portions_note_setting",
-    env: "system.portions_note_env",
-    off: "system.portions_note_off",
-  }[settings.defaultPortionsSource];
-  $("#default-portions-note").textContent = note ? t(note, { count: settings.defaultPortions }) : "";
-}
-
-async function loadDefaultPortions() {
-  try {
-    defaultPortionsState.settings = await jsonFetch("/api/server-settings");
-    renderDefaultPortions();
-  } catch (error) {
-    message("#default-portions-message", error.message);
-  }
-}
-
-async function saveDefaultPortions(event) {
-  const button = event.currentTarget;
-  const input = $("#default-portions");
-  message("#default-portions-message", "");
-  // Tekst in een getalveld geeft value "" (badInput): niet als leeg opslaan, want dat zet de standaard stil uit.
-  if (input.validity.badInput) {
-    message("#default-portions-message", t("system.portions_invalid"));
-    return;
-  }
-  const raw = input.value.trim();
-  const value = raw === "" ? null : Number(raw);
-  if (value !== null && !(Number.isInteger(value) && value >= 1 && value <= 12)) {
-    message("#default-portions-message", t("system.portions_invalid"));
-    return;
-  }
-  button.disabled = true;
-  try {
-    defaultPortionsState.settings = await jsonFetch("/api/server-settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ defaultPortions: value }),
-    });
-    // Bewaarde weken rekenden met de oude standaard: haal ze opnieuw op zodra het weekmenu weer open gaat.
-    if (typeof mealPlanCache !== "undefined") mealPlanCache.clear();
-    renderDefaultPortions();
-    message("#default-portions-message", t("system.portions_saved"), "success");
-  } catch (error) {
-    message("#default-portions-message", error.message);
-  } finally {
-    button.disabled = false;
-  }
-}
-
-$("#default-portions-save").addEventListener("click", saveDefaultPortions);
-window.addEventListener("ms:languagechange", renderDefaultPortions);

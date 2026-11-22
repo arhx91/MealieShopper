@@ -26,12 +26,12 @@ If nothing applies, write exactly: "No changes to Compose or .env files in this 
 
 <!--
 NL: Verplicht als deze pull request een grens voor grootte, aantal of tijd verandert (bijvoorbeeld de 200 MB van een
-back-upbestand of de 120 seconden van Gunicorn). Noem de nieuwe waarde als getal waar een beheerder iets mee kan
+back-upbestand of de 120 seconden voor het lichaam van een aanvraag). Noem de nieuwe waarde als getal waar een beheerder iets mee kan
 ("de grootste aanvraag is nu 60 MB; wat ervoor staat moet minstens dat doorlaten"), niet als instelling van één
 proxy. Anders: "Geen wijzigingen in grenzen in deze pull request."
 
 EN: Required when this pull request raises or lowers a size, rate or timeout limit (for example the 200 MB of a
-backup file or the 120 seconds of Gunicorn). State the new value as a number an operator can act on ("the largest
+backup file or the 120 seconds for a request body). State the new value as a number an operator can act on ("the largest
 request is now 60 MB; whatever runs in front must allow at least that"), never as one proxy's setting. Otherwise
 write "No limit changes in this pull request."
 -->
@@ -52,8 +52,8 @@ Only documentation or tests, with no effect on the app? Write: "No new version n
 ## Checklist
 
 - [ ] De pull request richt zich op `beta`. / The pull request targets `beta`.
-- [ ] `python -m unittest discover -s tests` slaagt. / `python -m unittest discover -s tests` passes.
-- [ ] Nederlands en Engels zijn gelijk: de interface (`static/i18n/`), `README.md` en `README.en.md`, en de voorbeeld-`.env`-bestanden. / Dutch and English match: the interface (`static/i18n/`), `README.md` and `README.en.md`, and the example `.env` files.
+- [ ] `MEALIESHOPPER_TESTING=1 python -m pytest` slaagt. / `MEALIESHOPPER_TESTING=1 python -m pytest` passes.
+- [ ] Nederlands en Engels zijn gelijk: de interface (`static/i18n/`), `README.md` en `README.en.md`, `docs/handleiding.md` en `docs/handleiding.en.md`, en de voorbeeld-`.env`-bestanden. / Dutch and English match: the interface (`static/i18n/`), `README.md` and `README.en.md`, `docs/handleiding.md` and `docs/handleiding.en.md`, and the example `.env` files.
 - [ ] Er staan geen geheimen of `.env`-bestanden in deze pull request. / No secrets or `.env` files are in this pull request.
 - [ ] Een nieuwe tabel met gegevens staat in `backup.DATA_TABLES` (of bewust in `EXCLUDED_TABLES`) en in `tests/test_backup.py`. / A new data table is in `backup.DATA_TABLES` (or deliberately in `EXCLUDED_TABLES`) and in `tests/test_backup.py`.
 - [ ] Wat een standaard is (passkeys, OAuth, JWT, TOTP en dergelijke) gebruikt een bestaande open-sourcebibliotheek, hier genoemd, of de uitzondering is uitgelegd. / Anything defined by a standard (passkeys, OAuth, JWT, TOTP and the like) uses an existing open-source library, named here, or the exception is explained.
