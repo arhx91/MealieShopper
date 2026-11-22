@@ -1,5 +1,8 @@
 // Weekmenu naar de winkel, mandjes, recepten zoeken, winkelkeuze en maaltijdboxen.
-const { DISHES, WEEK, product } = require("../demo");
+const { DISHES, WEEK, product, perUnit, openSubtab, openBasket } = require("../demo");
+const { NOW } = require("../lib");
+// Je eigen recepten in Mealie staan bij Recepten zoeken bovenaan (dezelfde als in de receptkiezer van het weekmenu).
+const { mealieRecipes } = require("./01-plan");
 
 // ---- Hulpjes
 
@@ -18,6 +21,12 @@ const scrollTo = (page, selector, offset = 84) =>
   page.evaluate(([sel, off]) => window.scrollTo(0, document.querySelector(sel).getBoundingClientRect().top + window.scrollY - off), [selector, offset]);
 
 const url = (id) => `https://www.example.nl/product/${id}`;
+
+// De boodschappenlijst staat sinds 4.24.0 achter de knop Boodschappen, op de plek van het weekmenu: eerst die weergave openen.
+const openShopping = async (page) => {
+  await page.waitForSelector("#shop-jump");
+  await page.click("#shop-jump");
+};
 
 // ---- Het weekmenu en wat erin zit: 20 ingrediënten, zoals een gewone week
 
@@ -40,13 +49,35 @@ const mealPlan = MENU.map(([day, type, name, image, ingredients]) => ({
   recipeDetail: { name, recipeIngredient: ingredients.map((display) => ({ display })) },
 }));
 
-// Per ingrediënt de producten die de winkel voorstelt: [trefwoord, kleur, soort, [titel, merk, inhoud, prijs, verpakkingen, twijfel?], ...]
+// Hetzelfde weekmenu voor de boodschappenlijst (sinds 4.11.0), met wat je meestal al in huis hebt: olijfolie bij de wraps en
+// de curry (dezelfde naam in Mealie, dus één regel) en zout bij de curry. De naam van een ingrediënt in Mealie (`food.name`) is
+// waar Al in huis op vergelijkt (shopQuery in static/shopping.js).
+// Een eenheid zoals Mealie hem geeft; met useAbbreviation telt "1 el" en "2 el" op tot "3 el".
+const TABLESPOON = { name: "eetlepel", pluralName: "eetlepels", abbreviation: "el", useAbbreviation: true };
+const STAPLES = {
+  3: [{ display: "1 el olijfolie", food: { name: "olijfolie" }, quantity: 1, unit: TABLESPOON }],
+  4: [
+    { display: "2 el olijfolie", food: { name: "olijfolie" }, quantity: 2, unit: TABLESPOON },
+    { display: "zout naar smaak", food: { name: "zout" } },
+  ],
+};
+// Alleen maandag tot en met vrijdag, zodat de lijst met Al in huis eronder op het scherm past.
+const shoppingPlan = mealPlan
+  .map((entry, at) => ({
+    ...entry,
+    recipeDetail: { ...entry.recipeDetail, recipeIngredient: [...entry.recipeDetail.recipeIngredient, ...(STAPLES[MENU[at][0]] || [])] },
+  }))
+  .filter((entry) => entry.date <= WEEK[4]);
+
+// Per ingrediënt de producten die de winkel voorstelt: [trefwoord, kleur, soort, [titel, merk, inhoud, prijs, verpakkingen, twijfel?], ...].
+// Het eerste is het voorgestelde product; daarna, zoals bij het weekmenu (prices.check_list_candidates), alleen hetzelfde product in
+// een andere maat of wat per eenheid goedkoper is. Bij spaghetti en aardappelen is een grotere verpakking per kilo goedkoper.
 const CATALOG = [
-  ["spaghetti", "#e6b84a", "pack", ["Spaghetti", "AH", "500 g", 1.49, 1], ["Spaghetti n° 5", "Barilla", "500 g", 2.19, 1]],
-  ["kerstomaten", "#d9503f", "pack", ["Kerstomaten", "AH", "250 g", 1.99, 1], ["Biologische kerstomaten", "AH Biologisch", "250 g", 2.49, 1]],
-  ["pesto", "#6aa55a", "jar", ["Pesto verde", "AH", "190 g", 2.29, 1, true], ["Pesto alla Genovese", "Barilla", "190 g", 2.79, 1]],
+  ["spaghetti", "#e6b84a", "pack", ["Spaghetti", "AH", "500 g", 1.49, 1], ["Spaghetti", "AH", "1 kg", 2.59, 1]],
+  ["kerstomaten", "#d9503f", "pack", ["Kerstomaten", "AH", "250 g", 1.99, 1], ["Kerstomaten", "AH", "500 g", 3.99, 1]],
+  ["pesto", "#6aa55a", "jar", ["Pesto verde", "AH", "190 g", 2.29, 1, true]],
   ["pijnboompitten", "#c9a36a", "pack", ["Pijnboompitten", "AH", "80 g", 3.49, 1]],
-  ["aardappelen", "#b98a5a", "pack", ["Kruimige aardappelen", "AH", "2 kg", 2.79, 1], ["Kruimige aardappelen", "AH Biologisch", "1 kg", 1.99, 1]],
+  ["aardappelen", "#b98a5a", "pack", ["Kruimige aardappelen", "AH", "2 kg", 2.79, 1], ["Kruimige aardappelen", "AH", "5 kg", 5.49, 1]],
   ["boerenkool", "#3f7f45", "pack", ["Boerenkool gesneden", "AH", "500 g", 1.79, 1]],
   ["rookworst", "#8a4b3a", "pack", ["Rookworst", "Unox", "250 g", 2.39, 1]],
   ["tomatenblokjes", "#d9503f", "jar", ["Tomatenblokjes", "AH", "400 g", 0.79, 1]],
@@ -81,8 +112,14 @@ function cartPreview(route, request) {
           url: url(`${found[0]}-${at}`),
           packs,
           doubt: doubt ? (dutch(request) ? "Verpakkingsgrootte onbekend" : "Pack size unknown") : null,
+          unitPrice: perUnit(price, unitSize),
         }))
       : [];
+    // Het voorgestelde product eerst; de rest is hetzelfde product (`same`) en soms per eenheid goedkoper (`cheaper`).
+    candidates.forEach((candidate, at) => {
+      if (at === 0) candidate.suggested = true;
+      else Object.assign(candidate, { same: true, cheaper: candidate.unitPrice.value < candidates[0].unitPrice.value * 0.98 });
+    });
     return { query: item.query, display: item.display, quantity: item.quantity ?? null, unit: item.unit ?? null, candidates };
   });
   return json(route, { items });
@@ -140,14 +177,6 @@ const jumboCart = {
   totalPrice: 12.18,
 };
 
-// Kies een winkel in de keuzelijst bovenaan het tabblad Mandje.
-async function openBasket(page, store) {
-  await page.click('[data-tab="basket"]');
-  await page.waitForSelector("#basket-store");
-  if (store) await page.selectOption("#basket-store", store);
-  await page.waitForTimeout(700);
-}
-
 // ---- Recepten zoeken
 
 const ahRecipe = (id, title, image, minutes, servings, courses) => ({
@@ -193,6 +222,16 @@ const picnicResults = {
     storeRecipe("pn2", "Kipcurry met kokosmelk", DISHES.curry, 30, null, null, ["Familie"]),
     storeRecipe("pn3", "Kipwraps met komkommer", DISHES.wrap, 15, null, null, ["Lunch"]),
     storeRecipe("pn4", "Kip uit de wok", DISHES.salad, 20, null, null, ["Snel"]),
+  ],
+};
+
+// Crisp-recepten (sinds 2.86.0 zoekt Recepten zoeken ook bij Crisp, zodra Crisp gekoppeld is).
+const crispResults = {
+  total: 3,
+  recipes: [
+    storeRecipe("cr1", "Kip piri piri met zoete aardappel", DISHES.curry, 35, 2, null, ["Pittig"]),
+    storeRecipe("cr2", "Kipsaté met atjar en rijst", DISHES.stroganoff, 30, 2, null, ["Familie"]),
+    storeRecipe("cr3", "Salade met gegrilde kip en peer", DISHES.salad, 15, 2, null, ["Snel"]),
   ],
 };
 
@@ -244,16 +283,18 @@ const jumboDetail = {
 
 // Antwoorden voor het zoeken bij alle vijf de winkels en aanbieders.
 const searchRoutes = {
+  "/api/mealie/recipes*": mealieRecipes,
   "/api/ah/search*": ahResults,
   "/api/jumbo/recipes*": jumboResults,
   "/api/jumbo/recipes/*": jumboDetail,
   "/api/picnic/recipes*": picnicResults,
+  "/api/crisp/recipes*": crispResults,
   "/api/hellofresh/search*": searchKits(helloFreshMenu.filter((recipe) => /kip|wraps|pasta/i.test(recipe.name)), 4),
   "/api/marleyspoon/search*": searchKits(marleySpoonMenu.filter((recipe) => /kip|tacos|bowl/i.test(recipe.name)), 4),
 };
 
 async function search(page) {
-  await page.click('[data-subtab="search"]');
+  await openSubtab(page, "search");
   await page.fill("#recipe-query", "kip");
   await page.press("#recipe-query", "Enter");
   await page.waitForSelector("#search-marleyspoon-results .recipe-card");
@@ -285,6 +326,7 @@ module.exports = [
     name: "plan-picnic",
     routes: { "/api/mealplan*": mealPlan, "/api/picnic/cart/preview": cartPreview, "/api/picnic/cart": cartFill },
     run: async (page) => {
+      await openShopping(page);
       await page.waitForSelector("#add-cart");
       await page.click("#cart-store-toggle");
       await page.click('#cart-store-list [data-store="picnic"]');
@@ -296,13 +338,34 @@ module.exports = [
     },
   },
   {
+    // De boodschappenlijst (sinds 4.11.0), achter de knop Boodschappen en op de plek van het weekmenu (sinds 4.24.0), met een pijltje
+    // terug. Het is woensdag 28 oktober, dus maandag en dinsdag tellen standaard niet mee (met de regel erover); de ui is
+    // uitgevinkt (die heb je nog), en olijfolie en zout staan open onder Al in huis. Onderaan de winkelkeuze, Liever biologisch
+    // en de knop naar het mandje.
+    name: "shopping-list",
+    routes: { "/api/mealplan*": shoppingPlan, "/api/pantry": { items: [{ name: "olijfolie" }, { name: "zout" }] } },
+    run: async (page) => {
+      await openShopping(page);
+      await page.waitForSelector("#shop-box .shop-pantry summary");
+      await page.click('#shop-box [data-shop-item="1 ui"]');
+      await page.click("#shop-box .shop-pantry summary");
+      await page.evaluate(() => document.activeElement && document.activeElement.blur());
+      await scrollTo(page, "#shop-box");
+    },
+  },
+  {
     // De controlelijst voor het mandje, met één gemarkeerde regel.
     name: "cart",
     routes: { "/api/mealplan*": mealPlan, "/api/ah/cart/preview": cartPreview },
     run: async (page) => {
+      await openShopping(page);
       await page.waitForSelector("#add-cart");
+      // De dagen die voorbij zijn tellen standaard niet mee (sinds 4.11.0); hier de hele week, met de twijfelregel van maandag.
+      while (await page.locator('[data-shop-day][aria-pressed="false"]').count()) await page.locator('[data-shop-day][aria-pressed="false"]').first().click();
       await page.click("#add-cart");
       await page.waitForSelector(".cart-review");
+      // De lijst zoekt in groepen (sinds 4.11.0): wachten tot de stand erboven weg is.
+      await page.waitForSelector("#review-progress", { state: "hidden" });
       await scrollTo(page, ".cart-review");
     },
   },
@@ -329,7 +392,7 @@ module.exports = [
     run: async (page) => openBasket(page, "jumbo"),
   },
   {
-    // Recepten zoeken: de resultaten van Albert Heijn bovenaan.
+    // Recepten zoeken: je eigen recepten in Mealie bovenaan, daaronder Albert Heijn.
     name: "search",
     routes: searchRoutes,
     run: async (page) => {
@@ -347,7 +410,7 @@ module.exports = [
     },
   },
   {
-    // Een Jumbo-recept met ingrediënten, bereiding en de knoppen Importeer en Bekijk op de site.
+    // Een Jumbo-recept met ingrediënten, bereiding en de knoppen Inplannen, Importeer en Bekijk bij Jumbo.
     name: "search-detail",
     routes: searchRoutes,
     run: async (page, { device }) => {
@@ -357,6 +420,36 @@ module.exports = [
       await page.waitForTimeout(300);
       // Op het bureaublad staat de grote foto boven alles: scroll naar de gegevens, de knoppen en de ingrediënten.
       if (device === "desktop") await scrollTo(page, "#search-detail-body .muted", 150);
+    },
+  },
+  {
+    // De kookmodus vanuit hetzelfde Jumbo-recept: één stap tegelijk in grote letters, met Vorige en Volgende onderaan. Op het
+    // bureaublad staan de ingrediënten ernaast (kipfilet en penne zijn al afgevinkt). De eerste twee stappen zijn klaar, dus dit
+    // is stap 3. Sinds 4.14.0 staan eronder de ingrediënten bij de stap (de kerstomaten, automatisch gevonden: een Jumbo-recept
+    // heeft geen koppelingen) en de knopjes voor een timer van 3 minuten en een eigen tijd. De timer van 3 minuten loopt al
+    // 75 seconden: hij zweeft rechtsonder, boven Vorige en Volgende, met nog 1:45.
+    name: "cook-mode",
+    routes: searchRoutes,
+    run: async (page) => {
+      await search(page);
+      await page.click('[data-store-open^="jumbo:"]');
+      await page.waitForSelector("#search-detail-body [data-cook-start]");
+      await page.check('#search-detail-body [data-cook-tick="0"]');
+      await page.check('#search-detail-body [data-cook-tick="2"]');
+      await page.click('#search-detail-body [data-cook-done="0"]');
+      await page.click('#search-detail-body [data-cook-done="1"]');
+      await page.click("#search-detail-body [data-cook-start]");
+      await page.waitForSelector("#cook-mode[open]");
+      await page.click('#cook-mode-timer-row [data-cook-timer-start="180"]');
+      await page.waitForSelector("#cook-timers [data-cook-timer]");
+      // De klok staat vast (lib.js); verzet hem, dan telt de timer bij de volgende tik af naar 1:45.
+      await page.clock.setFixedTime(new Date(NOW.getTime() + 75 * 1000));
+      await page.waitForTimeout(1300);
+      // De klik op het knopje scrolde de stap; terug naar boven, zodat "Stap 3 van 5" in beeld is.
+      await page.evaluate(() => {
+        document.activeElement && document.activeElement.blur();
+        document.getElementById("cook-mode-stage").scrollTop = 0;
+      });
     },
   },
   {

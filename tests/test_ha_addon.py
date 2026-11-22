@@ -55,6 +55,16 @@ class AddonFilesTest(unittest.TestCase):
         self.assertEqual(top_level(text, "image"), "ghcr.io/helmerznl/mealieshopper")
         self.assertNotEqual(block(text, "ports"), block(self.config(ha_addon.STABLE), "ports"))
 
+    def test_the_addon_files_have_no_merge_conflict_left(self):
+        # Een merge in beta liet conflictmarkeringen en twee `version:`-regels achter in beide config.yaml's: geen geldige YAML
+        # meer voor de Supervisor, en de tests hierboven lezen alleen de eerste `version:` (#228).
+        files = [ROOT / "repository.yaml"] + sorted(path for folder in (ha_addon.STABLE, ha_addon.BETA) for path in folder.rglob("*.yaml"))
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"(?m)^(<{7}|={7}|>{7})( |$)", path)
+            keys = re.findall(r"(?m)^([A-Za-z_][\w-]*):", text)
+            self.assertEqual(sorted(keys), sorted(set(keys)), f"een sleutel staat dubbel in {path}")
+
     def test_beta_addon_is_derived_from_the_stable_one(self):
         self.assertEqual(ha_addon.differences(VERSION), [], "draai: python scripts/ha_addon.py")
 
@@ -95,17 +105,18 @@ class AddonFilesTest(unittest.TestCase):
         found = [
             p.relative_to(ROOT).as_posix()
             for p in ROOT.rglob("config.*")
-            if p.name in {"config.yaml", "config.yml", "config.json"} and ".git" not in p.relative_to(ROOT).parts
+            if p.name in {"config.yaml", "config.yml", "config.json"}
+            and ".git" not in p.relative_to(ROOT).parts
             and not any(part.startswith(".") for part in p.relative_to(ROOT).parts)
         ]
         self.assertEqual(sorted(found), ["homeassistant/mealieshopper-beta/config.yaml", "homeassistant/mealieshopper/config.yaml"])
 
 
 class ImageTest(unittest.TestCase):
-    def test_dockerfile_starts_through_the_entrypoint_and_keeps_gunicorn(self):
+    def test_dockerfile_starts_through_the_entrypoint_and_starts_hypercorn(self):
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn('ENTRYPOINT ["python", "/app/docker-entrypoint.py"]', text)
-        self.assertIn('CMD ["gunicorn"', text)
+        self.assertIn('CMD ["hypercorn"', text)
         self.assertRegex(text, r"COPY .*docker-entrypoint\.py")
         self.assertIn("MEALIESHOPPER_DATA_DIR=/data", text)
 
@@ -126,7 +137,6 @@ class EntrypointTest(unittest.TestCase):
                 "offers_sync_hour": 0,
                 "picnic_country_code": "DE",
                 "audit_retention_days": 14,
-                "default_portions": 4,
             }
         )
         self.assertEqual(
@@ -139,7 +149,6 @@ class EntrypointTest(unittest.TestCase):
                 "MEALIESHOPPER_OFFERS_SYNC_HOUR": "0",
                 "PICNIC_COUNTRY_CODE": "DE",
                 "MEALIESHOPPER_AUDIT_RETENTION_DAYS": "14",
-                "MEALIESHOPPER_DEFAULT_PORTIONS": "4",
             },
         )
 
@@ -161,21 +170,25 @@ class EntrypointTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             options = Path(tmp) / "options.json"
             options.write_text(json.dumps({"mealie_url": "http://mealie:9000"}), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"MEALIESHOPPER_OPTIONS_FILE": str(options)}), \
-                    mock.patch.object(entrypoint.os, "execvp") as execvp:
-                entrypoint.main(["docker-entrypoint.py", "gunicorn", "run:app"])
+            with mock.patch.dict(os.environ, {"MEALIESHOPPER_OPTIONS_FILE": str(options)}), mock.patch.object(entrypoint.os, "execvp") as execvp:
+                entrypoint.main(["docker-entrypoint.py", "hypercorn", "run:app"])
                 self.assertEqual(os.environ["MEALIE_URL"], "http://mealie:9000")
             os.environ.pop("MEALIE_URL", None)
-        execvp.assert_called_once_with("gunicorn", ["gunicorn", "run:app"])
+        execvp.assert_called_once_with("hypercorn", ["hypercorn", "run:app"])
 
     def test_without_options_the_command_starts_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             before = dict(os.environ)
-            with mock.patch.dict(os.environ, {"MEALIESHOPPER_OPTIONS_FILE": str(Path(tmp) / "none.json")}), \
-                    mock.patch.object(entrypoint.os, "execvp") as execvp:
-                entrypoint.main(["docker-entrypoint.py", "gunicorn"])
-                self.assertEqual({k: v for k, v in os.environ.items() if k != "MEALIESHOPPER_OPTIONS_FILE"}, {k: v for k, v in before.items() if k != "MEALIESHOPPER_OPTIONS_FILE"})
-        execvp.assert_called_once_with("gunicorn", ["gunicorn"])
+            with (
+                mock.patch.dict(os.environ, {"MEALIESHOPPER_OPTIONS_FILE": str(Path(tmp) / "none.json")}),
+                mock.patch.object(entrypoint.os, "execvp") as execvp,
+            ):
+                entrypoint.main(["docker-entrypoint.py", "hypercorn"])
+                self.assertEqual(
+                    {k: v for k, v in os.environ.items() if k != "MEALIESHOPPER_OPTIONS_FILE"},
+                    {k: v for k, v in before.items() if k != "MEALIESHOPPER_OPTIONS_FILE"},
+                )
+        execvp.assert_called_once_with("hypercorn", ["hypercorn"])
 
     def test_no_command_is_an_error(self):
         with self.assertRaises(SystemExit):

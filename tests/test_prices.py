@@ -1,0 +1,2498 @@
+"""Prijsgeschiedenis (#178): normale prijs, aanbiedingen en aankopen per product."""
+
+import asyncio
+import os
+import tempfile
+import threading
+import unittest
+from contextlib import closing
+from datetime import date, timedelta
+from typing import Any
+from unittest import mock
+
+os.environ.setdefault("MEALIESHOPPER_DATA_DIR", tempfile.mkdtemp())
+
+from helpers import AppTestCase, db, in_db, returned, run, served  # noqa: E402
+
+from mealieshopper import ah, ah_orders, auth, mcp, offers, picnic_orders, price_import, prices, product_links, regular_price  # noqa: E402
+from mealieshopper.app import create_app  # noqa: E402
+
+TODAY = "2026-10-20"
+
+
+class PricesCase(AppTestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"MEALIESHOPPER_DATA_DIR": tmp.name, "PASSKEY_AUTH_ENABLED": "false"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        run(auth.init_db())
+
+    async def sync_offer(self, when, *items, store="ah"):
+        with mock.patch.object(offers, "_now", return_value=when), mock.patch.dict(offers.FETCHERS, {store: lambda: returned(list(items))}):
+            await offers.sync(store)
+
+    async def ah_order(self, order_id, kind, day, *items):
+        await in_db(
+            ah_orders._connect, lambda conn: ah_orders._save_order(conn, {"id": order_id, "deliveryDate": day}, kind, list(items) if items else None)
+        )
+
+    def ah_article(self, article: int, product_id: int, title: str) -> None:
+        """De koppeling van AH van een artikelnummer op de bon aan een product van de webwinkel (`ah_receipt_products`)."""
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute(
+                "INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (?, ?, ?, 'x')",
+                (article, product_id, title),
+            )
+
+    def ah_receipt(self, receipt_id, when, *lines):
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute(
+                "INSERT INTO ah_receipts (receipt_id, date_time, total, details_synced, first_seen) VALUES (?, ?, 0, 1, ?)", (receipt_id, when, when)
+            )
+            conn.executemany(
+                "INSERT INTO ah_receipt_items (receipt_id, position, product_id, name, quantity, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(receipt_id, position, *line) for position, line in enumerate(lines)],
+            )
+
+    async def history(self, store="ah", query="", limit=50):
+        return await prices.history(store, query, limit, today=TODAY)
+
+    async def product(self, product_id, **kwargs):
+        return next(p for p in (await self.history(**kwargs))["products"] if p["productId"] == product_id)
+
+
+async def history_points(store: str = "ah", wanted: tuple[str, ...] = ("1",)) -> dict[str, list[tuple[str, float]]]:
+    """`prices._history_points` zoals `_annotate` hem aanroept: met de bonregels van `_areceipt_rows` erbij, op dezelfde verbinding,
+    voor de producten in `wanted` (bij `_annotate` de ids van de aanbiedingen)."""
+
+    async def points(conn):
+        return await prices._history_points(conn, store, TODAY, await prices._receipt_rows(conn, store, TODAY), wanted)
+
+    found = (await in_db(prices._connect, points))[0]
+    return {product_id: [(day, price) for day, price, _ in rows] for product_id, rows in found.items()}  # zonder de bron, die testen we apart
+
+
+def offer(product_id, title, price=1.0, before=1.5, label="25% korting", **extra):
+    return {"id": product_id, "title": title, "price": price, "priceBefore": before, "promoLabel": label, **extra}
+
+
+def order_item(product_id, title, price, quantity=1, before=None, bonus=False):
+    return {
+        "productId": product_id,
+        "title": title,
+        "brand": "AH",
+        "unitSize": "500 g",
+        "quantity": quantity,
+        "amount": price * quantity,
+        "price": price,
+        "priceBeforeBonus": before,
+        "bonus": bonus,
+        "taxonomy": "",
+        "image": "",
+    }
+
+
+class RegularPriceTest(AppTestCase):
+    def test_without_an_offer_the_price_is_the_regular_price(self):
+        self.assertEqual(prices.regular_price({"price": 1.29}), 1.29)
+        self.assertEqual(prices.regular_price({"price": {"now": 2.5}}), 2.5)  # de vorm van AH
+
+    def test_with_an_offer_only_the_price_before_counts(self):
+        self.assertEqual(prices.regular_price({"price": 1.0, "isBonus": True, "promo": {"priceBefore": 1.49}}), 1.49)
+        self.assertEqual(prices.regular_price({"price": 1.0, "listPrice": 1.2}), 1.2)
+        self.assertEqual(prices.regular_price({"price": 1.0, "bonus": True, "priceBeforeBonus": 1.3}), 1.3)
+
+    def test_an_offer_without_the_price_before_is_skipped(self):
+        self.assertIsNone(prices.regular_price({"price": 1.0, "isBonus": True}))
+        self.assertIsNone(prices.regular_price({"price": 1.0, "promo": {"label": "2 voor 3"}}))
+
+    def test_nonsense_is_no_price(self):
+        for value in (None, 0, -1, True, "1,29", {"now": None}):
+            self.assertIsNone(prices.regular_price({"price": value}), value)
+
+
+class RecordTest(PricesCase):
+    def rows(self):
+        with closing(db(prices)) as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM price_observations ORDER BY store, product_id, day")]
+
+    def test_one_price_per_product_per_day_the_last_one_wins(self):
+        products = [{"id": "1", "title": "AH Penne", "price": 1.19, "unitSize": "500 g"}, {"id": "2", "title": "Spaghetti", "price": 0.99}]
+        self.assertEqual(run(prices.record("ah", products, now="2026-10-01T08:00:00+00:00")), 2)
+        run(prices.record("ah", [{"id": "1", "title": "AH Penne", "price": 1.25}], now="2026-10-01T18:00:00+00:00"))
+        run(prices.record("ah", [{"id": "1", "title": "AH Penne", "price": 1.25}], now="2026-10-02T08:00:00+00:00"))
+        rows = self.rows()
+        self.assertEqual(
+            [(r["product_id"], r["day"], r["price"]) for r in rows], [("1", "2026-10-01", 1.25), ("1", "2026-10-02", 1.25), ("2", "2026-10-01", 0.99)]
+        )
+        self.assertEqual(rows[0]["unit_size"], "500 g")  # een latere zoekopdracht zonder pakmaat wist hem niet
+        self.assertEqual(rows[0]["url"], None)
+
+    def test_products_without_id_title_or_regular_price_are_skipped(self):
+        found = [{"title": "Geen id", "price": 1}, {"id": "3", "price": 1}, {"id": "4", "title": "Bonus", "price": 1, "isBonus": True}, "rommel"]
+        self.assertEqual(run(prices.record("ah", found)), 0)
+        self.assertEqual(run(prices.record("nope", [{"id": "1", "title": "X", "price": 1}])), 0)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_failure_never_breaks_the_search(self):
+        with mock.patch.object(prices, "_connect", side_effect=OSError("schijf vol")), self.assertLogs(prices.log, "WARNING"):
+            self.assertEqual(run(prices.record("ah", [{"id": "1", "title": "X", "price": 1}])), 0)
+        search = mock.AsyncMock(return_value=[{"id": "1", "title": "X", "price": 1}])
+        with mock.patch.object(prices, "_connect", side_effect=OSError("schijf vol")), self.assertLogs(prices.log, "WARNING"):
+            self.assertEqual(run(prices.recorded("ah", search)("x", 5)), search.return_value)
+        search.assert_called_once_with("x", 5)
+
+    def test_the_wrapper_records_what_the_store_found(self):
+        search = mock.AsyncMock(return_value=[{"webshopId": "9", "title": "Melk", "price": {"now": 1.09}, "images": [{"url": "https://img/9"}]}])
+        self.assertEqual(run(prices.recorded("ah", search)("melk")), search.return_value)
+        row = self.rows()[0]
+        self.assertEqual((row["product_id"], row["price"], row["image"], row["source"]), ("9", 1.09, "https://img/9", "search"))
+
+
+class HistoryTest(PricesCase):
+    async def test_offers_regular_prices_and_purchases_come_together(self):
+        await self.sync_offer("2026-10-05T05:00:00+00:00", offer("1", "AH Penne", 0.89, 1.19, validFrom="2026-10-05", validUntil="2026-10-11"))
+        await prices.record("ah", [{"id": "1", "title": "AH Penne", "price": 1.25}], now="2026-10-15T08:00:00+00:00")
+        await self.ah_order(101, "delivered", "2026-10-07", order_item(1, "AH Penne", 0.89, quantity=2, before=1.19, bonus=True))
+        await self.ah_order(102, "open", "2026-10-22", order_item(1, "AH Penne", 1.25, quantity=5))  # nog niet geleverd: telt niet
+        self.ah_receipt("R1", "2026-10-16T12:30:00", (1, "AH PENNE", 1, 1.25, 1.25))
+
+        product = await self.product("1")
+        self.assertEqual((product["title"], product["timesOnOffer"], product["lowestPrice"]), ("AH Penne", 1, 0.89))
+        self.assertEqual(
+            product["regular"],
+            [{"from": "2026-10-05", "to": "2026-10-11", "price": 1.19}, {"from": "2026-10-15", "to": "2026-10-15", "price": 1.25}],
+        )
+        self.assertEqual((product["regularPrice"], product["lowestRegular"], product["highestRegular"]), (1.25, 1.19, 1.25))
+        self.assertEqual(
+            [(p["date"], p["price"], p["quantity"], p["source"]) for p in product["purchases"]],
+            [("2026-10-07", 0.89, 2, "order"), ("2026-10-16", 1.25, 1, "receipt")],
+        )
+        self.assertEqual((product["timesBought"], product["lastPaid"], product["lowestPaid"]), (2, 1.25, 0.89))
+        self.assertEqual(product["averagePaid"], round((0.89 * 2 + 1.25) / 3, 2))
+        self.assertEqual(product["lastActivity"], "2026-10-16")
+        self.assertEqual(product["url"], "https://www.ah.nl/producten/product/wi1")
+
+    async def test_a_product_you_only_bought_is_found_too(self):
+        await self.ah_order(101, "delivered", "2026-09-01", order_item(7, "AH Volkoren spaghetti", 1.09))
+        product = await self.product("7", query="spaghetti")
+        self.assertEqual((product["timesOnOffer"], product["episodes"], product["onOfferNow"]), (0, [], False))
+        self.assertEqual((product["title"], product["brand"], product["unitSize"]), ("AH Volkoren spaghetti", "AH", "500 g"))
+        self.assertEqual(product["regular"], [{"from": "2026-09-01", "to": "2026-09-01", "price": 1.09}])
+
+    async def test_a_receipt_name_finds_the_product_and_brings_its_other_data(self):
+        await prices.record("ah", [{"id": "5", "title": "AH Basmati rijst", "price": 2.19}], now="2026-10-01T08:00:00+00:00")
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (5, "AH RIJST BASMATI", 2, 2.19, 4.38))
+        product = await self.product("5", query="RIJST BASMATI")
+        self.assertEqual(product["title"], "AH Basmati rijst")  # de zoekopdracht geeft een betere naam dan de bon
+        self.assertEqual(len(product["regular"]), 1)
+
+    async def test_receipt_lines_without_a_usable_id_are_linked_by_name(self):
+        # Rundergehakt tien keer gekocht: twee keer bezorgd, de rest in de winkel. Op de bon staat geen id (of een onbekend id), wel de naam.
+        await self.ah_order(101, "delivered", "2026-09-01", order_item(11, "AH Rundergehakt", 3.49))
+        await self.ah_order(102, "delivered", "2026-09-15", order_item(11, "AH Rundergehakt", 3.49))
+        for number in range(1, 7):
+            self.ah_receipt(f"R{number}", f"2026-10-0{number}T12:00:00", (None, "AH RUNDERGEHAKT", 1, 3.59, 3.59))
+        self.ah_receipt("R7", "2026-10-08T12:00:00", (0, "AH Rundergehakt", 1, 3.59, 3.59))
+        self.ah_receipt("R8", "2026-10-09T12:00:00", (987654, "AH  RUNDERGEHAKT", 2, 3.59, 7.18))  # een id dat we niet kennen, wel de naam
+        data = await self.history(query="rundergehakt")
+        self.assertEqual(data["total"], 1)
+        product = data["products"][0]
+        self.assertEqual((product["productId"], product["title"], product["timesBought"]), ("11", "AH Rundergehakt", 10))
+        self.assertEqual([p["source"] for p in product["purchases"]].count("receipt"), 8)
+
+    async def test_a_linked_article_number_joins_the_product_from_the_orders(self):
+        # Op de bon "AH BLOEMK" (afgekort) met artikelnummer 20960, in de bestelling "AH Bloemkool" met id 4183: een product (issue #178).
+        await self.ah_order(101, "delivered", "2026-09-01", order_item(4183, "AH Bloemkool", 1.69))
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (20960, "AH BLOEMK", 2, 1.99, 3.98))
+        self.ah_receipt("R2", "2026-10-09T09:00:00", (20960, "AH BLOEMK", 1, 1.85, 1.85))
+        self.assertEqual(sorted(p["productId"] for p in (await self.history(query="bloem"))["products"]), ["20960", "4183"], "zonder koppeling: twee")
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute(
+                "INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (20960, 4183, 'AH Bloemkool', 'x')"
+            )
+        data = await self.history(query="bloem")
+        self.assertEqual(data["total"], 1)
+        product = data["products"][0]
+        self.assertEqual((product["productId"], product["title"], product["timesBought"]), ("4183", "AH Bloemkool", 3))
+        self.assertEqual([p["source"] for p in product["purchases"]], ["order", "receipt", "receipt"])
+        self.assertEqual((await self.history(query="BLOEMK"))["total"], 1, "de naam op de bon vindt hem ook")
+
+    async def test_a_receipt_id_that_is_also_the_id_of_another_product_is_not_trusted(self):
+        # Het artikelnummer van "AH ROOKWORST" op de bon (627748) is ook het id van een pizza in de webwinkel (issue #178).
+        await self.sync_offer("2026-11-02T05:00:00+00:00", offer("627748", "Dr. Oetker Ristorante pizza hawaii 3-pack", 8.80, 9.57))
+        await self.ah_order(101, "delivered", "2026-09-01", order_item(55, "AH Rookworst", 2.79))
+        self.ah_receipt("R1", "2025-12-06T18:57:00", (627748, "AH ROOKWORST", 1, None, 2.99))
+        pizza = next(p for p in (await prices.history("ah", "ristorante", 50, today="2026-11-03"))["products"] if p["productId"] == "627748")
+        self.assertEqual(pizza["timesBought"], 0)
+        sausage = next(p for p in (await prices.history("ah", "rookworst", 50, today="2026-11-03"))["products"] if p["productId"] == "55")
+        self.assertEqual((sausage["timesBought"], [p["source"] for p in sausage["purchases"]]), (2, ["receipt", "order"]))
+
+    async def test_a_receipt_id_of_another_product_without_a_name_match_stays_its_own_product(self):
+        # Zonder bestelling van rookworst valt de bonregel niet terug op het id van de pizza, maar wordt hij een eigen product.
+        await self.sync_offer("2026-11-02T05:00:00+00:00", offer("627748", "Dr. Oetker Ristorante pizza hawaii 3-pack", 8.80, 9.57))
+        self.ah_receipt("R1", "2025-12-06T18:57:00", (627748, "AH ROOKWORST", 1, None, 2.99))
+        products = {p["productId"]: p for p in (await prices.history("ah", "", 50, today="2026-11-03"))["products"]}
+        self.assertEqual(products["627748"]["timesBought"], 0)
+        self.assertEqual(products["bon:ah rookworst"]["timesBought"], 1)
+
+    def test_names_agree_on_a_shared_or_shortened_word(self):
+        self.assertTrue(prices._names_agree("ah rijst basmati", ["ah basmati rijst"]))
+        self.assertTrue(prices._names_agree("ah rundergeh", ["ah rundergehakt"]))
+        self.assertFalse(prices._names_agree("ah rookworst", ["dr. oetker ristorante pizza hawaii 3-pack"]))
+        self.assertFalse(prices._names_agree("ah ui", ["ah uien"]), "woorden van twee letters tellen niet")
+
+    async def test_a_receipt_name_without_the_house_brand_finds_the_product(self):
+        # Op de bon "BLOEMKOOL", in de bestelling "AH Bloemkool" (issue #178): zonder "AH" vooraan is het dezelfde naam.
+        await self.ah_order(101, "delivered", "2026-09-01", order_item(4183, "AH Bloemkool", 1.69))
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (None, "BLOEMKOOL", 1, 1.99, 1.99))
+        product = await self.product("4183", query="bloemkool")
+        self.assertEqual((product["timesBought"], [p["source"] for p in product["purchases"]]), (2, ["order", "receipt"]))
+
+    async def test_a_bare_name_that_fits_two_products_is_not_guessed(self):
+        await self.ah_order(101, "delivered", "2026-09-01", order_item(1, "AH Bloemkool", 1.69), order_item(2, "Bloemkool", 1.49))
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (None, "BLOEMKOOL ", 1, 1.99, 1.99))
+        ids = sorted(p["productId"] for p in (await self.history(query="bloemkool"))["products"])
+        self.assertEqual(ids, ["1", "2"], "precies dezelfde naam gaat voor: Bloemkool")
+        self.assertEqual((await self.product("2", query="bloemkool"))["timesBought"], 2)
+
+    async def test_an_article_number_that_ah_did_not_find_changes_nothing(self):
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (43947, "DRAAGTAS", 1, 0.25, 0.25))
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (43947, NULL, NULL, 'x')")
+        self.assertEqual([p["productId"] for p in (await self.history(query="draagtas"))["products"]], ["43947"])
+
+    async def test_a_linked_receipt_line_gets_the_web_shop_name_and_stays_findable_by_the_receipt_name(self):
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (77234, "RED BAND", 1, 1.99, 1.99), (511669, "RB PICOLIENT", 1, 1.49, 1.49))
+        with closing(db(ah_orders)) as conn, conn:
+            conn.executemany(
+                "INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (?, ?, ?, 'x')",
+                [(77234, 547751, "Red Band Winegums original"), (511669, 4242, "Red Band Picolient")],
+            )
+        titles = {p["productId"]: p["title"] for p in (await self.history(query="redband"))["products"]}
+        self.assertEqual(
+            titles, {"547751": "Red Band Winegums original", "4242": "Red Band Picolient"}, "redband vindt Red Band (spaties tellen niet)"
+        )
+        self.assertEqual([p["productId"] for p in (await self.history(query="RB PICOLIENT"))["products"]], ["4242"], "de naam op de bon werkt ook")
+
+    def test_a_search_looks_up_matching_unlinked_receipt_names_first(self):
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (501520, "REDBAND", 1, 1.99, 1.99), (20960, "BLOEMKOOL", 1, 1.99, 1.99))
+        asked = []
+
+        async def lookup(names: list[str]) -> None:
+            asked.append(names)
+            with closing(db(ah_orders)) as conn, conn:
+                conn.execute(
+                    "INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (501520, 88624, 'Red Band Schatkistjes', 'x')"
+                )
+
+        data = run(prices.history("ah", "redband", 50, today=TODAY, lookup=lookup))
+        self.assertEqual(asked, [["REDBAND"]], "alleen de namen die bij de zoekterm passen")
+        self.assertEqual([(p["productId"], p["title"]) for p in data["products"]], [("88624", "Red Band Schatkistjes")])
+        run(prices.history("ah", "redband", 50, today=TODAY, lookup=lookup))
+        self.assertEqual(len(asked), 1, "gekoppeld: niet opnieuw opzoeken")
+        run(prices.history("ah", "", 50, today=TODAY, lookup=lookup))
+        self.assertEqual(len(asked), 1, "zonder zoekterm niets opzoeken")
+
+    def test_a_failing_lookup_leaves_the_receipt_name(self):
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (501520, "REDBAND", 1, 1.99, 1.99))
+        data = run(prices.history("ah", "redband", 50, today=TODAY, lookup=lambda names: 1 / 0))
+        self.assertEqual([p["title"] for p in data["products"]], ["REDBAND"])
+
+    async def test_a_receipt_line_that_matches_nothing_is_still_found(self):
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (None, "AH VERSE KNOFLOOK", 1, 0.79, 0.79))
+        product = (await self.history(query="knoflook"))["products"][0]
+        self.assertEqual(
+            (product["productId"], product["title"], product["timesBought"], product["url"]), ("bon:ah verse knoflook", "AH VERSE KNOFLOOK", 1, "")
+        )
+        self.assertEqual((await self.product("bon:ah verse knoflook", query=""))["timesBought"], 1)
+
+    async def test_purchases_that_are_not_fetched_yet_are_counted(self):
+        await self.ah_order(101, "delivered", "2026-09-01")  # geen producten: items_synced blijft 0
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("INSERT INTO ah_receipts (receipt_id, date_time, total, details_synced, first_seen) VALUES ('R9', '2026-10-01', 1, 0, 'x')")
+        self.assertEqual((await self.history())["unsynced"], {"ah": {"orders": 1, "receipts": 1}})
+
+    async def test_search_by_words_and_pack_size(self):
+        async def record(pid: str, title: str, size: str) -> None:
+            await prices.record("ah", [{"id": pid, "title": title, "price": 3.0, "unitSize": size}], now="2026-10-01T08:00:00+00:00")
+
+        await record("1", "AH Rundergehakt", "500 g")
+        await record("2", "AH Rundergehakt", "300 g")
+        await record("3", "AH Half-om-half gehakt", "0,5 kg")
+        await record("4", "AH Kipgehakt", "1 kg")
+        await record("5", "AH Gehaktkruiden", "per stuk")
+        self.ah_receipt("R1", "2026-10-02T09:00:00", (None, "SLAGER GEHAKT", 1, 4.0, 4.0), (None, "AH GEHAKT 300G", 1, 2.0, 2.0))
+
+        async def found(query: str) -> list[str]:
+            return sorted(p["productId"] for p in (await self.history(query=query))["products"])
+
+        self.assertEqual(await found("Gehakt 500 gram"), ["1", "3", "bon:slager gehakt"])  # de bon zonder maat blijft erin, die van 300 g niet
+        self.assertEqual(await found("500g gehakt"), await found("Gehakt 500 gram"))  # volgorde en schrijfwijze van de maat maken niet uit
+        self.assertEqual(await found("gehakt 0,5 kg"), await found("Gehakt 500 gram"))
+        self.assertEqual(await found("rundergehakt 300 gram"), ["2"])
+        self.assertEqual(await found("gehakt"), ["1", "2", "3", "4", "5", "bon:ah gehakt 300g", "bon:slager gehakt"])
+        self.assertEqual(await found("half om half"), ["3"])
+
+    async def test_the_same_price_on_more_days_is_one_period_and_a_change_starts_a_new_one(self):
+        for day, price in (("01", 1.0), ("02", 1.0), ("05", 1.0), ("06", 1.2), ("09", 1.0)):
+            await prices.record("ah", [{"id": "1", "title": "Kaas", "price": price}], now=f"2026-10-{day}T08:00:00+00:00")
+        self.assertEqual(
+            (await self.product("1"))["regular"],
+            [
+                {"from": "2026-10-01", "to": "2026-10-05", "price": 1.0},
+                {"from": "2026-10-06", "to": "2026-10-06", "price": 1.2},
+                {"from": "2026-10-09", "to": "2026-10-09", "price": 1.0},
+            ],
+        )
+
+    def test_on_one_day_the_search_beats_an_order_and_an_order_beats_an_offer(self):
+        points = [("2026-10-01", 1.5, "offer"), ("2026-10-01", 1.4, "order"), ("2026-10-02", 1.5, "offer"), ("2026-10-02", 1.3, "search")]
+        self.assertEqual(
+            prices._regular_segments(points),
+            [{"from": "2026-10-01", "to": "2026-10-01", "price": 1.4}, {"from": "2026-10-02", "to": "2026-10-02", "price": 1.3}],
+        )
+
+    async def test_picnic_lines_are_divided_by_the_quantity_and_cancelled_or_future_orders_are_left_out(self):
+        line = {"id": "s1", "title": "Picnic penne", "unitSize": "500 g", "quantity": 3, "price": 2.67, "listPrice": 3.57}
+        await in_db(
+            picnic_orders._connect,
+            lambda conn: picnic_orders._save_order(conn, {"id": "P1", "status": "COMPLETED", "deliveredStart": "2026-10-03T18:00:00+02:00"}, [line]),
+            lambda conn: picnic_orders._save_order(
+                conn, {"id": "P2", "status": "CANCELLED", "windowStart": "2026-10-04T18:00:00+02:00"}, [{**line, "price": 0.3}]
+            ),
+            lambda conn: picnic_orders._save_order(
+                conn, {"id": "P3", "status": "CURRENT", "windowStart": "2026-10-30T18:00:00+02:00"}, [{**line, "price": 0.6}]
+            ),
+        )
+        product = await self.product("s1", store="picnic")
+        self.assertEqual([(p["date"], p["price"], p["regularPrice"]) for p in product["purchases"]], [("2026-10-03", 0.89, 1.19)])
+        self.assertEqual(product["regular"], [{"from": "2026-10-03", "to": "2026-10-03", "price": 1.19}])
+
+    async def test_newest_first_with_a_limit_and_the_total(self):
+        for number in range(1, 6):
+            await prices.record("ah", [{"id": str(number), "title": f"Product {number}", "price": 1}], now=f"2026-10-0{number}T08:00:00+00:00")
+        data = await self.history(limit=2)
+        self.assertEqual(([p["productId"] for p in data["products"]], data["total"]), (["5", "4"], 5))
+        self.assertEqual((await self.history(query="product 3"))["total"], 1)
+        self.assertEqual((await self.history(query="100%"))["total"], 0)  # % en _ zijn letters, geen jokers
+
+    async def test_stores_are_kept_apart_and_an_unlinked_store_is_simply_empty(self):
+        await prices.record("ah", [{"id": "1", "title": "Melk", "price": 1}])
+        self.assertEqual(
+            await self.history(store="jumbo"),
+            {"products": [], "total": 0, "unsynced": {"jumbo": {"orders": 0, "receipts": 0}}, "facets": {"brands": [], "categories": []}},
+        )  # geen tabellen
+        self.assertEqual((await prices.history(None, "melk", 10))["total"], 1)
+        with self.assertRaises(ValueError):
+            await prices.history("nope")
+
+
+class RouteAndToolTest(PricesCase):
+    async def test_the_route(self):
+        await prices.record("ah", [{"id": "1", "title": "Kipfilet", "price": 5.49}])
+        client = self.client_for(create_app())
+        reply = (await client.get("/api/prices/history?store=ah&q=kip&limit=5")).get_json()
+        self.assertEqual((reply["total"], reply["products"][0]["regularPrice"]), (1, 5.49))
+        self.assertEqual((await client.get("/api/prices/history?store=nope")).status_code, 400)
+        self.assertEqual((await client.get("/api/prices/history?limit=abc")).status_code, 200)
+
+    async def test_one_product_by_id_skips_the_search_and_the_lookup(self):
+        await prices.record("ah", [{"id": "1", "title": "Kipfilet", "price": 5.49}, {"id": "2", "title": "Kipdij", "price": 4.49}])
+        lookup = mock.AsyncMock()
+        reply = await prices.history("ah", "", 50, today=TODAY, lookup=lookup, product="2")
+        self.assertEqual([p["productId"] for p in reply["products"]], ["2"])
+        self.assertEqual(reply["total"], 1)
+        lookup.assert_not_called()
+        self.assertEqual((await prices.history("ah", "", 50, today=TODAY, product="nope"))["products"], [])
+        client = self.client_for(create_app())
+        self.assertEqual((await client.get("/api/prices/history?store=ah&product=1")).get_json()["products"][0]["regularPrice"], 5.49)
+
+    async def test_the_check_list_of_the_week_menu_records_the_regular_price(self):
+        found = [{"webshopId": "42", "title": "AH Penne", "price": {"now": 1.19}, "unitSize": "500 g", "images": [], "isBonus": False}]
+        with mock.patch.object(ah, "search_products", return_value=found):
+            reply = await self.client_for(create_app()).post(
+                "/api/ah/cart/preview", json={"items": [{"query": "penne", "quantity": 500, "unit": "g"}]}
+            )
+        self.assertEqual(reply.status_code, 200)
+        self.assertEqual((await prices.history("ah", "penne"))["products"][0]["regularPrice"], 1.19)
+
+    async def test_the_mcp_tool_is_compact(self):
+        await self.sync_offer("2026-10-05T05:00:00+00:00", offer("1", "AH Penne", 0.89, 1.19))
+        await self.ah_order(101, "delivered", "2026-10-07", order_item(1, "AH Penne", 0.89, quantity=2, before=1.19, bonus=True))
+        data = await mcp.TOOLS["get_price_history"]["handler"]({"query": "penne", "store": "ah"})
+        product = data["products"][0]
+        self.assertEqual((product["title"], product["timesOnOffer"], product["timesBought"], product["regularPrice"]), ("AH Penne", 1, 1, 1.19))
+        self.assertEqual(product["purchases"], [{"date": "2026-10-07", "pricePerItem": 0.89, "quantity": 2, "source": "order"}])
+        self.assertIn("hint", data)
+        with self.assertRaises(mcp.ToolError):
+            await mcp.TOOLS["get_price_history"]["handler"]({"store": "nope"})
+
+
+class PublicObservedPriceTest(PricesCase):
+    def observation(self, day: str, price: float, source: str = "public_observed_unknown", size: str | None = "1 l") -> None:
+        with closing(db(prices)) as conn, conn:
+            conn.execute(
+                "INSERT INTO price_observations (store, product_id, day, source, title, brand, unit_size, url, price, seen_at) "
+                "VALUES ('picnic', 'milk', ?, ?, 'Halfvolle melk', 'Picnic', ?, ?, ?, ?)",
+                (day, source, size, f"https://example.org/prices/{day}", price, day + "T12:00:00+00:00"),
+            )
+
+    async def test_unknown_only_product_is_searchable_without_regular_offer_or_purchase_claims(self) -> None:
+        self.observation("2026-10-02", 1.09)
+        self.observation("2026-10-18", 1.19)
+        data: dict = await self.history(store="picnic", query="melk 1 l")
+        self.assertEqual(data["total"], 1)
+        product: dict = data["products"][0]
+        self.assertEqual(
+            product["observed"],
+            [
+                {"date": "2026-10-02", "price": 1.09, "unitSize": "1 l", "sourceUrl": "https://example.org/prices/2026-10-02"},
+                {"date": "2026-10-18", "price": 1.19, "unitSize": "1 l", "sourceUrl": "https://example.org/prices/2026-10-18"},
+            ],
+        )
+        self.assertEqual((product["regular"], product["episodes"], product["purchases"]), ([], [], []))
+        for key in ("regularPrice", "regularPerUnit", "lowestRegular", "highestRegular", "regularSince", "lastPaid", "lowestPaid"):
+            self.assertIsNone(product.get(key), key)
+        self.assertEqual((product["timesBought"], product["timesOnOffer"], product["onOfferNow"]), (0, 0, False))
+        self.assertEqual((product["title"], product["unitSize"], product["lastActivity"]), ("Halfvolle melk", "1 l", "2026-10-18"))
+        self.assertEqual((await prices.history("picnic", product="milk", today=TODAY))["products"][0], product)
+        self.assertEqual((await prices.history("picnic", bought=True, today=TODAY))["total"], 0)
+
+    def test_regular_source_comes_with_its_own_day_in_the_last_segment(self) -> None:
+        # Dezelfde prijs op twee dagen uit twee bronnen: een periode, en de bron is die van de nieuwste dag (`to`, niet `from`).
+        rows: list[dict] = [
+            {
+                "day": "2026-09-01",
+                "regular": 1.49,
+                "paid": 1.49,
+                "quantity": 1,
+                "ref": "a",
+                "source": "import",
+                "unit_size": None,
+                "title": "Melk",
+                "brand": None,
+                "image": None,
+            },
+            {
+                "day": "2026-09-20",
+                "regular": 1.49,
+                "paid": 1.49,
+                "quantity": 1,
+                "ref": "b",
+                "source": "receipt",
+                "unit_size": None,
+                "title": "Melk",
+                "brand": None,
+                "image": None,
+            },
+        ]
+        product: dict = prices._product("picnic", "milk", None, [], rows, TODAY)
+        self.assertEqual((product["regularSource"], product["regularSince"], product["regular"][-1]["to"]), ("receipt", "2026-09-01", "2026-09-20"))
+
+    def test_regular_source_is_the_source_of_the_point_that_gives_the_regular_price(self) -> None:
+        def row(day: str, source: str, regular: float) -> dict:
+            return {
+                "day": day,
+                "regular": regular,
+                "paid": regular,
+                "quantity": 1,
+                "ref": day,
+                "source": source,
+                "unit_size": None,
+                "title": "Melk",
+                "brand": None,
+                "image": None,
+            }
+
+        only_import: dict = prices._product("picnic", "milk", None, [], [row("2026-10-01", "import", 1.49)], TODAY)
+        self.assertEqual((only_import["regularPrice"], only_import["regularSource"]), (1.49, "import"))
+        newer: dict = prices._product("picnic", "milk", None, [], [row("2026-09-01", "import", 1.49), row("2026-10-02", "receipt", 1.59)], TODAY)
+        self.assertEqual((newer["regularPrice"], newer["regularSince"], newer["regularSource"]), (1.59, "2026-10-02", "receipt"))
+        empty: dict = prices._product("picnic", "milk", None, [], [], TODAY)
+        self.assertIsNone(empty.get("regularSource"))
+
+    async def test_archive_source_is_not_labelled_as_a_product_link_at_the_store(self) -> None:
+        self.observation("2026-10-01", 1.09)
+        self.assertEqual((await self.product("milk", store="picnic"))["url"], "")
+
+    async def test_mixed_sources_keep_confirmed_regular_prices_separate(self) -> None:
+        self.observation("2026-10-01", 1.49, "search")
+        self.observation("2026-10-02", 0.99)
+        self.observation("2026-10-03", 1.59, "public_press_release")
+        product: dict = await self.product("milk", store="picnic")
+        self.assertEqual([point["price"] for point in product["observed"]], [0.99])
+        self.assertEqual([point["price"] for point in product["regular"]], [1.49, 1.59])
+        self.assertEqual((product["regularPrice"], product["lowestRegular"], product["regularSince"]), (1.59, 1.49, "2026-10-03"))
+
+    async def test_regular_unit_price_uses_the_confirmed_prices_own_pack_size(self) -> None:
+        self.observation("2026-10-01", 2.00, "search", size="1 l")
+        self.observation("2026-10-02", 1.00, size="2 l")
+        product: dict = await self.product("milk", store="picnic")
+        self.assertEqual(product["regularPrice"], 2.00)
+        self.assertEqual(product["unitSize"], "1 l")
+        self.assertEqual(product["observed"][0]["unitSize"], "2 l")
+        self.assertEqual(product["regularPerUnit"], {"value": 2.00, "unit": "l"})
+        compact: dict = (await mcp.tool_get_price_history({"store": "picnic", "query": "melk"}))["products"][0]
+        self.assertEqual(compact["regularPricePerUnit"], product["regularPerUnit"])
+
+    async def test_missing_confirmed_pack_size_does_not_borrow_unknown_pack_size(self) -> None:
+        self.observation("2026-10-01", 2.00, "search", size=None)
+        self.observation("2026-10-02", 1.00, size="2 l")
+        product: dict = await self.product("milk", store="picnic")
+        self.assertEqual(product["regularPrice"], 2.00)
+        self.assertIsNone(product["regularPerUnit"])
+        self.assertIsNone(product["unitSize"])
+        self.assertEqual(product["observed"][0]["unitSize"], "2 l")
+
+    async def test_compare_fallback_uses_confirmed_observation_with_its_own_pack(self) -> None:
+        self.observation("2026-10-01", 2.00, "public_press_release", size="1 l")
+        self.observation("2026-10-02", 1.00, size="2 l")
+
+        async def nothing(*_: object) -> list:
+            return []
+
+        with (
+            mock.patch.object(offers, "load", new_callable=mock.AsyncMock, return_value={"offers": []}),
+            mock.patch.object(prices, "_search_function", return_value=nothing),
+        ):
+            result: dict = await prices.compare("picnic", "milk")
+        self.assertEqual((result["product"]["price"], result["product"]["unitSize"]), (2.00, "1 l"))
+        self.assertEqual(result["product"]["unitPrice"], {"value": 2.00, "unit": "l"})
+        self.assertEqual(result["candidates"][0]["price"], 2.00)
+        self.assertEqual(result["candidates"][0]["unitSize"], "1 l")
+
+    async def test_compare_fallback_rejects_unknown_only_observations(self) -> None:
+        self.observation("2026-10-02", 1.00, size="2 l")
+        with mock.patch.object(offers, "load", new_callable=mock.AsyncMock, return_value={"offers": []}):
+            self.assertIsNone(await prices._known_product("picnic", "milk"))
+            with self.assertRaises(ValueError):
+                await prices.compare("picnic", "milk")
+
+    async def test_unknown_prices_never_supply_a_regular_baseline_but_count_as_observed_history(self) -> None:
+        self.observation("2026-10-01", 0.79)
+
+        async def points(conn):
+            return await prices._regular_points(conn, "picnic", "2026-09-20", TODAY, receipts=[])
+
+        self.assertEqual((await in_db(prices._connect, points))[0], {})
+        self.assertEqual((await history_points("picnic", ("milk",)))["milk"], [("2026-10-01", 0.79)])
+        self.assertEqual(await prices.regular_before("picnic", ["milk"], TODAY), {})
+        current: dict = offer("milk", "Halfvolle melk", price=0.69, before=None)
+        await prices._annotate("picnic", [current], TODAY)
+        self.assertEqual(current["verdict"]["kind"], "unknown")
+        self.assertIsNone(current["verdict"]["lowestRegular"])
+        self.assertIsNone(current["badge"])
+
+    async def test_ordinary_products_always_include_an_empty_observed_series(self) -> None:
+        self.observation("2026-10-01", 1.49, "search")
+        self.assertEqual((await self.product("milk", store="picnic"))["observed"], [])
+
+    async def test_api_and_mcp_expose_the_same_observed_entries(self) -> None:
+        self.observation("2026-10-01", 1.09)
+        client = self.client_for(create_app())
+        api: dict = (await client.get("/api/prices/history?store=picnic&product=milk")).get_json()["products"][0]
+        result: dict = (await mcp.tool_get_price_history({"store": "picnic", "query": "melk"}))["products"][0]
+        self.assertEqual(result["observed"], api["observed"])
+        self.assertEqual((result["regularPrices"], result["regularPrice"]), ([], None))
+
+
+class UnitPriceTest(AppTestCase):
+    """Testgevallen uit het userscript van wolph (prijs per kg/ml/etc.)."""
+
+    def test_packs_become_a_price_per_kilo_litre_or_piece(self):
+        cases = [
+            (2.50, "2 x 250 g", {"value": 5.0, "unit": "kg"}),
+            (3.00, "ca. 500 g", {"value": 6.0, "unit": "kg"}),
+            (1.29, "per stuk", {"value": 1.29, "unit": "stuk"}),
+            (6.49, "6 x 1 l", {"value": 1.08, "unit": "l"}),  # de prijs van het pak, gedeeld door zes liter
+            (3.00, "75 cl", {"value": 4.0, "unit": "l"}),
+            (2.00, "4 stuks", {"value": 0.5, "unit": "stuk"}),
+            (1.50, "1,5 l", {"value": 1.0, "unit": "l"}),
+            (2.19, "0,5 kg", {"value": 4.38, "unit": "kg"}),
+        ]
+        for price, size, expected in cases:
+            self.assertEqual(prices.unit_price(price, size), expected, size)
+
+    def test_unknown_packs_and_prices_give_nothing(self):
+        for price, size in ((1.0, "1 bos"), (1.0, ""), (None, "500 g"), (0, "500 g"), (1.0, "0 g")):
+            self.assertIsNone(prices.unit_price(price, size), (price, size))
+
+    def test_the_base_title_leaves_out_sizes_and_pack_words(self):
+        self.assertEqual(prices.base_title("AH Zalmfilet 3-pack"), "ah zalmfilet")
+        self.assertEqual(prices.base_title("AH Penne voordeelverpakking"), "ah penne")
+        self.assertEqual(prices.base_title("Coca-Cola Zero 6 x 1,5 l"), "coca cola zero")
+        self.assertEqual(prices._search_query("Coca-Cola Zero 6 x 1,5 l"), "Coca-Cola Zero")
+        self.assertEqual(prices._search_query("AH Zalmfilet 3-pack"), "AH Zalmfilet")
+
+
+def deal(product_id, title, price, before=None, label="", size="500 g", brand="AH", **extra):
+    from mealieshopper import deals
+
+    return {
+        "id": product_id,
+        "title": title,
+        "brand": brand,
+        "unitSize": size,
+        "price": price,
+        "priceBefore": before,
+        "promoLabel": label,
+        **deals.describe(label, price_now=price, price_before=before),
+        **extra,
+    }
+
+
+class VerdictTest(PricesCase):
+    async def annotate(self, *items, store="ah"):
+        return {item["id"]: item for item in await prices.annotate(store, list(items), today=TODAY)}
+
+    async def observe(self, day, product_id, title, price, size="500 g", brand="AH", store="ah"):
+        await prices.record(
+            store, [{"id": product_id, "title": title, "price": price, "unitSize": size, "brand": brand}], now=f"{day}T08:00:00+00:00"
+        )
+
+    async def test_a_real_deal_is_far_below_the_lowest_regular_price_of_30_days(self):
+        await self.observe("2026-10-10", "1", "AH Penne", 1.19)
+        offer = (await self.annotate(deal("1", "AH Penne", 0.89, 1.19, "25% korting")))["1"]
+        self.assertEqual(
+            {k: offer["verdict"][k] for k in ("kind", "percent", "lowestRegular", "inflated")},
+            {"kind": "good", "percent": 25, "lowestRegular": 1.19, "inflated": False},
+        )
+        self.assertEqual(offer["unitPricePer"], {"value": 1.78, "unit": "kg"})
+
+    async def test_a_price_before_that_was_raised_is_seen_through(self):
+        await self.observe("2026-10-05", "1", "AH Kaas", 1.10)  # binnen 30 dagen: de gewone prijs was lager dan de prijs ervoor van de actie
+        await self.observe("2026-09-01", "1", "AH Kaas", 0.90)  # ouder dan 30 dagen: telt niet
+        verdict = (await self.annotate(deal("1", "AH Kaas", 1.12, 1.50, "nu 1,12")))["1"]["verdict"]
+        self.assertEqual((verdict["kind"], verdict["lowestRegular"], verdict["inflated"]), ("none", 1.10, True))
+
+    async def test_a_small_saving(self):
+        self.assertEqual((await self.annotate(deal("1", "AH Rijst", 1.80, 2.00)))["1"]["verdict"]["kind"], "small")
+
+    async def test_a_deal_with_a_minimum_uses_the_price_per_item(self):
+        # AH geeft bij "2 voor 3,00" de gewone prijs als prijs en geen prijs ervoor.
+        verdict = (await self.annotate(deal("1", "AH Hummus", 2.00, None, "2 voor 3,00")))["1"]["verdict"]
+        self.assertEqual((verdict["kind"], verdict["percent"], verdict["lowestRegular"]), ("good", 25, 2.0))
+        for label, expected in (("2e halve prijs", 25), ("1+1 gratis", 50)):
+            self.assertEqual((await self.annotate(deal("2", "AH Soep", 2.00, 2.00, label)))["2"]["verdict"]["percent"], expected, label)
+
+    async def test_ah_gives_the_regular_price_for_one_plus_one_free(self):
+        # Zo staat "1+1 gratis" in de aanbiedingen van AH: de prijs is de gewone prijs, zonder prijs ervoor (wolph: 300 g rundergehakt).
+        offer = (await self.annotate(deal("1", "AH Rundergehakt", 3.49, None, "1+1 gratis", size="300 g")))["1"]
+        self.assertEqual((offer["unitPrice"], offer["unitPricePer"]), (1.75, {"value": 5.83, "unit": "kg"}))
+        self.assertEqual((offer["verdict"]["kind"], offer["verdict"]["percent"], offer["verdict"]["lowestRegular"]), ("good", 50, 3.49))
+        half = (await self.annotate(deal("2", "AH Soep", 2.00, None, "2e halve prijs")))["2"]
+        self.assertEqual((half["unitPrice"], half["verdict"]["percent"]), (1.5, 25))
+        unknown = (await self.annotate(deal("3", "AH Kaas", 2.00, None, "25% korting")))["3"]  # is 2,00 al verlaagd? Dat weten we niet.
+        self.assertEqual((unknown["unitPrice"], unknown["verdict"]["kind"]), (None, "unknown"))
+
+    async def test_the_bulk_pack_is_compared_with_the_price_per_item_of_one_plus_one(self):
+        await self.observe("2026-10-15", "bulk", "AH Rundergehakt", 9.99, size="1000 g")  # €9,99/kg
+        verdict = (await self.annotate(deal("1", "AH Rundergehakt", 3.49, None, "1+1 gratis", size="300 g")))["1"]["verdict"]  # €5,83/kg
+        self.assertIsNone(verdict["cheaperPack"])
+        verdict = (await self.annotate(deal("1", "AH Rundergehakt", 3.49, None, "2e halve prijs", size="300 g")))["1"]["verdict"]  # €8,73/kg
+        self.assertIsNone(verdict["cheaperPack"])
+        verdict = (await self.annotate(deal("1", "AH Rundergehakt", 3.49, 3.69, "nu 3,49", size="300 g")))["1"]["verdict"]  # €11,63/kg
+        self.assertEqual(verdict["cheaperPack"]["productId"], "bulk")
+
+    async def test_without_a_regular_price_or_a_price_per_item_there_is_no_verdict(self):
+        verdict = (await self.annotate(deal("p1", "Picnic yoghurt", 1.20, None, "20% korting"), store="picnic"))["p1"]["verdict"]
+        self.assertEqual((verdict["kind"], verdict["percent"]), ("unknown", None))
+
+    async def test_often_on_offer_and_the_lowest_offer_price_in_a_year(self):
+        weeks = ("2026-01-05", "2026-03-02", "2026-04-27", "2026-06-22", "2026-08-17")
+        for start in weeks:
+            end = (prices.date.fromisoformat(start) + prices.timedelta(days=6)).isoformat()
+            await self.sync_offer(f"{start}T05:00:00+00:00", offer("1", "AH Pindakaas", 2.49, 2.99, "nu 2,49", validFrom=start, validUntil=end))
+            await self.sync_offer(f"{end}T23:00:00+00:00")
+        await self.sync_offer(
+            "2026-10-19T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.99, "nu 1,99", validFrom="2026-10-19", validUntil="2026-10-25")
+        )
+        annotated = (await self.annotate(deal("1", "AH Pindakaas", 1.99, 2.99, "nu 1,99")))["1"]
+        verdict = annotated["verdict"]
+        self.assertEqual((verdict["timesThisYear"], verdict["often"]), (6, True))
+        self.assertEqual(annotated["priceLabel"]["kind"], "lowest_6m")
+        higher = (await self.annotate(deal("1", "AH Pindakaas", 2.79, 2.99, "nu 2,79")))["1"]
+        self.assertEqual(higher["priceLabel"]["kind"], "lower_before")
+        self.assertEqual(annotated["yearLow"]["status"], "unknown", "de app volgt het product nog geen jaar")
+
+    async def test_year_low_uses_offers_line_offers_purchases_and_observations(self):
+        # Casa di Mama pizza salami (514010): folderactie 1+1 gratis in sept 2026 per stuk 2.15, gewone prijs 4.29 een jaar geleden.
+        with closing(db(prices)) as conn, conn:
+            conn.execute(
+                "INSERT INTO offer_history (store, product_id, title, brand, price, price_before, promo_label, valid_from, valid_until, first_seen, last_seen, ended_at) "
+                "VALUES ('ah', 'folder:a', 'Folder: Alle Dr. Oetker Casa di Mama', 'Folderarchief', 2.15, 4.29, '1+1 gratis', '2026-08-31', '2026-09-06', "
+                "'2026-08-31T00:00:00+00:00', '2026-09-06T23:59:59+00:00', '2026-09-06T23:59:59+00:00')"
+            )
+        await self.observe("2025-10-01", "514010", "Dr. Oetker Casa di mama pizza salami", 4.29, size="390 g", brand="Dr. Oetker")
+        offer_now = deal("514010", "Dr. Oetker Casa di mama pizza salami", 3.65, 4.29, "Bonus Box 15% korting", size="390 g", brand="Dr. Oetker")
+        found = (await self.annotate(offer_now))["514010"]
+        self.assertEqual(
+            {k: found["yearLow"][k] for k in ("status", "price", "source", "above")},
+            {"status": "above", "price": 2.15, "source": "line", "above": 1.5},
+        )
+        self.assertEqual((found["verdict"]["timesThisYear"], found["verdict"]["often"]), (1, False), "de folderactie telt als keer in de aanbieding")
+        # "1+1 gratis" bij AH: price is de gewone prijs, de vergelijking gaat op de prijs per stuk (_effective), dus 2.15 en niet 4.29.
+        free = (
+            await self.annotate(deal("514010", "Dr. Oetker Casa di mama pizza salami", 4.29, None, "1+1 gratis", size="390 g", brand="Dr. Oetker"))
+        )["514010"]
+        self.assertEqual((free["yearLow"]["status"], free["yearLow"]["above"]), ("lowest", 0.0))
+
+    async def test_the_family_of_a_pack_lists_the_bulk_pack_from_the_stored_prices(self):
+        await self.observe("2026-10-15", "1000", "AH Rundergehakt", 7.49, size="1000 g")
+        offer_now = (await self.annotate(deal("300", "AH Rundergehakt", 2.49, 2.99, "nu 2,49", size="300 g")))["300"]
+        family = offer_now["family"]
+        self.assertEqual(family["key"], "ah|rundergehakt|ah")
+        self.assertEqual([(p["productId"], p["onOffer"], p["cheapest"]) for p in family["packs"]], [("300", True, False), ("1000", False, True)])
+        self.assertEqual(offer_now["verdict"]["cheaperPack"]["productId"], "1000")
+        self.assertFalse(family["unknownPacks"])
+
+    async def test_bought_says_whether_you_bought_the_product_before(self):
+        await self.ah_order(101, "delivered", "2026-10-07", order_item(1, "AH Penne", 0.89))
+        found = await self.annotate(deal("1", "AH Penne", 0.79, 1.19, "nu 0,79"), deal("2", "AH Rijst", 1.80, 2.00))
+        self.assertEqual((found["1"]["bought"], found["2"]["bought"]), (True, False))
+
+    async def test_a_family_is_bought_when_any_of_its_packs_was_bought(self):
+        await self.ah_order(101, "delivered", "2026-10-07", order_item(1000, "AH Rundergehakt 1000 g", 7.49))
+        await self.observe("2026-10-19", "1000", "AH Rundergehakt 1000 g", 7.49, size="1000 g")
+        found = await self.annotate(deal("300", "AH Rundergehakt 300 g", 2.49, 3.65, "nu 2,49", size="300 g"), deal("2", "AH Rijst", 1.80, 2.00))
+        self.assertEqual((found["300"]["bought"], found["300"]["family"]["bought"], found["2"]["family"]["bought"]), (False, True, False))
+
+    async def test_unknown_packs_sees_a_branded_pack_the_app_saw_long_ago(self):
+        # De catalogus kent de 1000 g van een oude zoekopdracht (ouder dan PACK_DAYS), met het merk in de naam.
+        await self.observe("2026-06-01", "1000", "AH Rundergehakt 1000 g", 7.49, size="1000 g")
+        found = await self.annotate(deal("300", "AH Rundergehakt 300 g", 2.49, 3.65, "nu 2,49", size="300 g"))
+        self.assertTrue(found["300"]["family"]["unknownPacks"])
+        self.assertEqual([p["productId"] for p in found["300"]["family"]["packs"]], ["300"])
+
+    async def test_warm_catalogues_builds_the_catalogue_before_the_first_request(self):
+        prices._CATALOGUES.clear()
+        with mock.patch.dict(os.environ, {"MEALIESHOPPER_SHARED_PRICES": "false"}):
+            await prices.warm_catalogues(["ah"], today=TODAY)
+        self.assertEqual([key[1] for key in prices._CATALOGUES], ["ah"])
+
+    async def test_the_price_signature_changes_with_the_catalogue(self):
+        before = await prices.offers_signature("ah")
+        self.assertFalse(before.startswith("fout:"), before)  # twee verschillende foutwaarden zouden anders ook slagen
+        with closing(db(prices)) as conn, conn:
+            conn.execute(
+                "INSERT INTO offer_history (store, product_id, title, first_seen, last_seen, ended_at) "
+                "VALUES ('ah', 'folder:b', 'Folder: Alle Ajax', '2026-01-05T00:00:00+00:00', '2026-01-11T23:59:59+00:00', '2026-01-11T23:59:59+00:00')"
+            )
+        self.assertNotEqual(await prices.offers_signature("ah"), before, "een archiefimport ververst het oordeel bij de aanbiedingen")
+
+    def test_the_price_label_ladder(self):
+        cases = [  # (punten, effectieve prijs, verwachte trede)
+            ([("2025-09-20", 2.49), ("2026-03-01", 2.29), ("2026-09-01", 2.19)], 1.99, "lowest_ever"),
+            ([("2025-09-20", 1.89), ("2026-03-01", 2.29), ("2026-09-01", 2.19)], 1.99, "lowest_12m"),
+            ([("2025-09-20", 2.49), ("2026-03-01", 1.89), ("2026-09-01", 2.19)], 1.99, "lowest_6m"),
+            ([("2026-07-12", 2.49), ("2026-09-01", 2.19)], 1.99, "lowest_seen"),
+            ([("2026-07-12", 1.89), ("2026-09-01", 2.19)], 1.99, "lower_before"),
+            ([("2026-10-10", 2.49)], 1.99, None),
+        ]
+        for points, effective, kind in cases:
+            self.assertEqual(prices.price_label(effective, points, TODAY)["kind"], kind, points)
+
+    def test_the_price_label_carries_the_price_the_month_and_the_coverage(self):
+        label = prices.price_label(1.99, [("2026-06-03", 1.89), ("2026-09-01", 2.29)], TODAY)
+        self.assertEqual(label, {"kind": "lower_before", "price": 1.89, "month": "2026-06", "coveredSince": "2026-06-03"})
+        # Een jaar dekking en een lagere prijs van langer dan een jaar geleden: wel de laagste in 12 maanden, niet ooit.
+        self.assertEqual(prices.price_label(1.99, [("2025-06-03", 1.89), ("2026-03-01", 2.29)], TODAY)["kind"], "lowest_12m")
+        seen = prices.price_label(1.99, [("2026-08-12", 2.49), ("2026-09-01", 2.19)], TODAY)
+        self.assertEqual(seen, {"kind": "lowest_seen", "price": None, "month": "2026-08", "coveredSince": "2026-08-12"})
+        empty = {"kind": None, "price": None, "month": None, "coveredSince": None}
+        self.assertEqual(prices.price_label(1.99, [], TODAY), empty)
+        self.assertEqual(prices.price_label(None, [("2026-08-12", 2.49)], TODAY)["kind"], None)
+
+    def test_a_lower_price_that_came_back_names_its_latest_month(self):
+        label = prices.price_label(1.99, [("2025-06-03", 1.89), ("2026-02-10", 1.89), ("2026-03-01", 2.29)], TODAY)
+        self.assertEqual((label["price"], label["month"]), (1.89, "2026-02"))
+
+    def test_one_old_purchase_is_not_the_lowest_price_ever(self):
+        # Eén aankoop uit 2022 geeft geen "laagste prijs ooit": zonder meting in het afgelopen jaar valt de ladder terug op
+        # "laagste sinds", en "laagste in 12 maanden" heeft net zo goed een meting in dat jaar nodig.
+        label = prices.price_label(2.50, [("2022-05-31", 2.59)], TODAY)
+        self.assertEqual((label["kind"], label["month"]), ("lowest_seen", "2022-05"))
+        recent = prices.price_label(2.50, [("2022-05-31", 2.59), ("2026-06-01", 2.79)], TODAY)
+        self.assertEqual(recent["kind"], "lowest_ever")
+
+    def test_a_half_cent_counts_as_equal(self):
+        self.assertEqual(prices.price_label(1.99, [("2025-06-03", 1.994), ("2026-03-01", 2.29)], TODAY)["kind"], "lowest_ever")
+
+    async def test_history_points_come_from_offers_prices_and_purchases_and_skip_the_running_offer(self):
+        await self.sync_offer(
+            "2026-01-05T05:00:00+00:00", offer("1", "AH Pindakaas", 2.49, 2.99, "nu 2,49", validFrom="2026-01-05", validUntil="2026-01-11")
+        )
+        await self.sync_offer("2026-01-11T23:00:00+00:00")
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        await self.ah_order(101, "delivered", "2026-07-07", order_item(1, "AH Pindakaas", 2.79, quantity=2, before=2.99, bonus=True))
+        await self.ah_order(102, "delivered", "2026-08-07", order_item(1, "AH Pindakaas", 0.0, quantity=1))  # gratis: telt niet
+        await self.sync_offer(
+            "2026-10-19T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.99, "nu 1,99", validFrom="2026-10-19", validUntil="2026-10-25")
+        )
+        points = (await history_points())["1"]
+        self.assertEqual(points, [("2026-01-05", 2.49), ("2026-05-01", 2.99), ("2026-07-07", 2.79)])
+
+    async def test_history_points_count_receipts_and_imported_purchases_but_not_free_or_unknown(self):
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        # Een bon: het artikelnummer op de bon is het id van het product (bekend uit de bewaarde prijzen), de prijs per stuk telt.
+        self.ah_receipt(
+            "R1", "2026-06-10T10:00:00", (1, "AH PINDAKAAS", 2, 2.79, 5.58), (1, "AH PINDAKAAS", 1, None, 0.0), (1, "AH PINDAKAAS", 1, 0.0, 0.0)
+        )
+        with closing(db(price_import)) as conn, conn:
+            conn.executemany(
+                "INSERT INTO imported_purchases (store, order_ref, position, day, title, quantity, paid, regular, order_total, imported_at) VALUES ('ah', ?, ?, ?, 'AH Pindakaas', 1, ?, NULL, 9.99, 'x')",
+                [("M1", 0, "2026-07-15", 2.59), ("M1", 1, "2026-07-15", None), ("M2", 0, "2026-08-15", 0.0)],
+            )
+        points = (await history_points())["1"]
+        self.assertEqual(points, [("2026-05-01", 2.99), ("2026-06-10", 2.79), ("2026-07-15", 2.59)])
+
+    async def test_history_points_only_for_the_wanted_products(self):
+        # `_annotate` vraagt alleen de producten van de aanbiedingen op: de rest van de geschiedenis wordt niet gelezen.
+        await self.sync_offer(
+            "2026-01-05T05:00:00+00:00", offer("2", "AH Hagelslag", 1.49, 1.99, "nu 1,49", validFrom="2026-01-05", validUntil="2026-01-11")
+        )
+        await self.sync_offer("2026-01-11T23:00:00+00:00")
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        await self.observe("2026-05-02", "2", "AH Hagelslag", 1.99)
+        await self.ah_order(101, "delivered", "2026-07-07", order_item(2, "AH Hagelslag", 1.89))
+        self.assertEqual(await history_points(wanted=("1",)), {"1": [("2026-05-01", 2.99)]})
+        self.assertEqual(
+            await history_points(wanted=("1", "2", "3")),
+            {"1": [("2026-05-01", 2.99)], "2": [("2026-01-05", 1.49), ("2026-05-02", 1.99), ("2026-07-07", 1.89)]},
+        )
+        self.assertEqual(await history_points(wanted=()), {})
+
+    async def test_an_upcoming_offer_makes_a_product_findable_and_a_pinned_product_is_always_first(self):
+        # De bonus van volgende week staat pas in offer_history als hij begint; de prijsgeschiedenis toont hem wel, als `upcoming`.
+        await self.sync_offer(
+            "2026-10-19T05:00:00+00:00",
+            offer(
+                "7",
+                "Dr. Oetker Casa di mama pizza salame extra piccante",
+                3.65,
+                4.29,
+                "Bonus Box 15% korting",
+                validFrom="2099-01-05",
+                validUntil="2099-01-11",
+                unitSize="415 g",
+                brand="Dr. Oetker",
+            ),
+        )
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        found = (await prices.history("ah", "casa di mama salame", 50, today=TODAY))["products"]
+        self.assertEqual([p["productId"] for p in found], ["7"])
+        self.assertEqual(
+            (found[0]["title"], found[0]["unitSize"], found[0]["onOfferNow"], found[0]["timesOnOffer"]),
+            ("Dr. Oetker Casa di mama pizza salame extra piccante", "415 g", False, 0),
+        )
+        self.assertEqual(
+            found[0]["upcoming"],
+            {
+                "validFrom": "2099-01-05",
+                "validUntil": "2099-01-11",
+                "price": 3.65,
+                "priceBefore": 4.29,
+                "promoLabel": "Bonus Box 15% korting",
+                "personal": False,
+            },
+        )
+        # Een link noemt het product op id: dat staat er altijd in, bovenaan, ook als de naam niet past of je het nooit kocht.
+        pinned = await prices.history("ah", "pindakaas", 50, today=TODAY, pin="7")
+        self.assertEqual(([p["productId"] for p in pinned["products"]], pinned["total"]), (["7", "1"], 2))
+        self.assertEqual([p["productId"] for p in (await prices.history("ah", "", 50, today=TODAY, bought=True, pin="7"))["products"]], ["7"])
+        self.assertEqual([p["productId"] for p in (await prices.history("ah", "pindakaas", 50, today=TODAY, pin="999"))["products"]], ["1"])
+        self.assertIsNone((await prices.history("ah", "pindakaas", 50, today=TODAY))["products"][0]["upcoming"])
+
+    async def test_one_product_by_id_with_only_bought_follows_the_purchases(self):
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        await self.observe("2026-05-01", "2", "AH Hagelslag", 1.99)
+        await self.ah_order(101, "delivered", "2026-07-07", order_item(1, "AH Pindakaas", 2.79))
+        bought = await prices.history("ah", "", 50, today=TODAY, bought=True, product="1")
+        self.assertEqual([p["productId"] for p in bought["products"]], ["1"])
+        self.assertEqual((await prices.history("ah", "", 50, today=TODAY, bought=True, product="2"))["products"], [])
+        self.assertEqual([p["productId"] for p in (await prices.history("ah", "", 50, today=TODAY, product="2"))["products"]], ["2"])
+
+    async def test_a_failing_history_ladder_keeps_the_verdict_and_the_badge(self):
+        await self.observe("2026-10-10", "1", "AH Penne", 1.19)
+        with mock.patch.object(prices, "_history_points", new_callable=mock.AsyncMock, side_effect=RuntimeError("stuk")):
+            annotated = (await self.annotate(deal("1", "AH Penne", 0.89, 1.19, "nu 0,89")))["1"]
+        self.assertEqual(annotated["verdict"]["kind"], "good")
+        self.assertEqual(annotated["badge"]["source"], "history")
+        self.assertEqual(annotated["priceLabel"]["kind"], None)
+
+    async def test_a_bundle_episode_counts_with_its_price_per_item(self):
+        await self.sync_offer(
+            "2026-03-02T05:00:00+00:00", offer("1", "AH Soep", 2.00, None, "1+1 gratis", validFrom="2026-03-02", validUntil="2026-03-08")
+        )
+        await self.sync_offer("2026-03-08T23:00:00+00:00")
+        self.assertEqual((await history_points())["1"], [("2026-03-02", 1.0)])
+
+    async def test_annotate_sets_the_price_label_and_drops_best_in_year(self):
+        await self.sync_offer(
+            "2026-01-05T05:00:00+00:00", offer("1", "AH Pindakaas", 2.49, 2.99, "nu 2,49", validFrom="2026-01-05", validUntil="2026-01-11")
+        )
+        await self.sync_offer("2026-01-11T23:00:00+00:00")
+        annotated = (await self.annotate(deal("1", "AH Pindakaas", 1.99, 2.99, "nu 1,99")))["1"]
+        # Dekking vanaf 5 januari (288 dagen), maar geen meetpunt in de laatste zes maanden: dan "laagste sinds januari".
+        self.assertEqual((annotated["priceLabel"]["kind"], annotated["priceLabel"]["month"]), ("lowest_seen", "2026-01"))
+        self.assertNotIn("bestInYear", annotated["verdict"])
+        self.assertEqual((await self.annotate(deal("9", "AH Nieuw", 1.00, 1.50, "nu 1,00")))["9"]["priceLabel"]["kind"], None)
+
+    async def test_the_badge_takes_the_measured_difference_and_says_where_it_comes_from(self):
+        await self.observe("2026-10-10", "1", "AH Penne", 1.19)
+        badge = (await self.annotate(deal("1", "AH Penne", 0.89, 1.19, "25% korting")))["1"]["badge"]
+        self.assertEqual(
+            badge,
+            {
+                "percent": 25,
+                "source": "history",
+                "claimed": 25,
+                "inflated": False,
+                "regular": {"price": 1.19, "day": "2026-10-10", "source": "search", "judged": True, "fresh": True},
+            },
+        )
+
+    async def test_without_history_the_badge_is_the_claim_of_the_store(self):
+        badge = (await self.annotate(deal("1", "AH Rijst", 1.50, 2.00, "25% korting")))["1"]["badge"]
+        self.assertEqual(badge, {"percent": 25, "source": "store", "claimed": 25, "inflated": False})
+
+    async def test_the_price_before_of_an_earlier_offer_is_a_claim_and_not_a_measurement(self):
+        await self.sync_offer(
+            "2026-10-05T05:00:00+00:00", offer("1", "AH Rijst", 1.50, 2.00, "25% korting", validFrom="2026-10-05", validUntil="2026-10-11")
+        )
+        await self.sync_offer("2026-10-11T23:00:00+00:00")
+        # De van-prijs van een afgelopen aanbieding is een gedateerde bron (`dated`), geen meting (`history`).
+        self.assertEqual((await self.annotate(deal("1", "AH Rijst", 1.50, 2.00, "25% korting")))["1"]["badge"]["source"], "dated")
+        await self.ah_order(101, "delivered", "2026-10-12", order_item(1, "AH Rijst", 2.00, quantity=1))
+        self.assertEqual((await self.annotate(deal("1", "AH Rijst", 1.50, 2.00, "25% korting")))["1"]["badge"]["source"], "history")
+
+    async def test_an_inflated_price_before_gives_a_lower_badge_than_the_claim(self):
+        await self.observe("2026-10-05", "1", "AH Kaas", 1.10)
+        badge = (await self.annotate(deal("1", "AH Kaas", 0.88, 1.50, "nu 0,88")))["1"]["badge"]
+        self.assertEqual((badge["percent"], badge["claimed"], badge["inflated"], badge["source"]), (20, 41, True, "history"))
+
+    async def test_the_claim_of_a_bundle_deal_follows_the_mechanic(self):
+        self.assertEqual((await self.annotate(deal("1", "AH Soep", 2.00, None, "1+1 gratis")))["1"]["badge"]["claimed"], 50)
+        self.assertEqual((await self.annotate(deal("2", "AH Hummus", 2.00, None, "2 voor 3,00")))["2"]["badge"]["claimed"], 25)
+        self.assertEqual((await self.annotate(deal("3", "AH Thee", 2.00, None, "2e halve prijs")))["3"]["badge"]["claimed"], 25)
+
+    async def test_without_a_verdict_there_is_no_badge(self):
+        self.assertIsNone((await self.annotate(deal("p1", "Picnic yoghurt", 1.20, None, "20% korting"), store="picnic"))["p1"]["badge"])
+
+    async def test_a_zero_difference_keeps_a_badge_of_zero(self):
+        await self.observe("2026-10-10", "1", "AH Kaas", 1.10)
+        badge = (await self.annotate(deal("1", "AH Kaas", 1.12, 1.50, "nu 1,12")))["1"]["badge"]
+        self.assertEqual((badge["percent"], badge["inflated"]), (0, True))
+
+    async def test_receipt_of_four_months_ago_gives_a_dated_badge(self) -> None:
+        day: str = prices._days_ago(TODAY, 120)
+        self.ah_receipt("R1", f"{day}T10:00:00", (1, "AH PINDAKAAS", 1, 2.50, 2.50))
+        self.ah_article(1, 1, "AH Pindakaas")  # de koppeling van AH op het artikelnummer: alleen die telt (CONFIRMED_LINKS)
+        found: dict = (await self.annotate(deal("1", "AH Pindakaas", 2.00, 2.99, "nu 2,00")))["1"]
+        self.assertEqual(found["badge"]["source"], "dated")
+        self.assertEqual(found["badge"]["regular"], {"price": 2.50, "day": day, "source": "receipt", "judged": True, "fresh": False})
+        self.assertEqual(found["verdict"]["regular"], found["badge"]["regular"])
+        self.assertEqual((found["verdict"]["lowestRegular"], found["verdict"]["percent"]), (2.50, 20))
+        self.assertIs(found["verdict"]["inflated"], True)
+
+    async def test_a_from_price_below_a_dated_price_is_the_stricter_reference(self) -> None:
+        # Eindreview 2026-11-12: de van-prijs van de lopende aanbieding (2,29) is lager dan de bon van 2,50. Een winkel noemt zijn
+        # van-prijs niet te laag, dus de gewone prijs is sindsdien gedaald: het oordeel rekent met 2,29 (13%, niet 20%), de badge is
+        # de claim van de winkel en noemt de bon alleen als bekende hogere prijs (`known`), niet als de prijs waarmee is vergeleken.
+        day: str = prices._days_ago(TODAY, 120)
+        self.ah_receipt("R1", f"{day}T10:00:00", (1, "AH PINDAKAAS", 1, 2.50, 2.50))
+        self.ah_article(1, 1, "AH Pindakaas")  # de koppeling van AH op het artikelnummer: alleen die telt (CONFIRMED_LINKS)
+        found: dict = (await self.annotate(deal("1", "AH Pindakaas", 2.00, 2.29, "nu 2,00")))["1"]
+        self.assertEqual((found["verdict"]["lowestRegular"], found["verdict"]["percent"], found["verdict"]["inflated"]), (2.29, 13, False))
+        self.assertIsNone(found["verdict"]["regular"])
+        self.assertEqual(found["badge"]["source"], "store")
+        self.assertNotIn("regular", found["badge"])
+        self.assertEqual(found["badge"]["known"], {"price": 2.50, "day": day, "source": "receipt", "judged": True, "fresh": False})
+
+    async def test_an_old_receipt_never_gives_more_than_the_store_claims(self) -> None:
+        # Eindreview 2026-11-12: bon van 300 dagen terug 3,49, aanbieding 2,49 van 2,79. De winkel zegt 11%, de bon zou 29% geven.
+        day: str = prices._days_ago(TODAY, 300)
+        self.ah_receipt("R1", f"{day}T10:00:00", (1, "AH PINDAKAAS", 1, 3.49, 3.49))
+        self.ah_article(1, 1, "AH Pindakaas")  # de koppeling van AH op het artikelnummer: alleen die telt (CONFIRMED_LINKS)
+        found: dict = (await self.annotate(deal("1", "AH Pindakaas", 2.49, 2.79, "nu 2,49")))["1"]
+        self.assertEqual((found["verdict"]["kind"], found["verdict"]["percent"], found["verdict"]["lowestRegular"]), ("small", 11, 2.79))
+        self.assertEqual((found["badge"]["percent"], found["badge"]["source"], found["badge"]["inflated"]), (11, "store", False))
+        self.assertEqual(found["badge"]["known"], {"price": 3.49, "day": day, "source": "receipt", "judged": True, "fresh": False})
+
+    async def test_a_fresh_measurement_never_gives_more_than_the_store_claims(self) -> None:
+        # Eindreview 2026-11-12: gemeten 2,99 op 25 dagen terug, aanbieding 1,99 van 2,49: 20% (van 2,49), niet 33% (van 2,99).
+        day: str = prices._days_ago(TODAY, 25)
+        await self.observe(day, "1", "AH Penne", 2.99)
+        found: dict = (await self.annotate(deal("1", "AH Penne", 1.99, 2.49, "nu 1,99")))["1"]
+        self.assertEqual((found["verdict"]["kind"], found["verdict"]["percent"], found["verdict"]["lowestRegular"]), ("good", 20, 2.49))
+        self.assertEqual((found["badge"]["percent"], found["badge"]["source"]), (20, "store"))
+        self.assertEqual(found["badge"]["known"], {"price": 2.99, "day": day, "source": "search", "judged": True, "fresh": True})
+
+    async def test_an_equal_from_price_keeps_the_chosen_source(self) -> None:
+        await self.observe("2026-10-10", "1", "AH Penne", 1.19)
+        found: dict = (await self.annotate(deal("1", "AH Penne", 0.89, 1.19, "nu 0,89")))["1"]
+        self.assertEqual((found["badge"]["source"], found["verdict"]["regular"]["source"]), ("history", "search"))
+        self.assertNotIn("known", found["badge"])
+
+    async def test_the_from_price_of_an_offer_that_ended_ten_days_ago_is_fresh(self) -> None:
+        # Eindreview 2026-11-12: van-prijs 2,49 van een aanbieding die tien dagen terug eindigde, gisteren 2,79 gemeten, aanbieding
+        # 1,99 van 2,79. De laagste van 30 dagen is 2,49: `dated` (een van-prijs), maar `fresh`, dus de tekst met de 30 dagen.
+        await self.sync_offer(
+            "2026-10-04T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.49, "nu 1,99", validFrom="2026-10-04", validUntil="2026-10-10")
+        )
+        await self.sync_offer("2026-10-11T05:00:00+00:00")
+        await self.observe("2026-10-19", "1", "AH Pindakaas", 2.79)
+        found: dict = (await self.annotate(deal("1", "AH Pindakaas", 1.99, 2.79, "nu 1,99")))["1"]
+        self.assertEqual(found["badge"]["source"], "dated")
+        self.assertEqual(found["badge"]["regular"], {"price": 2.49, "day": "2026-10-10", "source": "offer", "judged": True, "fresh": True})
+        self.assertEqual((found["verdict"]["percent"], found["verdict"]["inflated"]), (20, True))
+
+    async def test_from_price_of_an_earlier_offer_counts(self) -> None:
+        await self.sync_offer(
+            "2026-09-01T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.49, "nu 1,99", validFrom="2026-09-01", validUntil="2026-09-07")
+        )
+        await self.sync_offer("2026-09-08T05:00:00+00:00")
+        found: dict = (await self.annotate(deal("1", "AH Pindakaas", 1.99, 2.99, "nu 1,99")))["1"]
+        self.assertEqual(found["badge"]["source"], "dated")
+        self.assertEqual(found["badge"]["regular"], {"price": 2.49, "day": "2026-09-07", "source": "offer", "judged": True, "fresh": False})
+        self.assertEqual(found["verdict"]["lowestRegular"], 2.49)
+
+    async def test_a_name_linked_receipt_is_no_source_for_the_verdict(self) -> None:
+        # Eindreview 2026-11-12, met het antwoord van de eigenaar: een bonregel die alleen op naam bij het product hoort ("AH
+        # RUNDERGEHAKT", zonder verpakking) kan de 300 g zijn. Hij telt niet voor het oordeel, wel in de prijsgeschiedenis.
+        await self.observe("2026-10-15", "500", "AH Rundergehakt", 4.49)
+        self.ah_receipt("R1", f"{prices._days_ago(TODAY, 10)}T10:00:00", (88888, "AH RUNDERGEHAKT", 1, 2.99, 2.99))
+        found: dict = (await self.annotate(deal("500", "AH Rundergehakt", 3.99, 4.49, "nu 3,99")))["500"]
+        self.assertEqual((found["verdict"]["kind"], found["verdict"]["percent"], found["verdict"]["lowestRegular"]), ("small", 11, 4.49))
+        self.assertIs(found["verdict"]["inflated"], False)
+        self.assertEqual((found["badge"]["source"], found["badge"]["regular"]["source"]), ("history", "search"))
+        rows: list = (await in_db(prices._connect, lambda conn: prices._receipt_rows(conn, "ah", TODAY)))[0]
+        self.assertEqual([(row["product_id"], row["linked_by"]) for row in rows], [("500", "name")], "de prijsgeschiedenis houdt de regel")
+
+    async def test_a_receipt_whose_article_number_equals_a_product_id_is_no_source(self) -> None:
+        # Herreview 2026-11-12 (N1): het nummer op een AH-bon is AH's artikelnummer, niet het id van de webwinkel. Dat 123456 ook het
+        # id van "AH Kip tandoori" is en de namen een woord delen ("KIPFILET" begint met "Kip") is toeval, geen bevestigde koppeling.
+        await self.observe("2026-10-15", "123456", "AH Kip tandoori", 4.49)
+        self.ah_receipt("R1", f"{prices._days_ago(TODAY, 10)}T10:00:00", (123456, "AH KIPFILET", 1, 2.99, 2.99))
+        found: dict = (await self.annotate(deal("123456", "AH Kip tandoori", 3.99, 4.49, "nu 3,99")))["123456"]
+        self.assertEqual((found["verdict"]["kind"], found["verdict"]["percent"], found["verdict"]["lowestRegular"]), ("small", 11, 4.49))
+        self.assertIs(found["verdict"]["inflated"], False)
+        self.assertEqual((found["badge"]["source"], found["badge"]["regular"]["source"]), ("history", "search"))
+        rows: list = (await in_db(prices._connect, lambda conn: prices._receipt_rows(conn, "ah", TODAY)))[0]
+        self.assertEqual([(row["product_id"], row["linked_by"]) for row in rows], [("123456", "id")], "de prijsgeschiedenis houdt de regel")
+
+    async def test_a_receipt_with_a_confirmed_link_is_a_source_for_the_verdict(self) -> None:
+        # Je eigen koppeling en de koppeling van AH op het artikelnummer zijn bevestigd: dan telt de bon wel.
+        await self.observe("2026-10-15", "500", "AH Rundergehakt", 4.49)
+        self.ah_receipt("R1", f"{prices._days_ago(TODAY, 10)}T10:00:00", (88888, "AH RUNDERGEHAKT", 1, 2.99, 2.99))
+        for how in ("article", "own"):  # eerst de koppeling van AH, dan je eigen erbij (die gaat voor)
+            with self.subTest(linked_by=how):
+                if how == "article":
+                    with closing(db(ah_orders)) as conn, conn:
+                        conn.execute(
+                            "INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (88888, 500, 'AH Rundergehakt', 'x')"
+                        )
+                else:
+                    await product_links.save(
+                        "ah", "AH RUNDERGEHAKT", {"productId": "500", "title": "AH Rundergehakt"}, article=88888, now=f"{TODAY}T00:00:00+00:00"
+                    )
+                rows: list = (await in_db(prices._connect, lambda conn: prices._receipt_rows(conn, "ah", TODAY)))[0]
+                self.assertEqual([(row["product_id"], row["linked_by"]) for row in rows], [("500", how)])
+                found: dict = (await self.annotate(deal("500", "AH Rundergehakt", 3.99, 4.49, "nu 3,99")))["500"]
+                self.assertEqual((found["verdict"]["kind"], found["verdict"]["inflated"], found["verdict"]["lowestRegular"]), ("none", True, 2.99))
+                self.assertEqual(found["badge"]["regular"]["source"], "receipt")
+
+    async def test_regular_older_than_a_year_is_shown_without_verdict(self) -> None:
+        # Een van-prijs van een periode van vier jaar terug, te oud voor een oordeel. Zonder van-prijs bij de aanbieding geen badge.
+        # Noemt de aanbieding er wel een (antwoord van de eigenaar, 2026-11-12), dan houdt de kaart de gestippelde badge van de winkel,
+        # met het oordeel uit die van-prijs zoals bij een product zonder bron, en blijft de te oude prijs in `regular` staan.
+        await self.sync_offer(
+            "2022-10-03T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.49, "nu 1,99", validFrom="2022-10-03", validUntil="2022-10-09")
+        )
+        await self.sync_offer("2022-10-10T05:00:00+00:00")
+        for before, kind in ((None, "unknown"), (2.99, "good")):
+            with self.subTest(priceBefore=before):
+                found: dict = (await self.annotate(deal("1", "AH Pindakaas", 1.99, before, "nu 1,99")))["1"]
+                self.assertEqual(found["verdict"]["kind"], kind)
+                self.assertEqual(
+                    found["verdict"]["regular"], {"price": 2.49, "day": "2022-10-09", "source": "offer", "judged": False, "fresh": False}
+                )
+                self.assertIs(found["verdict"]["inflated"], False)
+                self.assertIsNone(found["verdict"]["lowestRegular"])
+        self.assertIsNone((await self.annotate(deal("1", "AH Pindakaas", 1.99, None, "nu 1,99")))["1"]["badge"])
+        badge: dict = (await self.annotate(deal("1", "AH Pindakaas", 1.99, 2.99, "nu 1,99")))["1"]["badge"]
+        self.assertEqual(badge, {"percent": 33, "source": "store", "inflated": False, "claimed": 33})
+        # Dezelfde kaart als een product zonder enige bron: hetzelfde oordeel, dezelfde badge.
+        bare: dict = (await self.annotate(deal("9", "AH Nieuw", 1.99, 2.99, "nu 1,99")))["9"]
+        self.assertEqual((bare["verdict"]["kind"], bare["badge"]), ("good", badge))
+
+    async def test_a_fresh_regular_price_without_a_computable_offer_price_is_judged_but_unknown(self) -> None:
+        # Geen te berekenen actieprijs (een tekst zonder van-prijs): kind unknown met de verse gewone prijs, en die is wel `judged`.
+        await self.observe("2026-10-19", "1", "AH Penne", 1.19)
+        found: dict = (await self.annotate(deal("1", "AH Penne", None, None, "bonus")))["1"]
+        self.assertEqual(found["verdict"]["kind"], "unknown")
+        self.assertEqual(found["verdict"]["regular"], {"price": 1.19, "day": "2026-10-19", "source": "search", "judged": True, "fresh": True})
+        self.assertIsNone(found["badge"])
+
+    async def test_own_from_price_only_keeps_the_store_badge(self) -> None:
+        # De lopende aanbiedingen staan zelf in offer_history (een met einddatum, een zonder): hun van-prijs is geen bron.
+        await self.sync_offer(
+            "2026-10-19T05:00:00+00:00",
+            offer("1", "AH Rijst", 1.50, 2.00, "25% korting", validFrom="2026-10-19", validUntil="2026-10-25"),
+            offer("2", "AH Thee", 1.50, 2.00, "25% korting"),
+        )
+        found: dict = await self.annotate(deal("1", "AH Rijst", 1.50, 2.00, "25% korting"), deal("2", "AH Thee", 1.50, 2.00, "25% korting"))
+        for product_id in ("1", "2"):
+            self.assertEqual(found[product_id]["badge"], {"percent": 25, "source": "store", "claimed": 25, "inflated": False})
+            self.assertEqual((found[product_id]["verdict"]["regular"], found[product_id]["verdict"]["lowestRegular"]), (None, 2.00))
+
+    async def test_a_running_offer_that_changed_halfway_is_not_its_own_source(self) -> None:
+        # Zonder einddatum (Picnic, Crisp, de doorlopende bonus van AH) sluit een wijziging halverwege de eerste rij en opent een
+        # `continued` rij. De gesloten rij is dezelfde lopende aanbieding: haar van-prijs is nog steeds de claim van de winkel.
+        await self.sync_offer(
+            "2026-10-10T05:00:00+00:00", offer("1", "AH Thee", 1.50, 2.00, "25% korting"), offer("2", "AH Koffie", 1.50, 2.00, "25% korting")
+        )
+        await self.sync_offer(
+            "2026-10-15T05:00:00+00:00", offer("1", "AH Thee", 1.50, 2.00, "nu 1,50"), offer("2", "AH Koffie", 1.50, 2.20, "25% korting")
+        )
+        found: dict = await self.annotate(deal("1", "AH Thee", 1.50, 2.00, "nu 1,50"), deal("2", "AH Koffie", 1.50, 2.20, "25% korting"))
+        for product_id in ("1", "2"):  # 1: het label veranderde, 2: de van-prijs
+            with self.subTest(product_id=product_id):
+                self.assertEqual(found[product_id]["badge"]["source"], "store")
+                self.assertNotIn("regular", found[product_id]["badge"])
+                self.assertIsNone(found[product_id]["verdict"]["regular"])
+
+    async def test_fresh_search_keeps_history(self) -> None:
+        await self.observe("2026-10-19", "1", "AH Penne", 1.19)
+        found: dict = (await self.annotate(deal("1", "AH Penne", 0.89, 1.19, "nu 0,89")))["1"]
+        self.assertEqual(found["badge"]["source"], "history")
+        self.assertEqual(found["badge"]["regular"], {"price": 1.19, "day": "2026-10-19", "source": "search", "judged": True, "fresh": True})
+
+    async def test_a_bigger_pack_that_is_cheaper_per_kilo(self):
+        await self.observe("2026-10-15", "big", "AH Zalmfilet", 7.00, size="500 g")  # €14/kg
+        await self.observe("2026-10-15", "other", "Kerstmis Zalmfilet", 5.00, size="500 g", brand="Vishandel")  # ander merk: telt niet
+        verdict = (await self.annotate(deal("small", "AH Zalmfilet 2 stuks", 4.00, 4.50, "nu 4,00", size="250 g")))["small"]["verdict"]  # €16/kg
+        self.assertEqual(
+            verdict["cheaperPack"],
+            {
+                "productId": "big",
+                "title": "AH Zalmfilet",
+                "unitSize": "500 g",
+                "price": 7.0,
+                "unitPrice": {"value": 14.0, "unit": "kg"},
+                "onOffer": False,
+            },
+        )
+        cheap = (await self.annotate(deal("small", "AH Zalmfilet 2 stuks", 3.00, 4.50, "nu 3,00", size="250 g")))["small"]["verdict"]  # €12/kg
+        self.assertIsNone(cheap["cheaperPack"])
+
+    def test_a_failure_leaves_the_offers_as_they_were(self):
+        items = [deal("1", "AH Penne", 0.89, 1.19, "25% korting")]
+        with mock.patch.object(prices, "_connect", side_effect=OSError("kapot")), self.assertLogs(prices.log, "WARNING"):
+            self.assertIs(run(prices.annotate("ah", items, today=TODAY)), items)
+        self.assertNotIn("verdict", items[0])
+
+
+def line(product_id, price, bonus=0, before=None, quantity=1):
+    """Een regel van een AH-bestelling, zoals `ah_orders._save_order` die bewaart."""
+    return order_item(product_id, f"Product {product_id}", price, quantity=quantity, before=before, bonus=bool(bonus))
+
+
+async def store_order(order_id, delivery_date, items, kind="delivered"):
+    await in_db(ah_orders._connect, lambda conn: ah_orders._save_order(conn, {"id": order_id, "deliveryDate": delivery_date}, kind, items))
+
+
+class RegularPricesTest(PricesCase):
+    NOW = "2026-09-22T00:00:00+00:00"
+
+    async def observe(self, day, product_id, title, price, store="ah"):
+        await prices.record(
+            store, [{"id": product_id, "title": title, "price": price, "unitSize": "500 g", "brand": "AH"}], now=f"{day}T08:00:00+00:00"
+        )
+
+    def rows(self, sql):
+        with closing(db(ah_orders)) as conn:
+            return [dict(row) for row in conn.execute(sql)]
+
+    def checked(self, table="ah_order_items"):
+        return {str(row["product_id"]): row["regular_checked_at"] for row in self.rows(f"SELECT product_id, regular_checked_at FROM {table}")}
+
+    async def test_the_lowest_regular_price_of_the_30_days_before_the_purchase_day(self):
+        await self.observe("2026-09-01", "1", "AH Penne", 1.39)  # 20 dagen voor de aankoop
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        await self.observe("2026-07-01", "1", "AH Penne", 0.99)  # ouder dan 30 dagen: telt niet
+        self.assertEqual(await prices.regular_before("ah", ["1"], "2026-09-21"), {"1": 1.19})
+
+    async def test_a_measurement_older_than_30_days_still_gives_a_judged_regular_price(self):
+        await self.observe("2026-07-01", "1", "AH Penne", 0.99)  # 82 dagen ervoor: niet vers, wel binnen het jaar
+        self.assertEqual(await prices.regular_before("ah", ["1"], "2026-09-21"), {"1": 0.99})
+
+    async def test_an_earlier_order_and_the_price_before_of_an_offer_count_but_the_purchase_day_itself_does_not(self):
+        await store_order(1, "2026-09-05", [line("1", price=1.29)])  # een eerdere bestelling: de gewone prijs die je toen betaalde
+        await store_order(2, "2026-09-21", [line("2", price=0.50)])  # dezelfde dag: de aankoop zelf is geen gewone prijs ervoor
+        await self.sync_offer("2026-09-12T08:00:00+00:00", offer("3", "AH Kaas", price=2.0, before=2.49))
+        found = await prices.regular_before("ah", ["1", "2", "3"], "2026-09-21")
+        self.assertEqual(found, {"1": 1.29, "3": 2.49})
+
+    async def test_regular_before_uses_a_receipt_of_three_months_earlier(self) -> None:
+        self.ah_receipt("R1", "2026-06-21T10:00:00", (555, "PENNE", 1, 0.89, 0.89))
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (555, 1, 'AH Penne', 'x')")
+        found: dict[str, float] = await prices.regular_before("ah", ["1"], "2026-09-21")
+        self.assertEqual(found, {"1": 0.89})
+
+    async def test_regular_before_counts_a_receipt_only_with_a_confirmed_link(self) -> None:
+        # Antwoord van de eigenaar, 2026-11-12: dezelfde regel als bij het oordeel. Op naam ("AH PENNE" bij "AH Penne") telt een
+        # bonregel niet voor de gewone prijs van een aankoop, met je eigen koppeling wel.
+        await self.observe("2025-06-01", "1", "AH Penne", 1.19)  # ouder dan een jaar: alleen voor de naam
+        self.ah_receipt("R1", "2026-09-01T10:00:00", (88888, "AH PENNE", 1, 0.89, 0.89))
+        self.assertEqual(await prices.regular_before("ah", ["1"], "2026-09-21"), {})
+        await product_links.save("ah", "AH PENNE", {"productId": "1", "title": "AH Penne"}, article=88888, now=self.NOW)
+        self.assertEqual(await prices.regular_before("ah", ["1"], "2026-09-21"), {"1": 0.89})
+
+    async def test_regular_before_ignores_the_purchase_of_that_day(self) -> None:
+        await store_order(1, "2026-09-21", [line("1", price=0.50)])
+        self.assertEqual(await prices.regular_before("ah", ["1"], "2026-09-21"), {})
+
+    async def test_regular_before_ignores_a_price_of_two_years_earlier(self) -> None:
+        await self.observe("2024-09-01", "1", "AH Penne", 1.19)
+        self.assertEqual(await prices.regular_before("ah", ["1"], "2026-09-21"), {})
+
+    async def test_regular_before_counts_the_from_price_of_an_offer_running_on_the_purchase_day(self) -> None:
+        await self.sync_offer("2026-09-20T08:00:00+00:00", offer("3", "AH Kaas", price=2.0, before=2.49))
+        self.assertEqual(await prices.regular_before("ah", ["3"], "2026-09-21"), {"3": 2.49})
+
+    async def test_regular_points_give_search_order_and_offer_points(self) -> None:
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        await store_order(1, "2026-09-05", [line("2", price=1.29)])
+        await self.sync_offer("2026-09-12T08:00:00+00:00", offer("3", "AH Kaas", price=2.0, before=2.49))
+
+        async def points(conn):
+            return await prices._regular_points(conn, "ah", "2026-08-22", "2026-09-21", receipts=[])
+
+        found: dict = (await in_db(prices._connect, points))[0]
+        self.assertEqual(
+            {key: [(p[1], p[2]) for p in value] for key, value in found.items()},
+            {"1": [(1.19, "search")], "2": [(1.29, "order")], "3": [(2.49, "offer")]},
+        )
+
+    async def test_the_verdict_reads_only_the_search_prices_choose_can_pick(self) -> None:
+        # Taak 9d: het oordeel leest van tien jaar bewaarde prijzen alleen die van de laatste dertig dagen, en zonder die de nieuwste
+        # dag met een bruikbare prijs. Een prijs van nul op de nieuwste dag telt niet, zoals bij `_point`. De keuze blijft dezelfde.
+        # Vers is vanaf 2026-08-22 (dertig dagen voor 2026-09-21): die dag telt mee, de dag ervoor niet. Product 2 heeft een
+        # bestelling die nieuwer is dan zijn nieuwste bewaarde prijs: de bestelling blijft, en de bewaarde prijs van die dag ook.
+        for day, product_id, price in (
+            ("2026-05-01", "1", 1.09),
+            ("2026-09-01", "1", 1.19),
+            ("2026-09-15", "1", 1.29),
+            ("2026-09-18", "1", 1.25),
+            ("2026-03-01", "2", 2.49),
+            ("2026-04-01", "2", 2.59),
+            ("2026-04-02", "2", 2.69),
+            ("2026-08-21", "3", 1.39),
+            ("2026-08-22", "3", 1.49),
+            ("2026-09-10", "3", 1.59),
+        ):
+            await self.observe(day, product_id, "AH Penne", price)
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("UPDATE price_observations SET price = 0 WHERE product_id = '2' AND day = '2026-04-02'")
+        await store_order(1, "2026-05-01", [line("2", price=2.79)])
+        ids: list[str] = ["1", "2", "3", "4"]
+
+        async def full(conn):
+            return await prices._regular_points(conn, "ah", "2016-09-21", "2026-09-21", receipts=[], ids=ids)
+
+        async def choosable(conn):
+            return await prices._regular_points(conn, "ah", "2016-09-21", "2026-09-21", receipts=[], ids=ids, choosable=True)
+
+        everything, picked = await in_db(prices._connect, full, choosable)
+        self.assertEqual(
+            {key: sorted(tuple(p) for p in value) for key, value in picked.items()},
+            {
+                "1": [("2026-09-01", 1.19, "search"), ("2026-09-15", 1.29, "search"), ("2026-09-18", 1.25, "search")],
+                "2": [("2026-04-01", 2.59, "search"), ("2026-05-01", 2.79, "order")],
+                "3": [("2026-08-22", 1.49, "search"), ("2026-09-10", 1.59, "search")],
+            },
+        )
+        self.assertEqual(sum(len(value) for value in everything.values()), 10)
+        self.assertEqual(prices._regular_for_verdict(picked["3"], "2026-09-21").price, 1.49)  # de eerste verse dag is de laagste
+        self.assertEqual(prices._regular_for_verdict(picked["2"], "2026-09-21").source, "order")  # de nieuwste dag, uit een bestelling
+        for product_id in ids:
+            self.assertEqual(
+                prices._regular_for_verdict(picked.get(product_id, []), "2026-09-21"),
+                prices._regular_for_verdict(everything.get(product_id, []), "2026-09-21"),
+            )
+
+    def test_brands_behind_a_name_are_found_by_their_last_word(self) -> None:
+        # Taak 9d: `_known_pack_titles` zoekt de merken achter een naam op het laatste woord (`_by_last_word`). Een merk van meer
+        # woorden dat op het huismerk eindigt ("x ah" en "ah") geeft dezelfde kandidaten in dezelfde volgorde als `endswith` met elk merk.
+        suffixes: set[str] = {"x ah", "ah", "dr  oetker", "oetker", "x"}
+        by_last: dict[str, list[str]] = prices._by_last_word(suffixes)
+        self.assertEqual(sorted(by_last["ah"]), ["ah", "x ah"])
+        for name in ("melk x ah", "melk ah", "x ah", "kaas ah x ah", "pizza dr  oetker", "pizza oetker", "melk x", "melk", "", " ah"):
+            old: list[str] = [name[: -len(suffix) - 1] for suffix in suffixes if name.endswith(f" {suffix}")]
+            new: list[str] = [name[: -len(suffix) - 1] for suffix in by_last.get(name.rsplit(" ", 1)[-1], []) if name.endswith(f" {suffix}")]
+            self.assertEqual(new, old, name)
+        melk: str = "melk x ah"
+        self.assertEqual(sorted(melk[: -len(suffix) - 1] for suffix in by_last["ah"] if melk.endswith(f" {suffix}")), ["melk", "melk x"])
+
+    def test_known_pack_titles_strip_a_brand_of_two_words(self) -> None:
+        # Taak 9d: het merk "Boer AH" naast het huismerk "ah". De naam zelf gaat voor, en anders wordt "melk boer ah" zonder merk "melk", niet "melk boer".
+        catalogue: prices._Catalogue = prices._Catalogue(
+            [],
+            {"1": prices._known("", ["melk boer ah"], []), "2": prices._known("", ["kaas ah"], []), "3": prices._known("", ["brood"], [])},
+            None,
+            {},  # type: ignore[arg-type]
+        )
+        found: dict[str, str] = prices._known_pack_titles("ah", catalogue, [{"brand": "Boer AH"}], {"melk", "kaas", "melk boer ah"})
+        self.assertEqual(found, {"1": "melk boer ah", "2": "kaas"})
+        found = prices._known_pack_titles("ah", catalogue, [{"brand": "Boer AH"}], {"melk", "kaas"})
+        self.assertEqual(found, {"1": "melk", "2": "kaas"})
+
+    async def test_fill_keeps_a_stored_price_when_only_an_old_source_remains(self) -> None:
+        await store_order(1, "2026-09-21", [line("1", price=0.89)])
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("UPDATE ah_order_items SET regular_price = 2.29")
+        await self.sync_offer("2026-06-12T08:00:00+00:00", offer("1", "AH Penne", price=2.0, before=2.49))
+        await self.sync_offer("2026-06-13T08:00:00+00:00")  # de aanbieding is voorbij: de van-prijs is 100 dagen oud
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 1)
+        row: dict = self.rows("SELECT regular_price, regular_checked_at FROM ah_order_items")[0]
+        self.assertEqual((row["regular_price"], row["regular_checked_at"]), (2.29, self.NOW))
+
+    async def test_fill_keeps_a_stored_price_when_there_is_no_pick(self) -> None:
+        # Geen enkele bron: de bewaarde prijs blijft staan, de regel krijgt wel zijn moment.
+        await store_order(1, "2026-09-21", [line("1", price=0.89)])
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("UPDATE ah_order_items SET regular_price = 2.29")
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 1)
+        row: dict = self.rows("SELECT regular_price, regular_checked_at FROM ah_order_items")[0]
+        self.assertEqual((row["regular_price"], row["regular_checked_at"]), (2.29, self.NOW))
+
+    async def test_fill_builds_no_catalogue_when_no_line_needs_one(self) -> None:
+        # Eindreview 2026-11-12: het openen van een aankoop bouwde de catalogus, ook als er niets te vullen was.
+        with mock.patch.object(prices, "_catalogue", new_callable=mock.AsyncMock) as catalogue:
+            self.assertEqual(await prices.fill_regular_prices("ah", order_ids=[1], now=self.NOW), 0)
+            await store_order(1, "2026-09-21", [order_item(0, "Los product", 1.0)])  # zonder product van de webwinkel
+            self.assertEqual(await prices.fill_regular_prices("ah", order_ids=[1], now=self.NOW), 1)
+        catalogue.assert_not_awaited()
+        self.assertEqual(self.rows("SELECT regular_checked_at FROM ah_order_items")[0]["regular_checked_at"], self.NOW)
+
+    async def test_fill_stamps_nothing_when_the_catalogue_fails(self) -> None:
+        # Zonder catalogus ontbreken de bonnen en de ingelezen aankopen: een regel die dan wordt gestempeld komt nooit terug.
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        await store_order(1, "2026-09-21", [line("1", price=0.89)])
+        with (
+            mock.patch.object(prices, "_catalogue", new_callable=mock.AsyncMock, side_effect=RuntimeError("stuk")),
+            self.assertLogs(prices.log, "ERROR"),
+        ):
+            self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 0)
+        row: dict = self.rows("SELECT regular_price, regular_checked_at FROM ah_order_items")[0]
+        self.assertEqual((row["regular_price"], row["regular_checked_at"]), (None, None))
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 1)  # de volgende ronde vult hem alsnog
+        self.assertEqual(self.rows("SELECT regular_price FROM ah_order_items")[0]["regular_price"], 1.19)
+
+    async def test_fill_gives_an_unpriced_line_an_old_judged_price(self) -> None:
+        await self.observe("2026-07-01", "1", "AH Penne", 0.99)
+        await store_order(1, "2026-09-21", [line("1", price=0.89)])
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 1)
+        self.assertEqual(self.rows("SELECT regular_price FROM ah_order_items")[0]["regular_price"], 0.99)
+
+    async def test_fill_overwrites_a_stored_price_with_a_fresh_one(self) -> None:
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        await store_order(1, "2026-09-21", [line("1", price=0.89)])
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("UPDATE ah_order_items SET regular_price = 2.29")
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 1)
+        self.assertEqual(self.rows("SELECT regular_price FROM ah_order_items")[0]["regular_price"], 1.19)
+
+    async def test_fill_writes_the_column_and_marks_lines_without_a_price_as_checked(self):
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        await store_order(order_id=1, delivery_date="2026-09-21", items=[line("1", price=0.89, bonus=1, before=1.39), line("2", price=2.0)])
+        self.assertEqual(await prices.fill_regular_prices("ah", now="2026-09-22T00:00:00+00:00"), 2)
+        # het id staat als getal in ah_order_items, vandaar str()
+        rows = {str(r["product_id"]): r for r in self.rows("SELECT product_id, regular_price, regular_checked_at FROM ah_order_items")}
+        self.assertEqual(rows["1"]["regular_price"], 1.19)
+        self.assertIsNone(rows["2"]["regular_price"])
+        self.assertTrue(rows["2"]["regular_checked_at"])
+
+    async def test_a_receipt_line_gets_the_regular_price_of_its_linked_webshop_product(self):
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        self.ah_receipt("R1", "2026-09-21T10:00:00", (555, "PENNE", 1, 0.89, 0.89), (777, "ONBEKEND", 1, 2.0, 2.0))
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (555, 1, 'AH Penne', 'x')")
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 2)
+        rows = {r["name"]: r for r in self.rows("SELECT name, regular_price, regular_checked_at FROM ah_receipt_items")}
+        self.assertEqual(rows["PENNE"]["regular_price"], 1.19)
+        self.assertIsNone(rows["ONBEKEND"]["regular_price"])
+        self.assertTrue(rows["ONBEKEND"]["regular_checked_at"])
+
+    async def test_a_receipt_line_you_linked_yourself_gets_the_regular_price_of_that_product(self):
+        # De automatische koppeling zegt product 2, jij koppelde de regel aan product 1 (#238): je eigen koppeling gaat voor.
+        await self.observe("2026-09-10", "1", "AH Penne", 1.19)
+        await self.observe("2026-09-10", "2", "AH Spaghetti", 2.49)
+        self.ah_receipt("R1", "2026-09-21T10:00:00", (555, "PENNE", 1, 0.89, 0.89), (777, "FUSILLI", 1, 0.99, 0.99))
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("INSERT INTO ah_receipt_products (receipt_product_id, product_id, title, checked_at) VALUES (555, 2, 'AH Spaghetti', 'x')")
+        await product_links.save("ah", "PENNE", {"productId": "1", "title": "AH Penne"}, article=555, now=self.NOW)
+        await product_links.save("ah", "FUSILLI", {"productId": "1", "title": "AH Penne"}, now=self.NOW)  # op naam, de regel heeft geen koppeling
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 2)
+        rows = {r["name"]: r["regular_price"] for r in self.rows("SELECT name, regular_price FROM ah_receipt_items")}
+        self.assertEqual(rows, {"PENNE": 1.19, "FUSILLI": 1.19})
+
+    async def test_a_jumbo_order_line_gets_its_regular_price(self):
+        from mealieshopper import jumbo_orders
+
+        await self.observe("2026-09-10", "J1", "Jumbo Penne", 1.09, store="jumbo")
+        await in_db(
+            jumbo_orders._connect,
+            lambda conn: jumbo_orders._save_order(
+                conn, {"id": "J-1", "deliveryDate": "2026-09-21"}, [{"productId": "J1", "title": "Jumbo Penne", "quantity": 1, "price": 0.79}]
+            ),
+        )
+        self.assertEqual(await prices.fill_regular_prices("jumbo", now=self.NOW), 1)
+        self.assertEqual(self.rows("SELECT regular_price FROM jumbo_order_items")[0]["regular_price"], 1.09)
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 0)  # AH heeft hier niets: de jumbo-regels tellen niet mee
+
+    async def test_a_second_fill_only_refreshes_recent_purchases_checked_more_than_a_day_ago(self):
+        await store_order(1, "2026-09-21", [line("1", price=1.0)])
+        await store_order(2, "2026-01-10", [line("2", price=1.0)])  # ouder dan 60 dagen
+        self.assertEqual(await prices.fill_regular_prices("ah", now=self.NOW), 2)
+        self.assertEqual(await prices.fill_regular_prices("ah", now="2026-09-22T12:00:00+00:00"), 0)  # nog geen dag geleden
+        await self.observe("2026-09-15", "1", "AH Penne", 1.19)  # een meting die later binnenkwam
+        self.assertEqual(await prices.fill_regular_prices("ah", now="2026-09-24T00:00:00+00:00"), 1)
+        self.assertEqual(self.rows("SELECT regular_price FROM ah_order_items WHERE order_id = 1")[0]["regular_price"], 1.19)
+        self.assertEqual(self.checked()["2"], self.NOW)  # de oude bestelling blijft zoals hij was
+
+    async def test_the_limit_takes_the_newest_purchases_first(self):
+        await store_order(1, "2026-09-01", [line("1", price=1.0)])
+        await store_order(2, "2026-09-20", [line("2", price=1.0)])
+        self.assertEqual(await prices.fill_regular_prices("ah", limit=1, now=self.NOW), 1)
+        self.assertEqual(self.checked(), {"1": None, "2": self.NOW})
+
+    async def test_given_purchases_only_their_lines_are_filled_whatever_their_age(self):
+        await store_order(1, "2025-01-10", [line("1", price=1.0)])  # oud, maar gevraagd: wordt gevuld
+        await store_order(2, "2026-09-20", [line("2", price=1.0)])
+        self.ah_receipt("R1", "2026-09-21T10:00:00", (555, "PENNE", 1, 0.89, 0.89))
+        self.assertEqual(await prices.fill_regular_prices("ah", order_ids=[1], now=self.NOW), 1)
+        self.assertEqual(self.checked(), {"1": self.NOW, "2": None})
+        self.assertIsNone(self.rows("SELECT regular_checked_at FROM ah_receipt_items")[0]["regular_checked_at"])
+        self.assertEqual(await prices.fill_regular_prices("ah", order_ids=[], receipt_ids=["R1"], limit=0, now=self.NOW), 1)
+        self.assertEqual(self.rows("SELECT regular_checked_at FROM ah_receipt_items")[0]["regular_checked_at"], self.NOW)
+        self.assertEqual(await prices.fill_regular_prices("ah", order_ids=[1], now=self.NOW), 0)  # net bepaald: niet opnieuw
+
+    async def test_the_nightly_round_reports_lines_and_stays_quiet_without_work(self):
+        self.assertIsNone(await prices.fill_regular_prices_nightly())
+        await store_order(1, "2026-09-21", [line("1", price=1.0)])
+        self.assertEqual(await prices.fill_regular_prices_nightly(), {"lines": 1})
+        with (
+            mock.patch.object(prices, "fill_regular_prices", new_callable=mock.AsyncMock, side_effect=RuntimeError("kapot")),
+            self.assertLogs("mealieshopper.prices", "ERROR"),
+        ):
+            self.assertIsNone(await prices.fill_regular_prices_nightly())
+
+
+class OffersRouteVerdictTest(PricesCase):
+    async def test_the_offers_carry_a_verdict_and_a_new_price_refreshes_the_cache(self):
+        await self.sync_offer("2026-11-02T05:00:00+00:00", offer("1", "AH Penne", 0.89, 1.19, "25% korting", unitSize="500 g"))
+        client = self.client_for(create_app())
+        first = await client.get("/api/offers?store=ah")
+        item = first.get_json()["offers"][0]
+        self.assertEqual((item["verdict"]["kind"], item["unitPricePer"]["unit"]), ("good", "kg"))
+        self.assertEqual((await client.get("/api/offers?store=ah", headers={"If-None-Match": first.headers["ETag"]})).status_code, 304)
+        await prices.record("ah", [{"id": "9", "title": "AH Spaghetti", "price": 1.0}])
+        self.assertEqual((await client.get("/api/offers?store=ah", headers={"If-None-Match": first.headers["ETag"]})).status_code, 200)
+
+
+class CompareTest(PricesCase):
+    def found(self):
+        return [
+            {"webshopId": "1", "title": "AH Penne", "price": {"now": 1.19}, "unitSize": "500 g", "brand": "AH", "isBonus": False},
+            {"webshopId": "2", "title": "AH Penne voordeelverpakking", "price": {"now": 1.99}, "unitSize": "1 kg", "brand": "AH", "isBonus": False},
+            {"webshopId": "3", "title": "Barilla Penne Rigate", "price": {"now": 1.69}, "unitSize": "500 g", "brand": "Barilla", "isBonus": False},
+            {"webshopId": "4", "title": "AH Pastasaus", "price": {"now": 1.49}, "unitSize": "500 ml", "brand": "AH", "isBonus": False},
+            {
+                "webshopId": "5",
+                "title": "De Cecco Penne",
+                "price": {"now": 3.0},
+                "unitSize": "500 g",
+                "brand": "De Cecco",
+                "isBonus": True,
+                "promo": {"label": "2e halve prijs", "priceBefore": 3.0},
+            },
+        ]
+
+    async def test_pack_sizes_side_by_side_cheapest_first(self):
+        await self.sync_offer("2026-11-02T05:00:00+00:00", offer("1", "AH Penne", 0.89, 1.19, "25% korting", brand="AH", unitSize="500 g"))
+        with mock.patch.object(ah, "search_products", return_value=self.found()) as search:
+            data = await prices.compare("ah", "1")
+        search.assert_called_once_with("AH Penne", prices.COMPARE_LIMIT)
+        self.assertEqual((data["unit"], data["product"]["price"], data["product"]["unitPrice"]), ("kg", 0.89, {"value": 1.78, "unit": "kg"}))
+        rows = [(c["id"], c["unitPrice"]["value"], c["self"], c["same"], c["cheaper"]) for c in data["candidates"]]
+        self.assertEqual(
+            rows,
+            [
+                ("1", 1.78, True, True, False),  # de actieprijs van het gekozen product, niet de gewone prijs uit de zoekopdracht
+                ("2", 1.99, False, True, False),
+                ("3", 3.38, False, False, False),
+                ("5", 4.5, False, False, False),  # 2e halve prijs: €2,25 per stuk
+            ],
+        )
+        self.assertEqual([c["rank"] for c in data["candidates"]], [0, 0.33, 0.67, 1])
+        self.assertEqual((await prices.history("ah", "voordeelverpakking"))["products"][0]["regularPrice"], 1.99)  # de zoekopdracht is bewaard
+
+    def test_another_variant_is_not_the_same_product(self):
+        self.assertTrue(prices._same_product("ah penne", "AH Penne voordeelverpakking"))
+        self.assertFalse(prices._same_product("ah penne", "AH Biologisch Penne"))
+        self.assertFalse(prices._same_product("", "AH Penne"))
+
+    def test_a_cheaper_bigger_pack_is_marked(self):
+        run(prices.record("ah", [{"id": "1", "title": "AH Penne", "price": 1.19, "unitSize": "500 g", "brand": "AH"}]))
+        with mock.patch.object(ah, "search_products", return_value=self.found()):
+            data = run(prices.compare("ah", "1"))
+        self.assertEqual([c["id"] for c in data["candidates"] if c["cheaper"]], ["2"])  # €1,99/kg tegen €2,38/kg
+
+    async def test_one_plus_one_free_is_compared_per_item(self):
+        await self.sync_offer("2026-11-02T05:00:00+00:00", offer("1", "AH Rundergehakt", 3.49, None, "1+1 gratis", brand="AH", unitSize="300 g"))
+        with mock.patch.object(ah, "search_products", return_value=[]):
+            data = await prices.compare("ah", "1")
+        self.assertEqual((data["product"]["price"], data["product"]["unitPrice"]), (1.75, {"value": 5.83, "unit": "kg"}))
+
+    def test_same_kind_and_same_brand_for_the_filters(self):
+        run(prices.record("ah", [{"id": "1", "title": "AH Rundergehakt", "price": 3.49, "unitSize": "300 g", "brand": "AH"}]))
+        found = [
+            {"webshopId": "1", "title": "AH Rundergehakt", "price": {"now": 3.49}, "unitSize": "300 g", "brand": "AH", "isBonus": False},
+            {"webshopId": "2", "title": "AH Rundergehakt", "price": {"now": 9.99}, "unitSize": "1000 g", "brand": "AH", "isBonus": False},
+            {"webshopId": "3", "title": "AH Biologisch rundergehakt", "price": {"now": 4.99}, "unitSize": "300 g", "brand": "AH", "isBonus": False},
+            {
+                "webshopId": "4",
+                "title": "Slagerij Rundergehakt mager",
+                "price": {"now": 5.49},
+                "unitSize": "500 g",
+                "brand": "Slagerij",
+                "isBonus": True,
+                "promo": {"label": "25% korting", "priceBefore": 5.49},
+            },
+            {"webshopId": "5", "title": "AH Hamburgers", "price": {"now": 3.99}, "unitSize": "400 g", "brand": "AH", "isBonus": False},
+            {"webshopId": "6", "title": "AH Half-om-half gehakt", "price": {"now": 2.99}, "unitSize": "500 g", "brand": "AH", "isBonus": False},
+        ]
+        with mock.patch.object(ah, "search_products", return_value=found) as search:
+            data = run(prices.compare("ah", "1"))
+        search.assert_called_once_with("AH Rundergehakt", 30)  # genoeg resultaten voor de grote verpakking
+        self.assertEqual(data["kind"], "rundergehakt")
+        flags = {c["id"]: (c["sameKind"], c["sameBrand"], c["onOffer"]) for c in data["candidates"]}
+        self.assertEqual(
+            flags,
+            {
+                "1": (True, True, False),
+                "2": (True, True, False),
+                "3": (True, True, False),
+                "4": (True, False, True),
+                "5": (False, True, False),
+                "6": (False, True, False),
+            },
+        )
+
+    async def test_the_route_refuses_an_unknown_product(self):
+        client = self.client_for(create_app())
+        self.assertEqual((await client.get("/api/prices/compare?store=ah&id=404")).status_code, 400)
+        self.assertEqual((await client.get("/api/prices/compare?store=nope&id=1")).status_code, 400)
+
+    async def test_lidl_and_aldi_cannot_be_searched(self):
+        """Lidl en Aldi hebben geen webwinkel: vergelijken en koppelen zoeken bij de winkel, dus dat kan daar niet (400, geen verzoek)."""
+        with served(side_effect=AssertionError("geen verzoek naar buiten")):
+            for store in ("lidl", "aldi"):
+                with self.assertRaises(ValueError) as caught:
+                    await prices.compare(store, "1")
+                self.assertIn("alleen", str(caught.exception))
+                with self.assertRaises(ValueError):
+                    await prices.link_candidates(store, "melk")
+            client = self.client_for(create_app())
+            reply = await client.get("/api/prices/compare?store=lidl&id=1")
+            self.assertEqual(reply.status_code, 400)
+            self.assertIn("Lidl", reply.get_json()["error"])
+            reply = await client.get("/api/product-links/search?store=aldi&q=melk")
+            self.assertEqual(reply.status_code, 400)
+            self.assertIn("Aldi", reply.get_json()["error"])
+
+
+def ah_found(pid, title, price, size, brand="AH", bonus=None):
+    item = {"webshopId": pid, "title": title, "price": {"now": price}, "unitSize": size, "brand": brand, "images": [], "isBonus": bool(bonus)}
+    if bonus:
+        item["promo"] = bonus
+    return item
+
+
+class CheckListTest(PricesCase):
+    """De vergelijking in de controlelijst van het weekmenu: alleen zelfde product of goedkoper per eenheid (#178)."""
+
+    def found(self):
+        return [
+            ah_found("300", "AH Rundergehakt", 3.79, "300 g", bonus={"label": "voor 3.79", "priceBefore": 4.29}),  # €12,63/kg
+            ah_found("bio", "AH Biologisch Rundergehakt", 4.99, "250 g"),  # €19,96/kg: zelfde soort, maar niet goedkoper
+            ah_found("500", "AH Rundergehakt", 5.35, "500 g"),  # €10,70/kg: zelfde product en goedkoper
+            ah_found("175", "AH Rundergehakt", 2.99, "175 g"),  # €17,09/kg: zelfde product, duurder
+            ah_found("green", "AH Greenfields Rundergehakt", 5.99, "300 g"),  # €19,97/kg
+            ah_found("mix", "AH Gemengd gehakt", 8.99, "1 kg"),  # €8,99/kg: goedkoper, maar geen rundergehakt
+            ah_found("mager", "AH Mager rundergehakt", 6.79, "500 g"),  # €13,58/kg: duurder, geen zelfde product
+            ah_found("minder", "AH Rundergehakt minder vet", 3.69, "300 g"),  # €12,30/kg: goedkoper per kg, zelfde soort
+        ]
+
+    async def preview(self, compare, quantity=500, unit="g"):
+        body = {"items": [{"query": "rundergehakt", "quantity": quantity, "unit": unit}]}
+        if compare:
+            body["compare"] = True
+        with mock.patch.object(ah, "search_products", side_effect=lambda query, limit: self.found()[:limit]) as search:
+            reply = await self.client_for(create_app()).post("/api/ah/cart/preview", json=body)
+        self.assertEqual(reply.status_code, 200)
+        return reply.get_json()["items"][0]["candidates"], search
+
+    async def test_the_week_menu_shows_only_the_same_product_or_cheaper_per_unit(self):
+        candidates, search = await self.preview(compare=True)
+        search.assert_called_once_with("rundergehakt", prices.COMPARE_LIMIT)
+        rows = [(c["productId"], c["unitPrice"]["value"], c.get("same", False), c.get("cheaper", False)) for c in candidates]
+        self.assertEqual(
+            rows,
+            [
+                ("300", 12.63, False, False),  # het voorgestelde product blijft bovenaan
+                ("500", 10.7, True, True),
+                ("minder", 12.3, False, True),
+                ("175", 17.09, True, False),
+            ],
+        )
+        self.assertTrue(candidates[0]["suggested"])
+        self.assertEqual([c["packs"] for c in candidates][:2], [2, 1])  # 500 g: twee keer 300 g of één keer 500 g
+
+    async def test_searching_yourself_shows_the_first_five_as_before(self):
+        candidates, search = await self.preview(compare=False)
+        search.assert_called_once_with("rundergehakt", 5)
+        self.assertEqual([c["productId"] for c in candidates], ["300", "bio", "500", "175", "green"])
+        self.assertEqual(candidates[1]["unitPrice"], {"value": 19.96, "unit": "kg"})  # de prijs per eenheid staat er wel bij
+        self.assertNotIn("same", candidates[1])
+
+    async def test_one_plus_one_counts_per_item_in_the_check_list(self):
+        one_plus_one = {"label": "1+1 gratis", "mechanism": "1+1 gratis"}  # AH geeft de gewone prijs en geen prijs ervoor
+        self.assertEqual(prices.per_item_price({"price": 3.49, "deal": {"label": "1+1 gratis", "unitPrice": None, "validity": "valid"}}), 1.75)
+        self.assertEqual(prices.per_item_price({"price": 3.49, "deal": {"label": "1+1 gratis", "unitPrice": None, "validity": "expired"}}), 3.49)
+        self.assertEqual(prices.per_item_price({"price": 3.49}), 3.49)
+        found = [ah_found("300", "AH Rundergehakt", 3.49, "300 g", bonus=one_plus_one), ah_found("1000", "AH Rundergehakt", 9.99, "1000 g")]
+        with mock.patch.object(ah, "search_products", return_value=found):
+            reply = await self.client_for(create_app()).post("/api/ah/cart/preview", json={"compare": True, "items": [{"query": "rundergehakt"}]})
+        candidates = reply.get_json()["items"][0]["candidates"]
+        self.assertEqual([(c["productId"], c["unitPrice"]["value"]) for c in candidates], [("300", 5.83), ("1000", 9.99)])  # zelfde product
+        self.assertFalse(candidates[1]["cheaper"])
+
+    def test_without_a_pack_size_only_the_same_product_is_added(self):
+        found = [
+            ah_found("a", "AH Basilicum", 1.29, ""),
+            ah_found("b", "AH Basilicum", 2.49, "1 bos"),
+            ah_found("c", "AH Basilicum pesto", 2.0, "190 g"),
+        ]
+        result = prices.check_list_candidates(
+            [{"productId": f["webshopId"], "title": f["title"], "brand": "AH", "unitSize": f["unitSize"], "price": f["price"]["now"]} for f in found],
+            True,
+        )
+        self.assertEqual([c["productId"] for c in result], ["a", "b"])
+
+
+class OrganicTest(PricesCase):
+    """*Liever biologisch* (#218): de controlelijst van het weekmenu stelt eerst een biologisch product van dezelfde soort voor."""
+
+    REGULAR = [
+        ah_found("300", "AH Rundergehakt", 3.79, "300 g"),  # €12,63/kg: het gewone voorstel
+        ah_found("500", "AH Rundergehakt", 5.35, "500 g"),  # €10,70/kg
+        ah_found("ballen", "AH Biologisch Rundergehakt balletjes", 3.99, "200 g"),  # biologisch, maar balletjes
+        ah_found("bio", "AH Biologisch Rundergehakt", 4.99, "250 g", brand="AH Biologisch"),  # €19,96/kg
+        ah_found("gehakt", "AH Gemengd gehakt", 8.99, "1 kg"),
+    ]
+
+    async def preview(self, results, organic=True, compare=True):
+        body = {"compare": compare, "organic": organic, "items": [{"query": "rundergehakt", "quantity": 500, "unit": "g"}]}
+        calls = []
+
+        def search(query, limit):
+            calls.append((query, limit))
+            found = results.get(query)
+            if isinstance(found, Exception):
+                raise found
+            return list(found or [])[:limit]
+
+        with mock.patch.object(ah, "search_products", side_effect=search):
+            reply = await self.client_for(create_app()).post("/api/ah/cart/preview", json=body)
+        self.assertEqual(reply.status_code, 200)
+        return reply.get_json()["items"][0], calls
+
+    def test_what_counts_as_organic(self):
+        for product in (
+            {"title": "AH Spaghetti", "organic": True},  # AH's eigen kenmerk
+            {"title": "AH Biologisch Rundergehakt balletjes"},  # zonder kenmerk, maar met "Biologisch" in de naam
+            {"title": "Rundergehakt", "brand": "AH Biologisch"},
+            {"title": "Jumbo Biologische Halfvolle Melk 1L"},
+            {"title": "Bio yoghurt"},
+            {"title": "Organic Oat Drink"},
+        ):
+            self.assertTrue(prices.is_organic(product), product)
+        for product in ({"title": "AH Rundergehakt", "organic": False}, {"title": "Biografie"}, {"title": "Antibiotica"}, {}):
+            self.assertFalse(prices.is_organic(product), product)
+
+    def test_organic_is_not_part_of_the_kind(self):
+        self.assertEqual(prices._kind_words("AH Biologisch Rundergehakt 500g", "AH"), ["rundergehakt"])
+        self.assertEqual(prices._kind_words("Jumbo Biologische Halfvolle Melk 1L", None), ["halfvolle", "melk"])
+
+    async def test_the_organic_product_of_the_same_kind_comes_first(self):
+        row, calls = await self.preview({"rundergehakt": self.REGULAR})
+        self.assertEqual(calls, [("rundergehakt", prices.COMPARE_LIMIT)])  # het stond er al tussen: geen extra zoekopdracht
+        self.assertEqual(row["candidates"][0]["productId"], "bio")  # precies rundergehakt, niet de balletjes die eerder stonden
+        self.assertTrue(row["candidates"][0]["organic"] and row["candidates"][0]["suggested"])
+        self.assertEqual((row["organic"], row["organicMissing"]), (True, False))
+        regular = {c["productId"]: c for c in row["candidates"][1:]}
+        self.assertTrue(regular["300"]["cheaper"] and regular["500"]["cheaper"])  # zo zie je wat biologisch kost
+        self.assertFalse(regular["300"]["organic"])
+        self.assertNotIn("gehakt", regular)  # een andere soort blijft weg
+        self.assertEqual(row["candidates"][0]["packs"], 2)  # 500 g: twee keer 250 g
+
+    async def test_otherwise_one_extra_search_for_organic(self):
+        regular = [c for c in self.REGULAR if c["webshopId"] not in ("bio", "ballen")]
+        extra = [ah_found("gb", "AH Biologisch Gehaktballen", 4.49, "300 g"), ah_found("bio2", "AH Biologisch Rundergehakt", 5.49, "300 g")]
+        row, calls = await self.preview({"rundergehakt": regular, "biologisch rundergehakt": extra})
+        self.assertEqual(calls, [("rundergehakt", prices.COMPARE_LIMIT), ("biologisch rundergehakt", prices.COMPARE_LIMIT)])
+        self.assertEqual(row["candidates"][0]["productId"], "bio2")  # gehaktballen zijn een andere soort
+        self.assertFalse(row["organicMissing"])
+        self.assertIn("300", [c["productId"] for c in row["candidates"]])  # het gewone product blijft te kiezen
+
+    async def test_without_organic_the_regular_product_stays_with_a_note(self):
+        regular = [c for c in self.REGULAR if c["webshopId"] not in ("bio", "ballen")]
+        for extra in ([ah_found("gb", "AH Biologisch Gehaktballen", 4.49, "300 g")], RuntimeError("AH is even weg")):
+            row, calls = await self.preview({"rundergehakt": regular, "biologisch rundergehakt": extra})
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(row["candidates"][0]["productId"], "300")
+            self.assertTrue(row["organicMissing"])
+            self.assertNotIn("error", row)  # een mislukte extra zoekopdracht is geen fout van de regel
+
+    async def test_an_organic_suggestion_needs_no_extra_search(self):
+        spaghetti = [ah_found("1", "AH Biologisch Spaghetti", 1.99, "500 g", brand="AH Biologisch"), ah_found("2", "AH Spaghetti", 1.29, "500 g")]
+        body = {"compare": True, "organic": True, "items": [{"query": "spaghetti"}]}
+        with mock.patch.object(ah, "search_products", return_value=spaghetti) as search:
+            row = (await self.client_for(create_app()).post("/api/ah/cart/preview", json=body)).get_json()["items"][0]
+        search.assert_called_once()
+        self.assertEqual((row["candidates"][0]["productId"], row["organicMissing"]), ("1", False))
+
+    async def test_switched_off_or_searching_yourself_changes_nothing(self):
+        row, calls = await self.preview({"rundergehakt": self.REGULAR}, organic=False)
+        self.assertEqual((len(calls), row["candidates"][0]["productId"]), (1, "300"))
+        self.assertNotIn("organicMissing", row)
+        row, calls = await self.preview({"rundergehakt": self.REGULAR}, compare=False)
+        self.assertEqual([c["productId"] for c in row["candidates"]], ["300", "500", "ballen", "bio", "gehakt"])
+        self.assertEqual([c["organic"] for c in row["candidates"]], [False, False, True, True, False])  # wel het label
+        self.assertNotIn("organicMissing", row)
+
+
+def egg(pid, title, price, size, category="Zuivel, eieren", brand="AH"):
+    return {**ah_found(pid, title, price, size, brand=brand), "category": category}
+
+
+class IngredientKindTest(PricesCase):
+    """#223: de soort in de controlelijst komt uit het ingrediënt als het voorstel dat noemt, met bij AH dezelfde hoofdcategorie."""
+
+    async def preview(self, query, found, organic=False, quantity=None, unit=None):
+        body = {"compare": True, "organic": organic, "items": [{"query": query, "quantity": quantity, "unit": unit}]}
+        with mock.patch.object(ah, "search_products", side_effect=lambda q, limit: found if q == query else []):
+            reply = await self.client_for(create_app()).post("/api/ah/cart/preview", json=body)
+        self.assertEqual(reply.status_code, 200)
+        return reply.get_json()["items"][0]
+
+    EGGS = [
+        egg("uit", "AH Witte vrije uitloopeieren M", 1.99, "6 stuks"),  # €0,33 per ei: het voorstel
+        egg("koek", "AH Brabantse eierkoeken", 0.99, "4 stuks", category="Koek, snoep, chocolade"),  # €0,25 per stuk, maar geen ei
+        egg("mais", "Natuurfarm de Boed Maïs scharreleieren M L", 8.49, "30 stuks", brand="Natuurfarm"),  # €0,28 per ei
+        egg("bio", "AH Biologisch Eieren S M L", 4.59, "10 stuks", brand="AH Biologisch"),
+        egg("L", "AH Witte vrije uitloopeieren L", 2.29, "6 stuks"),  # dezelfde eieren in maat L
+    ]
+
+    async def test_cheaper_eggs_per_piece_come_under_the_suggestion(self):
+        row = await self.preview("eieren", self.EGGS, quantity=6, unit="stuks")
+        rows = {c["productId"]: (c.get("same"), c.get("cheaper")) for c in row["candidates"][1:]}
+        self.assertEqual(row["candidates"][0]["productId"], "uit")
+        self.assertEqual(rows, {"mais": (False, True), "L": (True, False)})  # eierkoeken zijn geen eieren; maat L is hetzelfde product
+
+    async def test_prefer_organic_finds_the_organic_eggs(self):
+        row = await self.preview("eieren", self.EGGS, organic=True)
+        self.assertEqual((row["candidates"][0]["productId"], row["organicMissing"]), ("bio", False))
+        self.assertIn("mais", [c["productId"] for c in row["candidates"]])  # goedkoper per ei, dus erbij
+
+    def test_egg_sizes_are_a_size_not_a_kind(self):
+        self.assertEqual(prices._kind_words("AH Witte vrije uitloopeieren M", "AH"), ["witte", "vrije", "uitloopeieren"])
+        self.assertTrue(prices._same_product(prices.base_title("AH Witte vrije uitloopeieren M"), "AH Witte vrije uitloopeieren L"))
+        self.assertEqual(prices._ingredient_kind({"title": "AH Witte vrije uitloopeieren M", "brand": "AH"}, "ei"), [("eieren", True)])
+
+    async def test_a_standalone_word_needs_a_standalone_word(self):
+        # "AH Halfvolle melk" noemt melk als los woord: karnemelk is dan geen melk, volle melk wel.
+        found = [egg("half", "AH Halfvolle melk", 1.79, "1,5 l"), egg("karne", "AH Karnemelk", 0.99, "1 l"), egg("vol", "AH Volle melk", 1.09, "1 l")]
+        row = await self.preview("melk", found)
+        self.assertEqual([c["productId"] for c in row["candidates"]], ["half", "vol"])
+
+    async def test_at_ah_the_main_category_has_to_match(self):
+        found = [
+            egg("gilse", "Van Gilse Fijne kristalsuiker", 2.79, "1 kg", category="Maaltijden, salades", brand="Van Gilse"),
+            egg("moes", "AH Appelmoes 0% suiker toegevoegd", 0.79, "355 g", category="Conserven, soepen, sauzen"),
+            egg("kristal", "Van Gilse Kristalsuiker", 1.99, "1 kg", category="Maaltijden, salades", brand="Van Gilse"),
+        ]
+        row = await self.preview("suiker", found)
+        self.assertEqual([c["productId"] for c in row["candidates"]], ["gilse", "kristal"])  # appelmoes noemt suiker, maar is het niet
+        for item in found:
+            item.pop("category")  # zonder categorie (Picnic, Jumbo, Crisp) telt alleen het ingrediënt
+        self.assertIn("moes", [c["productId"] for c in (await self.preview("suiker", found))["candidates"]])
+
+    async def test_minced_beef_keeps_its_kind(self):
+        # #178: bij rundergehakt geen gemengd gehakt, half-om-half of gehaktballen; #218: niet de biologische balletjes.
+        found = [
+            egg("rund", "AH Rundergehakt", 3.79, "300 g", category="Vlees"),
+            egg("hoh", "AH Half-om-half gehakt", 2.99, "500 g", category="Vlees"),
+            egg("ballen", "AH Rundergehaktballen", 2.49, "300 g", category="Vlees"),
+            egg("bal", "AH Biologisch Rundergehakt balletjes", 3.99, "200 g", category="Vlees", brand="AH Biologisch"),
+            egg("bio", "AH Biologisch Rundergehakt", 4.99, "250 g", category="Vlees", brand="AH Biologisch"),
+            egg("500", "AH Rundergehakt", 5.35, "500 g", category="Vlees"),
+        ]
+        row = await self.preview("rundergehakt", found)
+        self.assertEqual([c["productId"] for c in row["candidates"]], ["rund", "500"])
+        self.assertEqual((await self.preview("rundergehakt", found, organic=True))["candidates"][0]["productId"], "bio")
+
+    async def test_without_the_ingredient_in_the_name_the_suggestion_decides(self):
+        # "Milner Jong belegen" is kaas zonder "kaas" in de naam: dan geldt de soort van het voorstel, zoals voorheen.
+        found = [
+            egg("milner", "Milner Jong belegen 48+", 4.99, "400 g", category="Kaas", brand="Milner"),
+            egg("room", "AH Kruiden roomkaas", 1.29, "150 g", category="Kaas"),
+            egg("blok", "Milner Jong belegen 48+", 8.99, "800 g", category="Kaas", brand="Milner"),
+        ]
+        self.assertIsNone(prices._ingredient_kind({"title": "Milner Jong belegen 48+", "brand": "Milner"}, "kaas"))
+        row = await self.preview("kaas", found)
+        self.assertEqual([c["productId"] for c in row["candidates"]], ["milner", "blok"])
+
+
+class CatalogueTest(PricesCase):
+    """De catalogus (`prices._catalogue`): de gekoppelde bonregels en de namen van alle producten blijven bewaard tot een tabel
+    eronder verandert, door welke verbinding ook. Triggers op die tabellen hogen de versie op."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        legacy: Any = mock.patch.dict(os.environ, {"MEALIESHOPPER_SHARED_PRICES": "false"})
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
+    async def observe(self, day, product_id, title, price):
+        await prices.record(
+            "ah", [{"id": product_id, "title": title, "price": price, "unitSize": "500 g", "brand": "AH"}], now=f"{day}T08:00:00+00:00"
+        )
+
+    async def found(self, query):
+        return [p["productId"] for p in (await self.history(query=query))["products"]]
+
+    async def test_the_catalogue_is_kept_until_a_table_under_it_changes(self):
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        with mock.patch.object(prices, "_known_products", wraps=prices._known_products) as built:
+            self.assertEqual(await self.found("pindakaas"), ["1"])
+            self.assertEqual(built.call_count, 0, "niets veranderd: de bewaarde catalogus")
+            # Een andere verbinding, direct in SQLite: de trigger ziet het toch.
+            with closing(db(price_import)) as conn, conn:
+                conn.execute(
+                    "INSERT INTO imported_purchases (store, order_ref, position, day, title, quantity, paid, regular, order_total, imported_at) "
+                    "VALUES ('ah', 'M1', 0, '2026-07-15', 'AH Hagelslag', 1, 1.99, NULL, 1.99, 'x')"
+                )
+            self.assertEqual(await self.found("hagelslag"), ["import:ah hagelslag"])
+            self.assertEqual(built.call_count, 1)
+            with closing(db(price_import)) as conn, conn:
+                conn.execute("UPDATE imported_purchases SET title = 'AH Hagelslag puur' WHERE order_ref = 'M1'")
+            self.assertEqual(await self.found("puur"), ["import:ah hagelslag puur"], "ook een wijziging op zijn plek")
+            with closing(db(price_import)) as conn, conn:
+                conn.execute("DELETE FROM imported_purchases")
+            self.assertEqual(await self.found("hagelslag"), [])
+            self.assertEqual(built.call_count, 3)
+            # Een nieuwe dag bouwt hem ook opnieuw (wat "vandaag" is, telt mee in de bonregels).
+            await prices.history("ah", "pindakaas", 50, today="2026-10-21")
+            self.assertEqual(built.call_count, 4)
+
+    async def test_a_table_created_later_gets_its_triggers_and_counts(self):
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        with closing(db(ah_orders)) as conn, conn:
+            for op in ("insert", "update", "delete"):
+                conn.execute(f"DROP TRIGGER IF EXISTS catalogue_store_ah_receipt_items_{op}")
+        # Zonder triggers op de bonregels: de volgende aanvraag maakt ze aan en bouwt de catalogus opnieuw.
+        self.ah_receipt("R1", "2026-06-10T10:00:00", (1, "AH PINDAKAAS", 2, 2.79, 5.58))
+        product = next(p for p in (await self.history(query="pindakaas"))["products"] if p["productId"] == "1")
+        self.assertEqual([purchase["source"] for purchase in product["purchases"]], ["receipt"])
+        with closing(db(ah_orders)) as conn:
+            names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'catalogue%'")}
+        self.assertLessEqual({f"catalogue_store_ah_receipt_items_{op}" for op in ("insert", "update", "delete")}, names)
+        self.assertEqual(
+            prices.CATALOGUE_TABLES
+            - {"crisp_order_items", "crisp_orders", "jumbo_order_items", "jumbo_orders", "picnic_order_items", "picnic_orders"},
+            {
+                "offer_history",
+                "offers",
+                "price_observations",
+                "imported_purchases",
+                "ah_receipts",
+                "ah_receipt_items",
+                "ah_receipt_products",
+                "product_links",
+                "shared_link_rejections",
+                "ah_orders",
+                "ah_order_items",
+            },
+        )
+
+    async def test_a_new_database_does_not_reuse_a_version_from_the_cache(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        with closing(db(price_import)) as conn, conn:
+            token: str
+            products: int
+            token, products = conn.execute("SELECT token, products FROM catalogue_versions WHERE store = 'ah'").fetchone()
+            # Een teruggezette of nieuwe database met dezelfde versie: alleen het token verschilt, dus geen oude catalogus.
+            conn.execute("DELETE FROM price_observations")  # met de trigger: `products` gaat omhoog
+            conn.execute("UPDATE catalogue_versions SET token = 'anders', products = ? WHERE store = 'ah'", (products,))
+        self.assertEqual(await self.found("pindakaas"), [])
+        self.assertEqual(len(token), 16)
+
+    async def test_an_ah_article_link_does_not_reach_a_jumbo_row(self) -> None:
+        # De koppeling van een artikelnummer op een bon van AH (`ah_receipt_products`) hoort bij AH: een product van Jumbo met
+        # hetzelfde nummer krijgt er geen merk en inhoud van. Haar trigger hoogt alleen de versie van AH op.
+        self.ah_article(111, 4183, "AH Bloemkool")
+        with closing(db(ah_orders)) as conn, conn:
+            conn.execute("UPDATE ah_receipt_products SET brand = 'AH', unit_size = '1 stuk' WHERE receipt_product_id = 111")
+        await prices.record("jumbo", [{"id": "4183", "title": "Jumbo Bloemkool", "price": 1.49}], now="2026-05-01T08:00:00+00:00")
+        with closing(db(price_import)) as conn, conn:
+            conn.execute(
+                "INSERT INTO imported_purchases (store, order_ref, position, day, title, quantity, paid, regular, order_total, imported_at) "
+                "VALUES ('jumbo', 'J1', 0, '2026-07-15', 'Jumbo Bloemkool', 1, 1.49, NULL, 1.49, 'x')"
+            )
+        rows: list[dict] = (await in_db(prices._connect, lambda conn: prices._receipt_rows(conn, "jumbo", TODAY)))[0]
+        self.assertEqual([(row["product_id"], row["brand"], row["unit_size"]) for row in rows], [("4183", None, None)])
+
+    async def test_without_a_catalogue_the_offers_get_no_regular_etag(self) -> None:
+        # Kan de catalogus niet worden opgebouwd, dan oordeelt `_annotate` zonder bonnen: dat antwoord krijgt geen ETag die een 304 geeft.
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        prices.forget_catalogues()
+        with mock.patch.object(prices, "_build_catalogue", side_effect=RuntimeError("stuk")), self.assertLogs(prices.log, "WARNING"):
+            first: str = await prices.offers_signature("ah")
+            second: str = await prices.offers_signature("ah")
+        self.assertTrue(first.startswith("fout:"), first)
+        self.assertNotEqual(first, second)
+        self.assertFalse((await prices.offers_signature("ah")).startswith("fout:"), "met een catalogus weer een gewone ETag")
+
+    async def catalogue_now(self) -> prices._Catalogue:
+        async with prices._connect() as conn:
+            return await prices._catalogue(conn, "ah", TODAY)
+
+    async def test_a_request_that_joins_an_older_build_catches_up_after_it(self) -> None:
+        # Een bouw die al liep voordat een prijs een bonregel verschoof, hoort niet als antwoord bij een aanvraag die die prijs al
+        # zag: na het aansluiten werkt `_catalogue` de catalogus bij (`_after_build`), anders komt een oud antwoord onder een nieuwe ETag.
+        await self.palermo("10", 1.69, "2 stuks", "2026-04-01")
+        await self.palermo("11", 2.49, "500 g", "2026-04-01")
+        self.ah_receipt("R1", "2026-06-10T10:00:00", (None, "AH Sweet Palermo", 1, 3.40, 3.40))
+        prices.forget_catalogues()
+        entered: threading.Event = threading.Event()
+        release: threading.Event = threading.Event()
+        real: Any = prices._build_catalogue
+        asked: list[int] = []
+        get: Any = prices._CATALOGUE_BUILDS.get
+
+        def held(*args: Any) -> prices._Catalogue:
+            entered.set()
+            release.wait(5)
+            return real(*args)
+
+        async def counted(key: Any, build: Any) -> prices._Catalogue:
+            asked.append(1)
+            return await get(key, build)
+
+        with mock.patch.object(prices, "_build_catalogue", side_effect=held), mock.patch.object(prices._CATALOGUE_BUILDS, "get", counted):
+            first: asyncio.Task[prices._Catalogue] = asyncio.ensure_future(self.catalogue_now())
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5), "de eerste bouw heeft zijn rijen gelezen")
+            await self.palermo("10", 3.39, "2 stuks", "2026-05-01")  # alleen `prices`: de bon hoort nu bij 10
+            second: asyncio.Task[prices._Catalogue] = asyncio.ensure_future(self.catalogue_now())
+            for _ in range(500):
+                if len(asked) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(asked), 2, "de tweede aanvraag sluit aan bij de bouw die al loopt")
+            release.set()
+            older: prices._Catalogue = await first
+            newer: prices._Catalogue = await second
+        self.assertEqual({row["product_id"] for row in older.receipts}, {"11"})
+        self.assertEqual({row["product_id"] for row in newer.receipts}, {"10"}, "bijgewerkt na de prijs die de aanvraag al zag")
+
+    async def test_a_failing_build_on_a_new_day_gives_no_regular_etag(self) -> None:
+        # De catalogus van vandaag en `_ANSWER_IDS` staan klaar, morgen mislukt de bouw: het antwoord zonder bonnen krijgt geen gewone ETag.
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertFalse((await prices.offers_signature("ah")).startswith("fout:"))
+        tomorrow: str = (date.fromisoformat(prices._now()[:10]) + timedelta(days=1)).isoformat()
+        with (
+            mock.patch.object(prices, "_now", return_value=f"{tomorrow}T08:00:00+00:00"),
+            mock.patch.object(prices, "_build_catalogue", side_effect=RuntimeError("stuk")),
+            self.assertLogs(prices.log, "WARNING"),
+        ):
+            self.assertTrue((await prices.offers_signature("ah")).startswith("fout:"))
+
+    async def test_the_offers_etag_carries_the_utc_day_of_the_verdict(self) -> None:
+        # Het oordeel hangt af van de dag (het venster van de pakken, de dagen sinds een prijs): dezelfde rijen op een andere
+        # UTC-dag zijn een ander antwoord, dus een andere ETag, ook als het venster op beide dagen leeg is.
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        found: list[str] = []
+        for day in ("2027-03-01", "2027-03-02"):
+            with mock.patch.object(prices, "_now", return_value=f"{day}T08:00:00+00:00"):
+                found.append(await prices.offers_signature("ah"))
+        self.assertFalse(any(value.startswith("fout:") for value in found), found)
+        self.assertNotEqual(found[0], found[1])
+        with mock.patch.object(prices, "_now", return_value="2027-03-01T23:00:00+00:00"):
+            self.assertEqual(await prices.offers_signature("ah"), found[0], "dezelfde dag, dezelfde ETag")
+
+    async def test_a_failing_catch_up_gives_no_regular_etag(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertFalse((await prices.offers_signature("ah")).startswith("fout:"))
+        await self.observe("2026-06-01", "1", "AH Pindakaas", 2.89)  # alleen `prices`: de volgende aanvraag werkt de catalogus bij
+        with mock.patch.object(prices, "_with_last", side_effect=RuntimeError("stuk")), self.assertLogs(prices.log, "WARNING"):
+            self.assertTrue((await prices.offers_signature("ah")).startswith("fout:"))
+
+    async def version(self, store: str) -> str:
+        return (await in_db(prices._connect, lambda conn: prices._catalogue_version(conn, store)))[0]
+
+    def counters(self, store: str) -> tuple[int, int]:
+        """(products, prices) van een winkel in `catalogue_versions`."""
+        with closing(db(prices)) as conn:
+            row: tuple[int, int] | None = conn.execute("SELECT products, prices FROM catalogue_versions WHERE store = ?", (store,)).fetchone()
+        return (row[0], row[1]) if row else (0, 0)
+
+    async def test_every_catalogue_table_has_a_store(self) -> None:
+        self.assertEqual(set(prices._TABLE_STORE), set(prices.CATALOGUE_TABLES))
+        for table, store in prices._TABLE_STORE.items():
+            with self.subTest(table=table):
+                self.assertIn(store, {"NEW.store", *(f"'{name}'" for name in offers.STORES), "'crisp'"})
+        self.assertEqual(prices._TABLE_STORE["ah_receipt_items"], "'ah'")
+        self.assertEqual(prices._TABLE_STORE["jumbo_order_items"], "'jumbo'")
+        self.assertEqual(prices._TABLE_STORE["price_observations"], "NEW.store")
+
+    async def test_a_price_at_picnic_leaves_the_catalogue_of_ah(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        ah_before: str = await self.version("ah")
+        picnic_before: str = await self.version("picnic")
+        with mock.patch.object(prices, "_build_catalogue", wraps=prices._build_catalogue) as built:
+            await prices.record("picnic", [{"id": "s100", "title": "Pindakaas", "price": 3.49}], now="2026-06-01T08:00:00+00:00")
+            self.assertEqual(await self.found("pindakaas"), ["1"])
+            self.assertEqual(built.call_count, 0, "de catalogus van AH blijft staan")
+        self.assertEqual(await self.version("ah"), ah_before)
+        self.assertNotEqual(await self.version("picnic"), picnic_before)
+
+    async def test_a_price_of_a_known_product_does_not_rebuild_the_catalogue(self) -> None:
+        # Elke opbouw van de catalogus is een aanroep van `_build_catalogue` (in de threadpool).
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        await self.observe("2026-04-01", "2", "AH Hagelslag", 1.99)
+        self.assertEqual(await self.found("ah"), ["1", "2"])
+        products: int
+        counted: int
+        products, counted = self.counters("ah")
+        with mock.patch.object(prices, "_build_catalogue", wraps=prices._build_catalogue) as built:
+            await self.observe("2026-06-01", "2", "AH Hagelslag", 1.89)  # een nieuwe dag: een INSERT
+            self.assertEqual(await self.found("ah"), ["2", "1"], "de nieuwste prijs telt in de volgorde")
+            await self.observe("2026-06-01", "2", "AH Hagelslag", 1.79)  # dezelfde dag: een UPDATE
+            self.assertEqual(await self.found("ah"), ["2", "1"])
+            self.assertEqual(built.call_count, 0, "alleen een prijs erbij: dezelfde catalogus")
+        self.assertEqual(self.counters("ah"), (products, counted + 2))
+        product: dict = await self.product("2", query="hagelslag")
+        self.assertEqual([segment["price"] for segment in product["regular"]], [1.99, 1.79])
+
+    async def test_a_price_of_a_new_product_rebuilds_the_catalogue(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        with mock.patch.object(prices, "_build_catalogue", wraps=prices._build_catalogue) as built:
+            await self.observe("2026-06-01", "2", "AH Pindakaas crunchy", 3.19)
+            self.assertEqual(await self.found("pindakaas"), ["2", "1"])
+            self.assertEqual(built.call_count, 1)
+
+    async def test_a_renamed_product_rebuilds_the_catalogue(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        with mock.patch.object(prices, "_build_catalogue", wraps=prices._build_catalogue) as built:
+            await self.observe("2026-06-01", "1", "AH Pindakaas naturel", 2.99)  # dezelfde product_id, een andere naam: een INSERT
+            self.assertEqual(await self.found("naturel"), ["1"])
+            self.assertEqual(built.call_count, 1)
+            await self.observe("2026-06-01", "1", "AH Pindakaas extra", 2.99)  # en op dezelfde dag: een UPDATE
+            self.assertEqual(await self.found("extra"), ["1"])
+            self.assertEqual(built.call_count, 2)
+        with closing(db(prices)) as conn, conn:
+            conn.execute("UPDATE price_observations SET brand = 'Calve' WHERE product_id = '1' AND day = '2026-05-01'")
+        self.assertEqual(await self.found("calve"), ["1"], "een ander merk is ook een andere naam")
+
+    async def answers(self) -> dict:
+        """Wat de prijsgeschiedenis en het oordeel bij twee aanbiedingen nu zeggen."""
+        items: list[dict] = [
+            offer("2", "AH Hagelslag", 1.49, 1.99, "25% korting", unitSize="400 g"),
+            offer("10", "AH Sweet Palermo", 1.29, 1.69, "1,29"),
+        ]
+        return {
+            "history": await self.history(),
+            "palermo": await self.history(query="palermo"),
+            "annotate": await prices.annotate("ah", items, today=TODAY),
+        }
+
+    async def palermo(self, product_id: str, price: float, size: str, day: str) -> None:
+        await prices.record(
+            "ah", [{"id": product_id, "title": "AH Sweet Palermo", "price": price, "unitSize": size, "brand": "AH"}], now=f"{day}T08:00:00+00:00"
+        )
+
+    async def test_after_a_price_only_write_the_answers_equal_a_full_rebuild(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        await self.observe("2026-03-01", "2", "AH Hagelslag", 1.99)
+        await self.observe("2026-04-01", "3", "AH Muisjes", 1.79)
+        # Twee producten met dezelfde naam: de prijs op de bon kiest (`_nearest_priced`), eerst de zak van 500 gram.
+        await self.palermo("10", 1.69, "2 stuks", "2026-04-01")
+        await self.palermo("11", 2.49, "500 g", "2026-04-01")
+        self.ah_receipt("R1", "2026-06-10T10:00:00", (None, "AH Sweet Palermo", 1, 3.40, 3.40))
+        before: dict = await self.answers()
+        self.assertEqual({p["productId"]: len(p["purchases"]) for p in before["palermo"]["products"]}, {"10": 0, "11": 1})
+        # Prijzen voor bekende producten, met dezelfde naam, merk en verpakking: een nieuwe dag en een gewijzigde prijs.
+        await self.observe("2026-10-01", "2", "AH Hagelslag", 1.89)
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.69)
+        await self.palermo("10", 3.39, "2 stuks", "2026-05-01")
+        warm: dict = await self.answers()
+        prices._CATALOGUES.clear()
+        self.assertEqual(warm, await self.answers())
+        self.assertNotEqual(warm["history"], before["history"], "de nieuwe prijzen staan erin")
+        self.assertEqual(warm["history"]["products"][0]["productId"], "2", "de nieuwste prijs zet hagelslag bovenaan")
+        self.assertEqual(
+            {p["productId"]: len(p["purchases"]) for p in warm["palermo"]["products"]}, {"10": 1, "11": 0}, "de bon hoort nu bij de prijs in de buurt"
+        )
+
+    async def test_an_old_database_with_catalogue_changes_is_migrated(self) -> None:
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        with closing(db(prices)) as conn, conn:  # zoals tot 4.21: een versie voor alle winkels, en triggers die hem ophogen
+            conn.execute("DROP TABLE catalogue_versions")
+            conn.execute("CREATE TABLE catalogue_changes (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL, version INTEGER NOT NULL)")
+            conn.execute("INSERT INTO catalogue_changes VALUES (1, 'oud', 7)")
+            for name in [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")]:
+                conn.execute(f"DROP TRIGGER {name}")
+            for op in ("INSERT", "UPDATE", "DELETE"):
+                conn.execute(
+                    f"CREATE TRIGGER catalogue_price_observations_{op.lower()} AFTER {op} ON price_observations "
+                    "BEGIN UPDATE catalogue_changes SET version = version + 1 WHERE id = 1; END"
+                )
+        for day in ("2026-06-01", "2026-06-02"):  # de migratie, en daarna nog een keer op een database die al over is
+            auth.forget_runtime_state()
+            await self.observe(day, "1", "AH Pindakaas", 2.89)
+            self.assertEqual(await self.found("pindakaas"), ["1"])
+        with closing(db()) as conn:
+            tables: set[str] = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            old: list[str] = [
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%catalogue_changes%'")
+            ]
+            new: set[str] = {
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%catalogue_versions%'")
+            }
+        self.assertNotIn("catalogue_changes", tables)
+        self.assertIn("catalogue_versions", tables)
+        self.assertEqual(old, [])
+        self.assertLessEqual({f"catalogue_store_price_observations_{op}" for op in ("insert", "update", "delete")}, new)
+        products: int
+        counted: int
+        products, counted = self.counters("ah")
+        await self.observe("2026-07-01", "1", "AH Pindakaas", 2.79)
+        self.assertEqual(self.counters("ah"), (products, counted + 1), "de nieuwe triggers tellen")
+
+    def old_triggers(self) -> dict[str, str]:
+        """De triggers die 4.21 zoekt (`catalogue_<tabel>_<bewerking>`), met hun SQL."""
+        with closing(db()) as conn:
+            rows: list[tuple[str, str]] = conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'").fetchall()
+        wanted: set[str] = {f"catalogue_{table}_{op}" for table in prices.CATALOGUE_TABLES for op in ("insert", "update", "delete")}
+        return {name: sql for name, sql in rows if name in wanted}
+
+    async def test_a_rollback_to_4_21_makes_its_own_triggers_and_both_count(self) -> None:
+        # Een database die een eerdere bouw van deze versie al omzette: triggers met de namen van 4.21 die `catalogue_versions` ophogen.
+        await self.observe("2026-05-01", "1", "AH Pindakaas", 2.99)
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        with closing(db(prices)) as conn, conn:
+            for op in ("INSERT", "UPDATE", "DELETE"):
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS catalogue_price_observations_{op.lower()} AFTER {op} ON price_observations "
+                    "BEGIN UPDATE catalogue_versions SET products = products + 1 WHERE store IN ('ah'); END"
+                )
+        auth.forget_runtime_state()
+        self.assertEqual(await self.found("pindakaas"), ["1"])
+        self.assertEqual(self.old_triggers(), {}, "4.21 vindt geen trigger met zijn naam, dus maakt hij zijn eigen")
+        # Terug naar 4.21 (`_catalogue_version` van 1d1633b): zijn tabel, en zijn triggers naast de nieuwe.
+        with closing(db(prices)) as conn, conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS catalogue_changes (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL, version INTEGER NOT NULL)"
+            )
+            conn.execute("INSERT INTO catalogue_changes VALUES (1, 'oud', 0)")
+            for op in ("INSERT", "UPDATE", "DELETE"):
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS catalogue_price_observations_{op.lower()} AFTER {op} ON price_observations "
+                    "BEGIN UPDATE catalogue_changes SET version = version + 1 WHERE id = 1; END"
+                )
+        products: int
+        counted: int
+        products, counted = self.counters("ah")
+        with closing(db(prices)) as conn, conn:
+            conn.execute(
+                "INSERT INTO price_observations (store, product_id, day, source, title, price, seen_at) "
+                "VALUES ('ah', 'x', '2026-06-01', 'search', 'Nieuw product', 1.0, 'nu')"
+            )
+            version: int = conn.execute("SELECT version FROM catalogue_changes").fetchone()[0]
+        self.assertEqual(version, 1, "de oude code krijgt een nieuwe versie bij een nieuw product")
+        self.assertEqual(self.counters("ah"), (products + 1, counted + 1), "de nieuwe triggers tellen ernaast door")
+        # Weer vooruit: de triggers van 4.21 en zijn tabel gaan weg, de nieuwe tellen.
+        auth.forget_runtime_state()
+        self.assertEqual(await self.found("product"), ["x"])
+        self.assertEqual(self.old_triggers(), {})
+        await self.observe("2026-07-01", "1", "AH Pindakaas", 2.79)
+        self.assertEqual(self.counters("ah"), (products + 1, counted + 2))
+
+
+class RegularPointsTest(PricesCase):
+    SINCE = "2026-08-01"
+    UNTIL = "2026-10-20"
+
+    async def observe(self, day, product_id, title, price):
+        await prices.record(
+            "ah",
+            [
+                {
+                    "id": product_id,
+                    "title": title,
+                    "price": price,
+                    "unitSize": "500 g",
+                    "brand": "AH",
+                }
+            ],
+            now=f"{day}T08:00:00+00:00",
+        )
+
+    @staticmethod
+    def line(source, product_id="1", day="2026-09-10", paid=2.79, regular=None, quantity=1, linked_by="own"):
+        # `linked_by` zoals `_link_receipt_rows` hem zet: alleen een bevestigde koppeling geeft een punt (CONFIRMED_LINKS).
+        return {
+            "product_id": product_id,
+            "day": day,
+            "paid": paid,
+            "regular": regular,
+            "quantity": quantity,
+            "source": source,
+            "linked_by": linked_by,
+        }
+
+    async def test_only_a_confirmed_link_gives_a_point(self) -> None:
+        for how in ("own", "shared", "article"):
+            with self.subTest(linked_by=how):
+                self.assertEqual(list(await self.points([self.line("receipt", linked_by=how)])), ["1"])
+        for how in ("id", "name", "fallback", None):  # `id`: het artikelnummer is toevallig ook een id van de webwinkel
+            with self.subTest(linked_by=how):
+                self.assertEqual(await self.points([self.line("receipt", linked_by=how), self.line("import", regular=2.89, linked_by=how)]), {})
+
+    async def points(self, receipts=(), *, before=False, ids=None, since=None, until=None):
+        async def collect(conn):
+            return await prices._regular_points(
+                conn,
+                "ah",
+                since or self.SINCE,
+                until or self.UNTIL,
+                receipts=list(receipts),
+                purchases_before_until=before,
+                ids=ids,
+            )
+
+        return (await in_db(prices._connect, collect))[0]
+
+    async def test_search_order_import_receipt_and_offer_each_give_a_point(self):
+        await self.observe("2026-09-01", "1", "AH Pindakaas", 2.99)
+        await self.ah_order(
+            101,
+            "delivered",
+            "2026-09-05",
+            order_item(1, "AH Pindakaas", 2.0, before=3.19, bonus=True),
+        )
+        await self.sync_offer(
+            "2026-09-22T05:00:00+00:00",
+            offer(
+                "1",
+                "AH Pindakaas",
+                1.99,
+                2.49,
+                "nu 1,99",
+                validFrom="2026-09-22",
+                validUntil="2026-09-28",
+            ),
+        )
+        await self.sync_offer("2026-09-29T05:00:00+00:00")
+        receipts = [
+            self.line("import", day="2026-09-10", regular=2.89),
+            self.line("receipt", day="2026-09-12", paid=2.79),
+        ]
+        found = (await self.points(receipts))["1"]
+        self.assertEqual({p[2] for p in found}, {"search", "order", "import", "receipt", "offer"})
+        self.assertEqual(len(found), 5)
+
+    async def test_weighed_receipt_line_gives_no_point(self):
+        found = await self.points(
+            [
+                self.line("receipt", quantity=0.482),
+                self.line("receipt", day="2026-09-11", quantity=2),
+            ]
+        )
+        self.assertEqual(found, {"1": [regular_price.regular_point("2026-09-11", 2.79, "receipt")]})
+        self.assertEqual(await self.points([self.line("receipt", quantity=None)]), {})
+
+    async def test_ended_offer_point_is_dated_at_its_end(self):
+        await self.sync_offer(
+            "2026-09-22T05:00:00+00:00",
+            offer(
+                "1",
+                "AH Pindakaas",
+                1.99,
+                2.49,
+                "nu 1,99",
+                validFrom="2026-09-22",
+                validUntil="2026-09-28",
+            ),
+        )
+        await self.sync_offer("2026-09-29T05:00:00+00:00")
+        self.assertEqual(
+            (await self.points())["1"],
+            [regular_price.regular_point("2026-09-28", 2.49, "offer")],
+        )
+
+    async def test_running_offer_point_is_dated_until(self):
+        await self.sync_offer(
+            "2026-10-15T05:00:00+00:00",
+            offer("1", "AH Pindakaas", 1.99, 2.49, "nu 1,99"),
+        )
+        self.assertEqual(
+            (await self.points())["1"],
+            [regular_price.regular_point(self.UNTIL, 2.49, "offer")],
+        )
+
+    async def test_folder_rows_give_no_point(self):
+        await self.sync_offer(
+            "2026-10-15T05:00:00+00:00",
+            offer("folder:abc", "Folderaanbieding", 1.99, 2.49, "nu 1,99"),
+        )
+        self.assertNotIn("folder:abc", await self.points())
+
+    async def test_purchase_of_until_is_left_out_on_request(self):
+        await self.ah_order(
+            101,
+            "delivered",
+            self.UNTIL,
+            order_item(1, "AH Pindakaas", 2.0, before=3.19, bonus=True),
+        )
+        receipts = [
+            self.line("import", day=self.UNTIL, regular=2.89),
+            self.line("receipt", day=self.UNTIL),
+        ]
+        self.assertEqual(len((await self.points(receipts))["1"]), 3)
+        self.assertEqual(await self.points(receipts, before=True), {})
+
+    async def test_ids_limits_the_products(self):
+        await self.observe("2026-09-01", "1", "AH Pindakaas", 2.99)
+        await self.observe("2026-09-01", "2", "AH Hagelslag", 1.99)
+        await self.sync_offer(
+            "2026-10-15T05:00:00+00:00",
+            offer("1", "AH Pindakaas", 1.99, 2.49),
+            offer("2", "AH Hagelslag", 1.0, 1.5),
+        )
+        receipts = [
+            self.line("import", product_id="1", regular=2.89),
+            self.line("import", product_id="2", regular=1.89),
+        ]
+        self.assertEqual(set(await self.points(receipts)), {"1", "2"})
+        limited = await self.points(receipts, ids=["2"])
+        self.assertEqual(set(limited), {"2"})
+        self.assertEqual({p[2] for p in limited["2"]}, {"search", "import", "offer"})
+
+    async def test_points_outside_the_window_are_left_out(self):
+        await self.observe("2026-07-01", "1", "AH Pindakaas", 2.99)
+        receipts = [
+            self.line("import", day="2026-07-02", regular=2.89),
+            self.line("import", day="2026-10-21", regular=2.89),
+        ]
+        self.assertEqual(await self.points(receipts), {})
+
+    async def test_a_closed_continued_chain_gives_one_point_at_its_end(self) -> None:
+        # Zonder einddatum: de wijziging op 5 september sluit de eerste rij en opent een `continued` rij, die op 10 september
+        # verdwijnt. Een aanbieding, dus een punt: de laatste van-prijs, op het einde van de laatste rij.
+        await self.sync_offer("2026-09-01T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.49, "nu 1,99"))
+        await self.sync_offer("2026-09-05T05:00:00+00:00", offer("1", "AH Pindakaas", 1.89, 2.59, "nu 1,89"))
+        await self.sync_offer("2026-09-10T05:00:00+00:00")
+        self.assertEqual((await self.points())["1"], [regular_price.regular_point("2026-09-05", 2.59, "offer")])
+
+    async def test_a_running_continued_chain_is_dated_until(self) -> None:
+        # De van-prijs veranderde halverwege een aanbieding die nog loopt: de hele keten loopt nog, dus `until`.
+        await self.sync_offer("2026-10-10T05:00:00+00:00", offer("1", "AH Pindakaas", 1.50, 2.00, "25% korting"))
+        await self.sync_offer("2026-10-15T05:00:00+00:00", offer("1", "AH Pindakaas", 1.50, 2.20, "25% korting"))
+        self.assertEqual((await self.points())["1"], [regular_price.regular_point(self.UNTIL, 2.20, "offer")])
+
+    async def test_a_new_period_after_a_chain_is_its_own_point(self) -> None:
+        # Een nieuwe periode (`continued` is 0) begint een nieuwe keten, ook direct na de vorige.
+        await self.sync_offer("2026-09-01T05:00:00+00:00", offer("1", "AH Pindakaas", 1.99, 2.49, "nu 1,99"))
+        await self.sync_offer("2026-09-05T05:00:00+00:00")
+        await self.sync_offer("2026-09-08T05:00:00+00:00", offer("1", "AH Pindakaas", 1.89, 2.59, "nu 1,89"))
+        self.assertEqual(
+            (await self.points())["1"],
+            [regular_price.regular_point("2026-09-01", 2.49, "offer"), regular_price.regular_point(self.UNTIL, 2.59, "offer")],
+        )
+
+
+class NamesOffTheLoopTest(PricesCase):
+    """Lowend: het vouwen van duizenden namen bij het oordeel en bij de ingelezen bestellingen loopt via `compute.run`."""
+
+    def _folded_in(self, call: Any) -> tuple[int, list[int]]:
+        main: int = threading.get_ident()
+        seen: list[int] = []
+        real = prices._fold_name
+
+        def fold(value: Any) -> str:
+            seen.append(threading.get_ident())
+            return real(value)
+
+        with mock.patch.object(prices, "_fold_name", fold):
+            call()
+        return main, seen
+
+    def test_the_verdict_fallback_folds_in_a_thread(self):
+        items: list[dict[str, Any]] = [{"id": "1", "title": "AH Melk", "brand": "AH", "unitSize": "1 l"}]
+        with mock.patch.object(prices, "_line_offers", mock.AsyncMock(return_value={})):
+            main, seen = self._folded_in(lambda: run(prices._verdict_lines("ah", object(), items, ["1"])))
+        assert seen
+        assert main not in seen
+
+    def test_the_names_of_an_imported_order_are_folded_in_a_thread(self):
+        main, seen = self._folded_in(lambda: run(prices.link_names("ah", {"AH Melk"})))
+        assert seen
+        assert main not in seen
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SharedPricesTest(unittest.TestCase):
+    """`prices._name_prices`: het deel van `_names` dat sinds 4.28.0 in een thread loopt (via `compute.run`), niet op de event loop."""
+
+    def test_products_and_prices_are_sorted_and_an_unknown_price_is_empty(self) -> None:
+        several = {"halfvolle melk": {"9", "10", "2"}, "bloemkool": {"7", "3"}}
+        known = {"9": {1.29, 1.09}, "2": {0.99}, "3": {2.49, 1.99, 2.19}}
+        self.assertEqual(
+            prices._name_prices(several, known),
+            {"halfvolle melk": {"10": (), "2": (0.99,), "9": (1.09, 1.29)}, "bloemkool": {"3": (1.99, 2.19, 2.49), "7": ()}},
+        )
+        self.assertEqual(list(prices._name_prices(several, known)["halfvolle melk"]), ["10", "2", "9"], "ids als tekst gesorteerd, zoals eerst")
+        self.assertEqual(prices._name_prices({}, {}), {})
+
+    def test_names_runs_it_off_the_event_loop(self) -> None:
+        import inspect  # pylint: disable=import-outside-toplevel
+
+        self.assertIn("await compute.run(_name_prices, several, known)", inspect.getsource(prices._names))

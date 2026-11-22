@@ -11,21 +11,25 @@ de pagina om voor Mealie. Zie docs/onderzoek-hellofresh.md.
 - We vragen zuinig (één verzoek tegelijk, met een pauze ertussen), noemen ons in de User-Agent en komen alleen op de
   paden die `robots.txt` niet uitsluit: `/menus/<week>` en `/recipes/<recept>`.
 """
+
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import re
-import threading
 import time
-from contextlib import closing
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-import requests
+import aiosqlite
+import httpx
 
-from . import about, auth, mealie, mealkit_import
+from . import about, auth, http_client, mealie, mealkit_import, nutrition, recipe_diet
 from .ah_lists import _fold
 from .i18n import tr
 
@@ -45,10 +49,7 @@ _DURATION = re.compile(r"^PT(?:(\d+)H)?(?:(\d+)M)?$")
 _TAGS = re.compile(r"<[^>]+>")
 
 _IMAGE = re.compile(r"^(https://img\.hellofresh\.com)/[^/]+/(hellofresh_s3/image/[^/?#]+)$")
-NUTRITION_FIELDS = (
-    "calories", "fatContent", "saturatedFatContent", "carbohydrateContent", "sugarContent", "proteinContent",
-    "fiberContent", "sodiumContent",
-)
+NUTRITION_FIELDS = nutrition.KEYS  # de velden van schema.org die Mealie ook kent
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hellofresh_menus (
@@ -58,18 +59,37 @@ CREATE TABLE IF NOT EXISTS hellofresh_menus (
 );
 """
 
+
 class HelloFreshError(RuntimeError):
     """Een fout met een tekst van onszelf (nooit het antwoord van HelloFresh), die de gebruiker mag zien."""
 
 
-_gap_lock = threading.Lock()
+# Het slot van de pauze, per event loop: een `asyncio.Lock` hoort bij de loop waarin hij voor het eerst wacht.
+# Een slot waarop iemand wacht houdt zijn loop in leven (de wachtende task verwijst naar het slot), net als bij de clients van http_client.
+_gap_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
 _last_request = 0.0
 
 
-def _connect():
-    conn = auth.connect()
-    conn.executescript(SCHEMA)
-    return conn
+def _gap_lock() -> asyncio.Lock:
+    """Het slot van de lopende event loop: een verzoek aan HelloFresh tegelijk, pauze en verzoek erbij."""
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    lock: asyncio.Lock | None = _gap_locks.get(loop)
+    if lock is None:
+        lock = _gap_locks[loop] = asyncio.Lock()
+    return lock
+
+
+async def _wait(seconds: float) -> None:
+    """De pauze tussen twee verzoeken. Een eigen functie, zodat een test hem kan vervangen zonder `asyncio.sleep` voor het hele proces."""
+    await asyncio.sleep(seconds)
+
+
+@asynccontextmanager
+async def _connect() -> AsyncIterator[aiosqlite.Connection]:
+    """Een verbinding met het schema, via `auth.connect()`. Sluit zonder commit."""
+    async with auth.connect() as conn:
+        await auth.ensure_schema(conn, "hellofresh", SCHEMA)
+        yield conn
 
 
 def _now() -> datetime:
@@ -80,29 +100,33 @@ def _now() -> datetime:
 
 
 def _user_agent() -> str:
-    return f"MealieShopper/{about.read_version()} (+https://github.com/helmerzNL/MealieShopper)"
+    return f"MealieShopper/{about.version()} (+https://github.com/helmerzNL/MealieShopper)"
 
 
-def _get(path: str) -> str:
+async def _get(path: str) -> str:
     """De tekst van een pagina; `path` komt van onszelf (een gecontroleerde week of receptsleutel)."""
     global _last_request
-    with _gap_lock:  # één verzoek tegelijk, met een pauze ertussen
+    async with _gap_lock():  # één verzoek tegelijk, met een pauze ertussen
         wait = MIN_GAP - (time.monotonic() - _last_request)
         if wait > 0:
-            time.sleep(wait)
+            await _wait(wait)
         try:
-            response = requests.get(BASE + path, headers={"User-Agent": _user_agent(), "Accept-Language": "nl-NL,nl;q=0.9"}, timeout=TIMEOUT)
-        except requests.RequestException as exc:
+            response = await http_client.client("hellofresh").get(
+                BASE + path, headers={"User-Agent": _user_agent(), "Accept-Language": "nl-NL,nl;q=0.9"}, timeout=TIMEOUT, follow_redirects=True
+            )
+        except httpx.HTTPError as exc:
             raise HelloFreshError(tr("HelloFresh is niet bereikbaar", "HelloFresh is not reachable")) from exc
         finally:
             _last_request = time.monotonic()
-    host = (urlsplit(response.url).hostname or "").lower()
+    host = (urlsplit(str(response.url)).hostname or "").lower()
     if host != f"www.{HOST}" and host != HOST:
         raise HelloFreshError(tr("HelloFresh stuurde ons ergens anders heen", "HelloFresh redirected us elsewhere"))
     if response.status_code == 404:
         raise ValueError(tr("HelloFresh heeft dit niet (meer)", "HelloFresh does not have this (any more)"))
     if response.status_code != 200:
-        raise HelloFreshError(tr(f"HelloFresh antwoordde met status {response.status_code}", f"HelloFresh answered with status {response.status_code}"))
+        raise HelloFreshError(
+            tr(f"HelloFresh antwoordde met status {response.status_code}", f"HelloFresh answered with status {response.status_code}")
+        )
     return response.text
 
 
@@ -157,14 +181,14 @@ def upcoming_weeks(count: int) -> list[str]:
     return [week_code(start + timedelta(days=7 * n)) for n in range(max(0, min(int(count), MAX_LOAD_WEEKS)))]
 
 
-def load_upcoming(get: Any, count: int, errors: tuple[type[Exception], ...]) -> Exception | None:
+async def load_upcoming(get: Callable[[str], Awaitable[Any]], count: int, errors: tuple[type[Exception], ...]) -> Exception | None:
     """Haal de menu's van de komende weken op met `get(week)`, zodat een zoekopdracht ze vindt. Een week die mislukt of nog
     geen menu heeft slaan we over. Geeft de laatste fout terug als er geen enkele week gelukt is, anders `None`."""
     last: Exception | None = None
     loaded = 0
     for week in upcoming_weeks(count):
         try:
-            get(week)
+            await get(week)
             loaded += 1
         except errors as exc:
             last = exc
@@ -191,7 +215,7 @@ def recipe_key(url: Any) -> str | None:
     parts = urlsplit(str(url or ""))
     if (parts.hostname or "").lower() not in {HOST, f"www.{HOST}"} or not parts.path.startswith("/recipes/"):
         return None
-    key = parts.path[len("/recipes/"):].strip("/")
+    key = parts.path[len("/recipes/") :].strip("/")
     return key if _KEY.match(key) else None
 
 
@@ -233,9 +257,9 @@ def parse_menu(page: str) -> dict[str, Any]:
     return {"week": str(payload.get("activeWeek") or ""), "currentWeek": str(payload.get("currentWeek") or ""), "recipes": recipes}
 
 
-def _stored(week: str) -> tuple[datetime, dict[str, Any]] | None:
-    with closing(_connect()) as conn:
-        row = conn.execute("SELECT fetched_at, payload FROM hellofresh_menus WHERE week = ?", (week,)).fetchone()
+async def _stored(week: str) -> tuple[datetime, dict[str, Any]] | None:
+    async with _connect() as conn, conn.execute("SELECT fetched_at, payload FROM hellofresh_menus WHERE week = ?", (week,)) as cursor:
+        row = await cursor.fetchone()
     if not row:
         return None
     try:
@@ -244,27 +268,28 @@ def _stored(week: str) -> tuple[datetime, dict[str, Any]] | None:
         return None
 
 
-def _store(menu: dict[str, Any]) -> None:
-    with closing(_connect()) as conn, conn:
-        conn.execute(
+async def _store(menu: dict[str, Any]) -> None:
+    async with _connect() as conn:
+        await conn.execute(
             "INSERT INTO hellofresh_menus (week, fetched_at, payload) VALUES (?, ?, ?) "
             "ON CONFLICT(week) DO UPDATE SET fetched_at = excluded.fetched_at, payload = excluded.payload",
             (menu["week"], _now().isoformat(timespec="seconds"), json.dumps(menu, ensure_ascii=False)),
         )
+        await conn.commit()
 
 
-def get_menu(week: Any = None, refresh: bool = False) -> dict[str, Any]:
+async def get_menu(week: Any = None, refresh: bool = False) -> dict[str, Any]:
     """Het menu van een week (standaard de actuele): uit de kopie als die vers is, anders bij HelloFresh."""
     wanted = str(week or "").strip() or week_code(date.today())
     monday(wanted)
-    cached = _stored(wanted)
+    cached = await _stored(wanted)
     if cached and not refresh and _now() - cached[0] < MENU_TTL:
         menu, fetched = cached[1], cached[0]
     else:
         try:
-            menu = parse_menu(_get(f"/menus/{wanted}"))
+            menu = parse_menu(await _get(f"/menus/{wanted}"))
             menu["week"] = wanted
-            _store(menu)
+            await _store(menu)
             fetched = _now()
         except (HelloFreshError, ValueError):
             if not cached:
@@ -281,15 +306,15 @@ def get_menu(week: Any = None, refresh: bool = False) -> dict[str, Any]:
     }
 
 
-def search(query: Any, load: int = 0) -> dict[str, Any]:
+async def search(query: Any, load: int = 0, wanted: Any = None) -> dict[str, Any]:
     """Zoek in alle bewaarde menu's; alle woorden moeten voorkomen in naam, kop, keuken of label. Zonder `load` vraagt dit
     HelloFresh niets; met `load` worden eerst de komende weken opgehaald (en bewaard) die er nog niet zijn."""
     words = _fold(query).split()
     if not words:
         raise ValueError(tr("Vul een zoekwoord in", "Enter a search term"))
-    failure = load_upcoming(get_menu, load, (HelloFreshError, ValueError)) if load else None
-    with closing(_connect()) as conn:
-        rows = conn.execute("SELECT week, payload FROM hellofresh_menus ORDER BY week DESC").fetchall()
+    failure = await load_upcoming(get_menu, load, (HelloFreshError, ValueError)) if load else None
+    async with _connect() as conn, conn.execute("SELECT week, payload FROM hellofresh_menus ORDER BY week DESC") as cursor:
+        rows = await cursor.fetchall()
     if failure and not rows:
         raise failure
     found: dict[str, dict[str, Any]] = {}
@@ -302,7 +327,8 @@ def search(query: Any, load: int = 0) -> dict[str, Any]:
             text = _fold(" ".join((recipe.get("name", ""), recipe.get("headline", ""), recipe.get("cuisine", ""), recipe.get("label", ""))))
             if recipe.get("key") not in found and all(word in text for word in words):
                 found[recipe["key"]] = {**recipe, "week": row["week"]}
-    results = list(found.values())
+    # Met filters (recipe_diet.Wanted: menugang, dieet, tijd) vóór het afkappen, zodat het totaal klopt (4.22.0).
+    results = recipe_diet.filter_cards("hellofresh", list(found.values()), wanted) if wanted is not None else list(found.values())
     return {"weeks": len(rows), "total": len(results), "recipes": results[:MAX_RESULTS]}
 
 
@@ -321,11 +347,11 @@ def ingredient_line(line: Any) -> str:
     return re.sub(r"\s+", " ", html.unescape(str(line or ""))).strip()
 
 
-def get_recipe(key: Any) -> dict[str, Any]:
+async def get_recipe(key: Any) -> dict[str, Any]:
     key = str(key or "").strip()
     if not _KEY.match(key):
         raise ValueError(tr("Geen geldig recept", "Not a valid recipe"))
-    data = _json_ld_recipe(_get(f"/recipes/{key}"))
+    data = _json_ld_recipe(await _get(f"/recipes/{key}"))
     image = data.get("image")
     steps = [_text(step.get("text") if isinstance(step, dict) else step) for step in data.get("recipeInstructions") or []]
     description = _text(data.get("description"))
@@ -383,16 +409,15 @@ def jsonld(recipe: dict[str, Any], minimal: bool = False) -> dict[str, Any]:
     if not minimal:
         if recipe.get("image"):
             data["image"] = [image_url(recipe["image"])]
-        nutrition = nutrition_fields(recipe.get("nutrition"))
-        if nutrition:
-            data["nutrition"] = {"@type": "NutritionInformation", **nutrition}
+        if fields := nutrition_fields(recipe.get("nutrition")):
+            data["nutrition"] = {"@type": "NutritionInformation", **fields}
     return data
 
 
 MEALIE_TIMEOUT = mealkit_import.MEALIE_TIMEOUT
 
 
-def import_into_mealie(recipe: dict[str, Any], attempts_log: list[dict[str, Any]] | None = None) -> str:
+async def import_into_mealie(recipe: dict[str, Any], attempts_log: list[dict[str, Any]] | None = None) -> str:
     """Zet het recept in Mealie en geeft het slug: volledig, dan zonder foto en voedingswaarden, en daarna door Mealie de
     HelloFresh-pagina zelf te laten lezen. De regels voor het opnieuw proberen staan in `mealkit_import`."""
     url = source_url(recipe["key"])
@@ -401,22 +426,30 @@ def import_into_mealie(recipe: dict[str, Any], attempts_log: list[dict[str, Any]
         ("zonder foto en voedingswaarden", lambda: mealie.import_via_jsonld(url, jsonld(recipe, minimal=True))),
         ("via de pagina", lambda: mealie.import_via_url(url)),
     )
-    return mealkit_import.import_into_mealie("HelloFresh", recipe["key"], attempts, HelloFreshError, attempts_log)
+    return await mealkit_import.import_into_mealie("HelloFresh", recipe["key"], attempts, HelloFreshError, attempts_log)
 
 
-def run_import(key: Any) -> dict[str, str]:
+async def run_import(key: Any) -> dict[str, str]:
     """Haal het recept op en zet het in Mealie: `{"slug", "mealieUrl"}`; zie `mealkit_import.run_import`."""
-    return mealkit_import.run_import(
-        "hellofresh", "HelloFresh", key, lambda k: bool(_KEY.match(k)), source_url,
-        lambda k, attempts: import_into_mealie(get_recipe(k), attempts), HelloFreshError,
-    )
+
+    async def work(k: str, attempts: list[dict[str, Any]]) -> str:
+        return await import_into_mealie(await get_recipe(k), attempts)
+
+    return await mealkit_import.run_import("hellofresh", "HelloFresh", key, lambda k: bool(_KEY.match(k)), source_url, work, HelloFreshError)
 
 
-def detail(key: Any) -> dict[str, Any]:
-    """Het recept in de vorm van het zoekscherm (ingrediënten als regels); zoals Jumbo en Picnic, zonder voedingswaarden."""
-    recipe = get_recipe(key)
+async def detail(key: Any) -> dict[str, Any]:
+    """Het recept in de vorm van het zoekscherm (ingrediënten als regels), zoals Jumbo en Picnic, met de voedingswaarden per portie."""
+    recipe = await get_recipe(key)
     return {
-        "id": recipe["key"], "name": recipe["name"], "description": recipe["description"], "image": recipe["image"],
-        "minutes": recipe["minutes"], "portions": recipe["portions"], "url": source_url(recipe["key"]),
-        "ingredients": [{"line": line} for line in recipe["ingredients"]], "steps": recipe["steps"], "nutrition": [],
+        "id": recipe["key"],
+        "name": recipe["name"],
+        "description": recipe["description"],
+        "image": recipe["image"],
+        "minutes": recipe["minutes"],
+        "portions": recipe["portions"],
+        "url": source_url(recipe["key"]),
+        "ingredients": [{"line": line} for line in recipe["ingredients"]],
+        "steps": recipe["steps"],
+        "nutrition": nutrition.items(recipe.get("nutrition")),
     }

@@ -1,5 +1,6 @@
 // Installatiehulp, inloggen, uitnodiging, toestemmingsscherm, beveiliging en gebruikers.
 const { execFileSync } = require("child_process");
+const { openSubtab } = require("../demo");
 
 const HOST = "mealieshopper.example.nl";
 const SERVER = `https://${HOST}`;
@@ -27,9 +28,13 @@ const UNLINKED = {
 };
 
 // Een stap van de installatiehulp: ga ernaartoe met de eigen functie van de pagina.
+// Sinds 4.13.0 krijgt alleen een gekozen winkel een stap: een winkelstap kiest hier eerst de drie winkels met een eigen stap.
 const step = (id, sub = "choose") => async (page) => {
   await page.waitForSelector("#onboarding:not([hidden])");
-  await page.evaluate(([s, u]) => obGo(s, u), [id, sub]);
+  await page.evaluate(([s, u]) => {
+    if (["ah", "jumbo", "picnic"].includes(s)) obSaveStores(["ah", "jumbo", "picnic"]);
+    obGo(s, u);
+  }, [id, sub]);
   await page.waitForTimeout(500);
 };
 
@@ -55,24 +60,26 @@ async function openProfile(page, subtab) {
   await trigger.click();
   await page.click('[data-user-action="profile"]');
   await page.waitForTimeout(300);
-  if (subtab) await page.click(`[data-subtab="${subtab}"]`);
+  if (subtab) await openSubtab(page, subtab);
   await page.waitForTimeout(500);
 }
 
 // Het toestemmingsscherm is server-gerenderd (templates/oauth.html) en vraagt een ingelogde sessie en een
-// geregistreerde AI-app. We renderen het sjabloon zelf met de Flask-app en geven dat als antwoord op de aanvraag.
+// geregistreerde AI-app. We renderen het sjabloon zelf met de Quart-app en geven dat als antwoord op de aanvraag.
 // SHOT_PYTHON is de Python met de afhankelijkheden van MealieShopper (standaard python3).
 function renderConsent(lang) {
   const code = [
-    "import os, sys, tempfile",
+    "import asyncio, os, sys, tempfile",
     "os.environ['PASSKEY_AUTH_ENABLED'] = 'false'",
     "os.environ['MEALIESHOPPER_TESTING'] = '1'",
     "os.environ['MEALIESHOPPER_DATA_DIR'] = tempfile.mkdtemp()",
-    "from flask import render_template",
+    "from quart import render_template",
     "from mealieshopper.app import create_app",
     "app = create_app()",
-    `with app.test_request_context('/', headers={'Cookie': 'ms_lang=${lang}'}):`,
-    `    sys.stdout.write(render_template('oauth.html', error='', client='ChatGPT', signed='demo', base='${SERVER}', username='anna'))`,
+    "async def render():",
+    `    async with app.test_request_context('/', headers={'Cookie': 'ms_lang=${lang}'}):`,
+    `        return await render_template('oauth.html', error='', client='ChatGPT', signed='demo', base='${SERVER}', username='anna')`,
+    "sys.stdout.write(asyncio.run(render()))",
   ].join("\n");
   return execFileSync(process.env.SHOT_PYTHON || "python3", ["-c", code], {
     cwd: require("path").resolve(__dirname, "../../.."),
@@ -134,7 +141,18 @@ module.exports = [
     },
   },
 
-  // Stap 3: Albert Heijn, met de uitleg, de inlogknop en de geplakte regel uit de console.
+  // Stap 3 (sinds 4.13.0): welke winkels gebruik je? Albert Heijn en Picnic aangevinkt; alleen die krijgen een stap.
+  {
+    name: "ob-stores",
+    routes: { "/api/onboarding/status*": onboarding(), "/api/onboarding/start": { needed: true }, ...UNLINKED },
+    run: async (page) => {
+      await step("stores")(page);
+      for (const store of ["ah", "picnic"]) await page.locator(`#ob-stores input[value="${store}"]`).check({ force: true });
+      await page.waitForTimeout(300);
+    },
+  },
+
+  // Albert Heijn, met de uitleg, de inlogknop en de geplakte regel uit de console.
   {
     name: "ob-ah",
     routes: { "/api/onboarding/status*": onboarding(), "/api/onboarding/start": { needed: true }, ...UNLINKED },
@@ -145,7 +163,7 @@ module.exports = [
     },
   },
 
-  // Stap 4: Jumbo, hetzelfde als bij Albert Heijn.
+  // Jumbo, hetzelfde als bij Albert Heijn.
   {
     name: "ob-jumbo",
     routes: { "/api/onboarding/status*": onboarding(), "/api/onboarding/start": { needed: true }, ...UNLINKED },
@@ -156,7 +174,7 @@ module.exports = [
     },
   },
 
-  // Stap 5: Picnic, met het veld voor de bevestigingscode erbij.
+  // Picnic, met het veld voor de bevestigingscode erbij.
   {
     name: "ob-picnic",
     routes: {
@@ -245,7 +263,7 @@ module.exports = [
       await trigger.click();
       await page.click('[data-user-action="settings"]');
       await page.waitForTimeout(300);
-      await page.click('[data-subtab="settings-users"]');
+      await openSubtab(page, "settings-users");
       await page.waitForTimeout(600);
       await page.fill("#invite-name", "mila");
       await toTop(page, "#users-list", device === "phone" ? 70 : 90); // de lijst met gebruikers, daaronder het uitnodigformulier

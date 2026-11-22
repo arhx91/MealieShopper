@@ -1,23 +1,52 @@
+import asyncio
 import os
 import tempfile
+import threading
+import unittest
+from collections.abc import Awaitable
 from contextlib import closing
 from datetime import date, timedelta
-import unittest
+from typing import Any, Callable
 from unittest import mock
+
+import httpx
 
 os.environ.setdefault("MEALIESHOPPER_DATA_DIR", tempfile.mkdtemp())
 
-from mealieshopper import ah, ah_recipes, auth, offers  # noqa: E402
+from helpers import AppTestCase, db, returned, routes, run, served  # noqa: E402
+
+from mealieshopper import ah, ah_recipes, auth, offer_categories, offers, offers_schedule, prices  # noqa: E402
 from mealieshopper.app import create_app  # noqa: E402
 
 BONUS_PAGE = {
     "bonusGroupOrProducts": [
-        {"bonusGroup": {"discountDescription": "2 voor 3", "products": [
-            {"webshopId": 11, "title": "AH Tomaten rond", "brand": "AH", "salesUnitSize": "500 g",
-             "currentPrice": 1.5, "priceBeforeBonus": 2.0, "isBonus": True, "images": [{"url": "https://img/t.png"}]},
-        ]}},
-        {"product": {"webshopId": 12, "title": "Kipfilet", "salesUnitSize": "400 g", "currentPrice": 3.0, "priceBeforeBonus": 4.5,
-                     "discountLabels": [{"defaultDescription": "1+1 gratis"}]}},
+        {
+            "bonusGroup": {
+                "discountDescription": "2 voor 3",
+                "products": [
+                    {
+                        "webshopId": 11,
+                        "title": "AH Tomaten rond",
+                        "brand": "AH",
+                        "salesUnitSize": "500 g",
+                        "currentPrice": 1.5,
+                        "priceBeforeBonus": 2.0,
+                        "isBonus": True,
+                        "images": [{"url": "https://img/t.png"}],
+                    },
+                ],
+            }
+        },
+        {
+            "product": {
+                "webshopId": 12,
+                "title": "Kipfilet",
+                "salesUnitSize": "400 g",
+                "currentPrice": 3.0,
+                "priceBeforeBonus": 4.5,
+                "discountLabels": [{"defaultDescription": "1+1 gratis"}],
+            }
+        },
         {"product": {"webshopId": 13, "title": "Tomatenpuree", "currentPrice": 0.9, "priceBeforeBonus": 1.2}},
     ]
 }
@@ -25,23 +54,43 @@ BONUS_PAGE = {
 
 def _promotion(pid, label, start, end, products, kind="NATIONAL", category="Vlees"):
     top, _, bottom = label.partition(" ")
-    return {"id": pid, "title": f"Actie {pid}", "periodStart": start, "periodEnd": end, "promotionType": kind, "category": category,
-            "promotionLabels": [{"title": None, "topText": top, "centerText": None, "bottomText": bottom}], "products": products}
+    return {
+        "id": pid,
+        "title": f"Actie {pid}",
+        "periodStart": start,
+        "periodEnd": end,
+        "promotionType": kind,
+        "category": category,
+        "promotionLabels": [{"title": None, "topText": top, "centerText": None, "bottomText": bottom}],
+        "products": products,
+    }
 
 
 def _gql_product(pid, title, price, image=True):
-    return {"id": pid, "title": title, "brand": "AH", "salesUnitSize": "300 g", "price": {"now": {"amount": price}, "was": {"amount": price}},
-            "imagePack": [{"small": {"url": f"https://img/{pid}.webp"}}] if image else []}
+    return {
+        "id": pid,
+        "title": title,
+        "brand": "AH",
+        "salesUnitSize": "300 g",
+        "price": {"now": {"amount": price}, "was": {"amount": price}},
+        "imagePack": [{"small": {"url": f"https://img/{pid}.webp"}}] if image else [],
+    }
 
 
 # Zoals de GraphQL van de AH-app de bonus geeft (bonusPeriods en bonusPromotions, met een echt antwoord bevestigd op 1 nov 2026).
 BONUS_PROMOTIONS = {
-    "bonusPeriods": [{"startDate": "2026-10-26", "endDate": "2026-11-01", "weekNumber": 44},
-                     {"startDate": "2026-11-02", "endDate": "2026-11-08", "weekNumber": 45}],
+    "bonusPeriods": [
+        {"startDate": "2026-10-26", "endDate": "2026-11-01", "weekNumber": 44},
+        {"startDate": "2026-11-02", "endDate": "2026-11-08", "weekNumber": 45},
+    ],
     "bonusPromotions": [
         _promotion("1", "25% korting", "2026-10-26", "2026-11-01", [_gql_product(4004, "AH Rundergehakt", 4.0)]),
-        _promotion("2", "2 voor 2.99", "2026-11-02", "2026-11-08", [_gql_product(4004, "AH Rundergehakt", 4.0), _gql_product(4164, "AH Courgette", 0.89)]),
-        _promotion("3", "voor 1.99", "2026-11-02", "2026-11-08", [_gql_product(171425, "AH Prei", 2.49, image=False)], category="Groente, aardappelen"),
+        _promotion(
+            "2", "2 voor 2.99", "2026-11-02", "2026-11-08", [_gql_product(4004, "AH Rundergehakt", 4.0), _gql_product(4164, "AH Courgette", 0.89)]
+        ),
+        _promotion(
+            "3", "voor 1.99", "2026-11-02", "2026-11-08", [_gql_product(171425, "AH Prei", 2.49, image=False)], category="Groente, aardappelen"
+        ),
         _promotion("4", "5% volume", "2026-11-02", "2999-12-31", [_gql_product(5, "AH Kip 4-pack", 20.0)]),
         _promotion("FREE4526_A", "gratis bezorging", "2026-11-02", "2026-11-08", [_gql_product(6, "Maggi", 1.0)], kind="INCENTIVE"),
         _promotion("5", "2e halve prijs", "2026-11-02", "2026-11-15", [_gql_product(7, "Etos Shampoo", 3.0)], kind="ETOS"),
@@ -51,17 +100,17 @@ BONUS_PROMOTIONS = {
 }
 
 
-class TempDataDirTest(unittest.TestCase):
+class TempDataDirTest(AppTestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         patcher = mock.patch.dict(os.environ, {"MEALIESHOPPER_DATA_DIR": tmp.name, "PASSKEY_AUTH_ENABLED": "false"})
         patcher.start()
         self.addCleanup(patcher.stop)
-        auth.init_db()
+        run(auth.init_db())
 
 
-class MatchingTest(unittest.TestCase):
+class MatchingTest(AppTestCase):
     def test_plural_and_double_vowels_match(self):
         for ingredient, title in (("tomaten", "AH Tomaat rond"), ("2 uien", "Ui geel"), ("6 eieren", "Ei"), ("kippen", "Kip")):
             head = offers.head_of(ingredient)
@@ -84,7 +133,7 @@ class MatchingTest(unittest.TestCase):
         self.assertTrue(offers.matches(offers.head_of("kip"), set(offers.tokens("Kipfilet 500 g"))))
 
 
-class BonusParsingTest(unittest.TestCase):
+class BonusParsingTest(AppTestCase):
     def test_products_are_found_by_shape_with_their_label_and_prices(self):
         products = {p["id"]: p for p in ah.bonus_products_in(BONUS_PAGE)}
         self.assertEqual(sorted(products), ["11", "12", "13"])
@@ -94,34 +143,73 @@ class BonusParsingTest(unittest.TestCase):
         self.assertEqual(products["12"]["promoLabel"], "1+1 gratis")
 
     def test_falls_back_on_search_when_the_page_has_no_products(self):
-        search = {"products": [{"webshopId": 5, "title": "Pasta", "currentPrice": 1.0, "priceBeforeBonus": 1.5, "isBonus": True},
-                               {"webshopId": 6, "title": "Rijst", "currentPrice": 1.0, "isBonus": False}]}
+        search = {
+            "products": [
+                {"webshopId": 5, "title": "Pasta", "currentPrice": 1.0, "priceBeforeBonus": 1.5, "isBonus": True},
+                {"webshopId": 6, "title": "Rijst", "currentPrice": 1.0, "isBonus": False},
+            ]
+        }
 
         def fake_request(method, url, **kwargs):
             raise RuntimeError("404: niet gevonden")
 
-        response = mock.Mock(ok=True)
-        response.json.return_value = search
-        with mock.patch.object(ah, "get_token", return_value="t"), \
-                mock.patch.object(ah, "get_bonus_promotions", side_effect=RuntimeError("AH bonus ophalen mislukt (500)")), \
-                mock.patch.object(ah, "_request_json", side_effect=fake_request), \
-                mock.patch.object(ah.requests, "get", return_value=response), \
-                mock.patch.object(ah, "BONUS_FALLBACK_TERMS", ("pasta",)):
-            products = ah.get_bonus_products()
+        response = httpx.Response(200, json=search)
+        with (
+            mock.patch.object(ah, "get_token", return_value="t"),
+            mock.patch.object(ah, "get_bonus_promotions", side_effect=RuntimeError("AH bonus ophalen mislukt (500)")),
+            mock.patch.object(ah, "_request_json", side_effect=fake_request),
+            served(return_value=response),
+            mock.patch.object(ah, "BONUS_FALLBACK_TERMS", ("pasta",)),
+        ):
+            products = run(ah.get_bonus_products())
         self.assertEqual([p["id"] for p in products], ["5"])
+
+    def test_the_search_fallback_asks_at_most_six_terms_at_once(self):
+        # Elk zoekverzoek geeft de loop een paar keer vrij, zoals een echt antwoord van AH: zonder grens liepen alle termen
+        # tegelijk, met de grens precies zes. De producten komen in de volgorde van de termen.
+        state: list[int] = [0, 0]  # nu bezig, hoogste aantal tegelijk
+
+        async def search(request: httpx.Request) -> httpx.Response:
+            term = request.url.params["query"]
+            state[0] += 1
+            state[1] = max(state[1], state[0])
+            for _ in range(3):
+                await asyncio.sleep(0)
+            state[0] -= 1
+            return httpx.Response(200, json={"products": [{"webshopId": term, "title": term, "currentPrice": 1.0, "isBonus": True}]})
+
+        with (
+            mock.patch.object(ah, "get_token", return_value="t"),
+            mock.patch.object(ah, "get_bonus_promotions", side_effect=RuntimeError("AH bonus ophalen mislukt (500)")),
+            mock.patch.object(ah, "_request_json", side_effect=RuntimeError("404: niet gevonden")),
+            served(side_effect=search) as route,
+        ):
+            products = run(ah.get_bonus_products())
+        self.assertEqual(route.call_count, len(ah.BONUS_FALLBACK_TERMS))
+        self.assertEqual([p["id"] for p in products], list(ah.BONUS_FALLBACK_TERMS))
+        self.assertEqual(state[1], ah.BONUS_SEARCH_WORKERS)
+        self.assertEqual(ah.BONUS_SEARCH_WORKERS, 6)
 
     def test_the_bonus_comes_per_bonus_period_from_graphql(self):
         with mock.patch.object(ah, "get_token", return_value="t"), mock.patch.object(ah, "_graphql", return_value=BONUS_PROMOTIONS) as graphql:
-            products = ah.get_bonus_promotions(today=date(2026, 11, 1))
+            products = run(ah.get_bonus_promotions(today=date(2026, 11, 1)))
         self.assertIn("bonusPeriods", graphql.call_args.args[1])
         by_key = {(p["id"], p["validFrom"]): p for p in products}
-        self.assertEqual(sorted(by_key), [("171425", "2026-11-02"), ("4004", "2026-10-26"), ("4004", "2026-11-02"), ("4164", "2026-11-02"), ("5", "2026-11-02")],
-                         "bezorgkorting, Etos, afgelopen acties en acties buiten AH's bonusperiodes doen niet mee; gehakt staat in beide weken")
+        self.assertEqual(
+            sorted(by_key),
+            [("171425", "2026-11-02"), ("4004", "2026-10-26"), ("4004", "2026-11-02"), ("4164", "2026-11-02"), ("5", "2026-11-02")],
+            "bezorgkorting, Etos, afgelopen acties en acties buiten AH's bonusperiodes doen niet mee; gehakt staat in beide weken",
+        )
         this_week = by_key[("4004", "2026-10-26")]
-        self.assertEqual((this_week["price"], this_week["priceBefore"], this_week["promoLabel"], this_week["validUntil"]), (3.0, 4.0, "25% korting", "2026-11-01"))
+        self.assertEqual(
+            (this_week["price"], this_week["priceBefore"], this_week["promoLabel"], this_week["validUntil"]), (3.0, 4.0, "25% korting", "2026-11-01")
+        )
         next_week = by_key[("4004", "2026-11-02")]
-        self.assertEqual((next_week["price"], next_week["priceBefore"], next_week["promoLabel"]), (4.0, None, "2 voor 2.99"),
-                         "met een minimumaantal blijft de normale prijs staan, zoals bij AH")
+        self.assertEqual(
+            (next_week["price"], next_week["priceBefore"], next_week["promoLabel"]),
+            (4.0, None, "2 voor 2.99"),
+            "met een minimumaantal blijft de normale prijs staan, zoals bij AH",
+        )
         prei = by_key[("171425", "2026-11-02")]
         self.assertEqual((prei["price"], prei["priceBefore"], prei["image"], prei["categoryHint"]), (1.99, 2.49, None, "Groente, aardappelen"))
         self.assertEqual(next_week["image"], "https://img/4004.webp")
@@ -129,10 +217,14 @@ class BonusParsingTest(unittest.TestCase):
         self.assertIsNone(by_key[("5", "2026-11-02")]["validUntil"], "AH's einddatum 2999 is doorlopend")
 
     def test_graphql_comes_first_and_the_old_routes_are_the_fallback(self):
-        with mock.patch.object(ah, "get_token", return_value="t"), mock.patch.object(ah, "_graphql", return_value=BONUS_PROMOTIONS), \
-                mock.patch.object(ah, "_request_json") as bonus_page, mock.patch.object(ah, "date") as fake_date:
+        with (
+            mock.patch.object(ah, "get_token", return_value="t"),
+            mock.patch.object(ah, "_graphql", return_value=BONUS_PROMOTIONS),
+            mock.patch.object(ah, "_request_json") as bonus_page,
+            mock.patch.object(ah, "date") as fake_date,
+        ):
             fake_date.today.return_value = date(2026, 11, 1)
-            products = ah.get_bonus_products()
+            products = run(ah.get_bonus_products())
         self.assertEqual(len(products), 5)
         bonus_page.assert_not_called()
 
@@ -140,17 +232,35 @@ class BonusParsingTest(unittest.TestCase):
 class OffersStoreTest(TempDataDirTest):
     def test_sync_replaces_the_copy_and_load_reads_it(self):
         first = ah.bonus_products_in(BONUS_PAGE)
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: first}):
-            data = offers.sync("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(first)}):
+            data = run(offers.sync("ah"))
         self.assertEqual(data["total"], 3)
         self.assertTrue(data["syncedAt"] and data["supported"])
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: first[:1]}):
-            self.assertEqual(offers.sync("ah")["total"], 1)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(first[:1])}):
+            self.assertEqual(run(offers.sync("ah"))["total"], 1)
+
+    def test_sync_categorises_the_offers_off_the_event_loop(self):
+        # Een categorie per aanbieding (regexen over de titel) hield de loop bij een sync van de volumedatabase 27 ms vast, op een
+        # trager apparaat 150 ms of meer (2026-11-15): `_sync_rows` loopt nu via compute.run.
+        threads: list[str] = []
+        original: Callable[..., Any] = offer_categories.offer_category
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:
+            threads.append(threading.current_thread().name)
+            return original(*args, **kwargs)
+
+        with (
+            mock.patch.object(offer_categories, "offer_category", recorded),
+            mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(ah.bonus_products_in(BONUS_PAGE))}),
+        ):
+            run(offers.sync("ah"))
+        self.assertTrue(threads, "geen categorie bepaald")
+        self.assertNotIn(threading.main_thread().name, threads)
 
     def test_load_adds_the_conditions_of_each_offer(self):
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: ah.bonus_products_in(BONUS_PAGE)}):
-            offers.sync("ah")
-        by_title = {o["title"]: o for o in offers.load("ah")["offers"]}
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(ah.bonus_products_in(BONUS_PAGE))}):
+            run(offers.sync("ah"))
+        by_title = {o["title"]: o for o in run(offers.load("ah"))["offers"]}
         kip = by_title["Kipfilet"]
         self.assertEqual((kip["mechanic"], kip["minQuantity"], kip["unitPrice"]), ("nth_free", 2, 2.25))
         tomaten = by_title["AH Tomaten rond"]
@@ -161,10 +271,17 @@ class OffersStoreTest(TempDataDirTest):
 
     def test_expired_offers_are_not_shown_but_counted(self):
         old = {"id": "21", "title": "Oude aanbieding", "price": 1.0, "priceBefore": 2.0, "promoLabel": "50% korting", "validUntil": "2000-01-01"}
-        current = {"id": "22", "title": "Lopende aanbieding", "price": 1.0, "priceBefore": 2.0, "promoLabel": "50% korting", "validUntil": "2999-01-01"}
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: [old, current]}):
-            offers.sync("ah")
-        data = offers.load("ah")
+        current = {
+            "id": "22",
+            "title": "Lopende aanbieding",
+            "price": 1.0,
+            "priceBefore": 2.0,
+            "promoLabel": "50% korting",
+            "validUntil": "2999-01-01",
+        }
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned([old, current])}):
+            run(offers.sync("ah"))
+        data = run(offers.load("ah"))
         self.assertEqual([o["id"] for o in data["offers"]], ["22"])
         self.assertEqual((data["total"], data["expired"]), (1, 1))
         self.assertEqual(data["offers"][0]["validity"], "valid")
@@ -176,14 +293,14 @@ class OffersStoreTest(TempDataDirTest):
             {"id": "32", "title": "Rijst", **week},
             {"id": "33", "title": "Volume voordeel", "validFrom": "2026-10-26", "validUntil": None, "price": 1.0, "priceBefore": 1.1},
         ]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: items}):
-            offers.sync("ah")
-        data = offers.load("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(items)}):
+            run(offers.sync("ah"))
+        data = run(offers.load("ah"))
         self.assertEqual(data["period"], {"from": "2026-10-26", "until": "2999-01-01"})
         self.assertEqual(data["offers"][0]["validFrom"], "2026-10-26")
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: [items[2]]}):
-            offers.sync("ah")
-        self.assertIsNone(offers.load("ah")["period"])
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned([items[2]])}):
+            run(offers.sync("ah"))
+        self.assertIsNone(run(offers.load("ah"))["period"])
 
     def test_saving_uses_the_unit_price_of_the_condition(self):
         second_half = {"price": 4.0, "priceBefore": 4.0, "unitPrice": 3.0}
@@ -194,24 +311,24 @@ class OffersStoreTest(TempDataDirTest):
         self.assertEqual(offers.saving_of({"price": 3.0, "priceBefore": 2.0, "unitPrice": None}), 0.0, "nooit negatief")
 
     def test_failed_sync_keeps_the_previous_copy(self):
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: ah.bonus_products_in(BONUS_PAGE)}):
-            offers.sync("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(ah.bonus_products_in(BONUS_PAGE))}):
+            run(offers.sync("ah"))
 
         def boom():
             raise RuntimeError("AH is stuk")
 
         with mock.patch.dict(offers.FETCHERS, {"ah": boom}):
             with self.assertRaises(RuntimeError):
-                offers.sync("ah")
-        self.assertEqual(offers.load("ah")["total"], 3)
+                run(offers.sync("ah"))
+        self.assertEqual(run(offers.load("ah"))["total"], 3)
 
     def test_every_store_has_a_fetcher_and_unknown_stores_are_rejected(self):
         for store in offers.STORES:
-            self.assertTrue(offers.load(store)["supported"], store)
+            self.assertTrue(run(offers.load(store))["supported"], store)
         with self.assertRaises(ValueError):
-            offers.sync("lidl")
+            run(offers.sync("nope"))
         with self.assertRaises(ValueError):
-            offers.load("lidl")
+            run(offers.load("nope"))
 
 
 class OffersWeekTest(TempDataDirTest):
@@ -231,19 +348,44 @@ class OffersWeekTest(TempDataDirTest):
             {"id": "vandaag", "title": "Pakketkorting", "validFrom": today.isoformat(), "validUntil": today.isoformat(), **deal},
             {"id": "zonder", "title": "Picnic-achtige aanbieding", **deal},
         ]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: self.items}):
-            offers.sync("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(self.items)}):
+            run(offers.sync("ah"))
+
+    def test_the_sync_stores_the_category_hint_and_uses_the_taxonomy(self):
+        items = [
+            {
+                "id": "pizza",
+                "title": "Dr. Oetker Casa di mama pizza salami",
+                "categoryHint": "Diepvries",
+                "price": 3.65,
+                "priceBefore": 4.29,
+                "promoLabel": "15% korting",
+            }
+        ]
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(items)}):
+            run(offers.sync("ah"))
+        from contextlib import closing
+
+        with closing(db(offers)) as conn:
+            row = conn.execute("SELECT category, category_hint FROM offers WHERE product_id = 'pizza'").fetchone()
+        self.assertEqual(tuple(row), ("diepvries", "Diepvries"))
+        self.assertEqual([o["category"] for o in run(offers.load("ah"))["offers"] if o["id"] == "pizza"], ["diepvries"])
 
     def test_this_week_leaves_out_next_weeks_bonus_and_counts_it(self):
-        data = offers.load("ah", self.monday.isoformat())
-        self.assertEqual([o["id"] for o in data["offers"]], ["deze", "vandaag", "zonder", "doorlopend"], "de bonus van de week voor de doorlopende kortingen")
+        data = run(offers.load("ah", self.monday.isoformat()))
+        self.assertEqual(
+            [o["id"] for o in data["offers"]], ["deze", "vandaag", "zonder", "doorlopend"], "de bonus van de week voor de doorlopende kortingen"
+        )
         self.assertEqual((data["total"], data["later"], data["undated"]), (4, 1, 0))
         self.assertEqual(data["week"], {"from": self.monday.isoformat(), "until": (self.monday + timedelta(days=6)).isoformat(), "current": True})
-        self.assertEqual(data["period"], {"from": self.monday.isoformat(), "until": (self.monday + timedelta(days=6)).isoformat()},
-                         "de bonusweek, niet de looptijd van één dag van de pakketkortingen")
+        self.assertEqual(
+            data["period"],
+            {"from": self.monday.isoformat(), "until": (self.monday + timedelta(days=6)).isoformat()},
+            "de bonusweek, niet de looptijd van één dag van de pakketkortingen",
+        )
 
     def test_next_week_shows_its_bonus_and_what_keeps_running(self):
-        data = offers.load("ah", (self.next_monday + timedelta(days=3)).isoformat())
+        data = run(offers.load("ah", (self.next_monday + timedelta(days=3)).isoformat()))
         self.assertEqual([o["id"] for o in data["offers"]], ["volgende", "doorlopend"], "elke dag van de week wijst dezelfde week aan")
         self.assertEqual((data["later"], data["undated"]), (0, 1), "zonder looptijd is alleen vandaag bekend")
         self.assertEqual(data["week"]["from"], self.next_monday.isoformat())
@@ -251,87 +393,271 @@ class OffersWeekTest(TempDataDirTest):
         self.assertEqual(data["period"]["from"], self.next_monday.isoformat())
 
     def test_without_a_week_everything_that_has_not_expired_is_given(self):
-        data = offers.load("ah")
+        data = run(offers.load("ah"))
         self.assertEqual(data["total"], 5, "zo blijft de AI in alles zoeken wat bekend is")
         self.assertIsNone(data["week"])
 
     def test_a_week_that_is_not_a_date_is_refused(self):
         for week in ("volgende", "2026-13-01", ""):
             with self.assertRaises(ValueError, msg=week):
-                offers.load("ah", week)
+                run(offers.load("ah", week))
 
     def test_each_week_has_its_own_signature(self):
-        this_week = offers.signature("ah", self.monday.isoformat())
-        self.assertEqual(this_week, offers.signature("ah", (self.monday + timedelta(days=2)).isoformat()))
-        self.assertNotEqual(this_week, offers.signature("ah", self.next_monday.isoformat()))
+        this_week = run(offers.signature("ah", self.monday.isoformat()))
+        self.assertEqual(this_week, run(offers.signature("ah", (self.monday + timedelta(days=2)).isoformat())))
+        self.assertNotEqual(this_week, run(offers.signature("ah", self.next_monday.isoformat())))
 
     def test_recipe_suggestions_use_the_offers_of_the_week(self):
-        with mock.patch.object(offers, "COLLECTORS", (("mealie", lambda: [
-                {"id": "r1", "title": "Pasta", "image": "", "url": "", "ingredients": ["400 g kipfilet"], "course": "hoofdgerecht"}]),)):
-            offers.sync_recipes()
-        later = offers.suggest("ah", week=self.next_monday.isoformat())
+        with mock.patch.object(
+            offers,
+            "COLLECTORS",
+            (
+                (
+                    "mealie",
+                    lambda: returned(
+                        [{"id": "r1", "title": "Pasta", "image": "", "url": "", "ingredients": ["400 g kipfilet"], "course": "hoofdgerecht"}]
+                    ),
+                ),
+            ),
+        ):
+            run(offers.sync_recipes())
+        later = run(offers.suggest("ah", week=self.next_monday.isoformat()))
         self.assertEqual([r["id"] for r in later["recipes"]], ["r1"])
         self.assertEqual(later["week"]["from"], self.next_monday.isoformat())
-        self.assertEqual(offers.suggest("ah", week=self.monday.isoformat())["recipes"], [], "dat product is deze week niet in de aanbieding")
+        self.assertEqual(run(offers.suggest("ah", week=self.monday.isoformat()))["recipes"], [], "dat product is deze week niet in de aanbieding")
 
     def test_a_product_on_offer_this_week_and_next_week_keeps_both_deals(self):
         sunday = self.monday + timedelta(days=6)
         twice = [
-            {"id": "4004", "title": "AH Rundergehakt", "price": 3.0, "priceBefore": 4.0, "promoLabel": "25% korting",
-             "validFrom": self.monday.isoformat(), "validUntil": sunday.isoformat()},
-            {"id": "4004", "title": "AH Rundergehakt", "price": 4.0, "priceBefore": None, "promoLabel": "2 voor 5.00",
-             "validFrom": self.next_monday.isoformat(), "validUntil": (self.next_monday + timedelta(days=6)).isoformat()},
+            {
+                "id": "4004",
+                "title": "AH Rundergehakt",
+                "price": 3.0,
+                "priceBefore": 4.0,
+                "promoLabel": "25% korting",
+                "validFrom": self.monday.isoformat(),
+                "validUntil": sunday.isoformat(),
+            },
+            {
+                "id": "4004",
+                "title": "AH Rundergehakt",
+                "price": 4.0,
+                "priceBefore": None,
+                "promoLabel": "2 voor 5.00",
+                "validFrom": self.next_monday.isoformat(),
+                "validUntil": (self.next_monday + timedelta(days=6)).isoformat(),
+            },
         ]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: twice + twice[:1]}):
-            offers.sync("ah")
-        self.assertEqual([o["promoLabel"] for o in offers.load("ah", self.monday.isoformat())["offers"]], ["25% korting"])
-        self.assertEqual(offers.load("ah", self.monday.isoformat())["later"], 1)
-        self.assertEqual([o["promoLabel"] for o in offers.load("ah", self.next_monday.isoformat())["offers"]], ["2 voor 5.00"])
-        self.assertEqual([o["promoLabel"] for o in offers.load("ah")["offers"]], ["25% korting"], "zonder week: elk product een keer, de actie van nu")
-        with closing(offers._connect()) as conn:
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(twice + twice[:1])}):
+            run(offers.sync("ah"))
+        self.assertEqual([o["promoLabel"] for o in run(offers.load("ah", self.monday.isoformat()))["offers"]], ["25% korting"])
+        self.assertEqual(run(offers.load("ah", self.monday.isoformat()))["later"], 1)
+        self.assertEqual([o["promoLabel"] for o in run(offers.load("ah", self.next_monday.isoformat()))["offers"]], ["2 voor 5.00"])
+        self.assertEqual(
+            [o["promoLabel"] for o in run(offers.load("ah"))["offers"]], ["25% korting"], "zonder week: elk product een keer, de actie van nu"
+        )
+        with closing(db(offers)) as conn:
             history = conn.execute("SELECT promo_label FROM offer_history WHERE product_id = '4004'").fetchall()
-        self.assertEqual([row["promo_label"] for row in history], ["25% korting"], "de actie van volgende week komt in de geschiedenis als hij begint")
+        self.assertEqual(
+            [row["promo_label"] for row in history], ["25% korting"], "de actie van volgende week komt in de geschiedenis als hij begint"
+        )
 
     def test_two_deals_in_the_same_week_show_the_most_specific_one(self):
-        long_running = {"id": "9", "title": "Kerstkoekjes", "price": 2.0, "promoLabel": "Feestfavoriet",
-                        "validFrom": (self.monday - timedelta(days=14)).isoformat(), "validUntil": (self.monday + timedelta(days=40)).isoformat()}
-        weekly = {**long_running, "promoLabel": "2e halve prijs", "validFrom": self.next_monday.isoformat(),
-                  "validUntil": (self.next_monday + timedelta(days=6)).isoformat()}
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: [long_running, weekly]}):
-            offers.sync("ah")
-        self.assertEqual([o["promoLabel"] for o in offers.load("ah", self.next_monday.isoformat())["offers"]], ["2e halve prijs"])
-        self.assertEqual([o["promoLabel"] for o in offers.load("ah", self.monday.isoformat())["offers"]], ["Feestfavoriet"])
+        long_running = {
+            "id": "9",
+            "title": "Kerstkoekjes",
+            "price": 2.0,
+            "promoLabel": "Feestfavoriet",
+            "validFrom": (self.monday - timedelta(days=14)).isoformat(),
+            "validUntil": (self.monday + timedelta(days=40)).isoformat(),
+        }
+        weekly = {
+            **long_running,
+            "promoLabel": "2e halve prijs",
+            "validFrom": self.next_monday.isoformat(),
+            "validUntil": (self.next_monday + timedelta(days=6)).isoformat(),
+        }
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned([long_running, weekly])}):
+            run(offers.sync("ah"))
+        self.assertEqual([o["promoLabel"] for o in run(offers.load("ah", self.next_monday.isoformat()))["offers"]], ["2e halve prijs"])
+        self.assertEqual([o["promoLabel"] for o in run(offers.load("ah", self.monday.isoformat()))["offers"]], ["Feestfavoriet"])
 
-    def test_the_routes_take_the_week_and_default_to_this_week(self):
-        client = create_app().test_client()
-        default = client.get("/api/offers?store=ah")
+    async def test_warm_offers_fills_the_cache_so_the_first_request_does_not_annotate(self):
+        app = create_app()
+        client = self.client_for(app)
+        with mock.patch.object(prices, "annotate", wraps=prices.annotate) as spy:
+            await app.extensions["mealieshopper_warm_offers"]()
+            warmed = spy.await_count
+            self.assertGreaterEqual(warmed, 2, "deze week en volgende week van AH")
+            self.assertEqual((await client.get("/api/offers?store=ah")).status_code, 200)
+            self.assertEqual(spy.await_count, warmed, "de eerste aanvraag komt uit de cache")
+
+    async def test_the_warm_up_and_a_request_with_a_week_share_the_cache_key(self):
+        # De browser vraagt altijd ?week=<maandag>; de opwarmer rekent op een dinsdag met de datum van vandaag. Dezelfde sleutel.
+        from mealieshopper import app as app_module
+
+        app = create_app()
+        client = self.client_for(app)
+        tuesday = self.monday + timedelta(days=1)
+
+        class Today(date):
+            @classmethod
+            def today(cls):
+                return tuesday
+
+        with (
+            mock.patch.object(app_module, "date", Today),
+            mock.patch.object(offers, "STORES", ("ah",)),
+            mock.patch.object(prices, "annotate", wraps=prices.annotate) as spy,
+        ):
+            await app.extensions["mealieshopper_warm_offers"]()
+            warmed = spy.await_count
+            self.assertEqual((await client.get(f"/api/offers?store=ah&week={self.monday.isoformat()}")).status_code, 200)
+            self.assertEqual(spy.await_count, warmed, "de aanvraag van de browser komt uit de opgewarmde cache")
+
+    async def test_a_request_during_the_warm_up_shares_the_computation(self):
+        app = create_app()
+        client = self.client_for(app)
+        with mock.patch.object(offers, "STORES", ("ah",)), mock.patch.object(prices, "annotate", wraps=prices.annotate) as spy:
+            await asyncio.gather(app.extensions["mealieshopper_warm_offers"](), client.get("/api/offers?store=ah"))
+            self.assertEqual(spy.await_count, 2, "deze week een keer (gedeeld) en volgende week een keer")
+
+    async def test_the_offers_carry_the_pack_margin(self):
+        # De client vergelijkt verpakkingen per eenheid met dezelfde marge als de server (prices.PACK_MARGIN, 2 procent).
+        client = self.client_for(create_app())
+        self.assertEqual((await client.get("/api/offers?store=ah")).get_json()["packMargin"], 0.02)
+
+    async def test_the_routes_take_the_week_and_default_to_this_week(self):
+        client = self.client_for(create_app())
+        default = await client.get("/api/offers?store=ah")
         self.assertTrue(default.get_json()["week"]["current"])
         self.assertEqual(default.get_json()["later"], 1)
-        later = client.get(f"/api/offers?store=ah&week={self.next_monday.isoformat()}")
+        later = await client.get(f"/api/offers?store=ah&week={self.next_monday.isoformat()}")
         self.assertEqual({o["id"] for o in later.get_json()["offers"]}, {"volgende", "doorlopend"})
         self.assertNotEqual(later.headers["ETag"], default.headers["ETag"], "elke week heeft een eigen ETag")
-        self.assertEqual(client.get("/api/offers?store=ah&week=morgen").status_code, 400)
-        self.assertEqual(client.get("/api/offers/recipes?store=ah&week=morgen").status_code, 400)
-        self.assertEqual(client.get(f"/api/offers/recipes?store=ah&week={self.next_monday.isoformat()}").status_code, 200)
+        self.assertEqual((await client.get("/api/offers?store=ah&week=morgen")).status_code, 400)
+        self.assertEqual((await client.get("/api/offers/recipes?store=ah&week=morgen")).status_code, 400)
+        self.assertEqual((await client.get(f"/api/offers/recipes?store=ah&week={self.next_monday.isoformat()}")).status_code, 200)
+
+    async def test_an_unknown_week_is_reported_in_the_language_of_the_browser(self):
+        # offers.load rekent buiten de event loop (compute.run), waar de taal van de aanvraag (een ContextVar) niet is: de week
+        # wordt daarom op de loop gecontroleerd. Review van taak 8, 2026-11-13.
+        client = self.client_for(create_app())
+        for path in ("/api/offers/recipes?store=ah&week=foo", "/api/offers?store=ah&week=foo"):
+            english = await client.get(path, headers={"Cookie": "ms_lang=en"})
+            self.assertEqual(english.status_code, 400, path)
+            self.assertTrue(english.get_json()["error"].startswith("Unknown week"), path)
+            dutch = await client.get(path)
+            self.assertTrue(dutch.get_json()["error"].startswith("Onbekende week"), path)
+
+
+class SyncWarmTest(AppTestCase):
+    """De knop `Aanbiedingen synchroniseren` per winkel verandert de ETag: daarna warmt de app de lijst met oordeel alvast op."""
+
+    async def test_the_per_store_sync_warms_the_offers_afterwards(self):
+        patcher = mock.patch.dict(os.environ, {"PASSKEY_AUTH_ENABLED": "false"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        app = create_app()
+        warmer = mock.AsyncMock()
+        app.extensions["mealieshopper_warm_offers"] = warmer
+        client = self.client_for(app)
+        with mock.patch.object(offers, "sync", new_callable=mock.AsyncMock, return_value={"store": "ah", "offers": []}):
+            self.assertEqual((await client.post("/api/offers/sync", json={"store": "ah"})).status_code, 200)
+        for _ in range(20):
+            if warmer.await_count:
+                break
+            await asyncio.sleep(0.01)
+        warmer.assert_awaited_once_with(("ah",))
+
+    async def test_the_store_of_the_sync_is_folded_before_warming(self):
+        # offers.sync neemt " Jumbo " aan als jumbo, dus de opwarmer moet dezelfde winkel krijgen en niet terugvallen op ah.
+        patcher = mock.patch.dict(os.environ, {"PASSKEY_AUTH_ENABLED": "false"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        app = create_app()
+        warmer = mock.AsyncMock()
+        app.extensions["mealieshopper_warm_offers"] = warmer
+        client = self.client_for(app)
+        with mock.patch.object(offers, "sync", new_callable=mock.AsyncMock, return_value={"store": "jumbo", "offers": []}):
+            self.assertEqual((await client.post("/api/offers/sync", json={"store": " Jumbo "})).status_code, 200)
+        for _ in range(20):
+            if warmer.await_count:
+                break
+            await asyncio.sleep(0.01)
+        warmer.assert_awaited_once_with(("jumbo",))
+
+
+class WarmerLifetimeTest(TempDataDirTest):
+    """create_app registreert zijn opwarmer bij offers_schedule; na het stoppen laat de app hem los, tenzij een latere app hem al verving."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(offers_schedule.set_warmer, None)
+
+    async def test_shutdown_lets_go_of_the_warmer(self):
+        app = create_app()
+        async with app.test_app():
+            self.assertIs(offers_schedule._warmer, app.extensions["mealieshopper_warm_offers"])
+        self.assertIsNone(offers_schedule._warmer)
+
+    async def test_shutdown_leaves_the_warmer_of_a_later_app_alone(self):
+        first = create_app()
+        second = create_app()
+        async with first.test_app():
+            pass
+        self.assertIs(offers_schedule._warmer, second.extensions["mealieshopper_warm_offers"])
+
+
+class HistoryProductsTest(unittest.TestCase):
+    def test_a_row_without_a_category_asks_offer_category_with_the_store(self):
+        row = {
+            "store": "ah",
+            "product_id": "1",
+            "title": "AH Halfvolle melk",
+            "brand": "AH",
+            "unit_size": "1 l",
+            "category": None,
+            "first_seen": "2026-11-01",
+            "ended_at": None,
+            "last_seen": "2026-11-09",
+            "price": 1.0,
+            "price_before": 1.5,
+            "promo_label": "",
+            "valid_from": None,
+            "valid_until": None,
+            "syncs": 1,
+            "continued": 0,
+            "image": "",
+            "url": "",
+        }
+        with mock.patch.object(offer_categories, "offer_category", return_value="zuivel") as category:
+            products = offers._history_products([row])
+        category.assert_called_once_with("ah", "AH Halfvolle melk")
+        self.assertEqual(products[("ah", "1")]["category"], "zuivel")
 
 
 class OffersTableMigrationTest(TempDataDirTest):
     def test_a_table_from_before_2_84_loses_its_key_and_keeps_its_rows(self):
-        with closing(auth.connect()) as conn, conn:
+        with closing(db()) as conn, conn:
             conn.execute(
                 "CREATE TABLE offers (store TEXT NOT NULL, product_id TEXT NOT NULL, position INTEGER NOT NULL, title TEXT NOT NULL, brand TEXT, "
                 "unit_size TEXT, price REAL, price_before REAL, promo_label TEXT, image TEXT, url TEXT, valid_until TEXT, PRIMARY KEY (store, product_id))"
             )
-            conn.execute("INSERT INTO offers (store, product_id, position, title, price, promo_label) VALUES ('ah', '1', 0, 'AH Kipfilet', 3.0, '1+1 gratis')")
-        data = offers.load("ah")
+            conn.execute(
+                "INSERT INTO offers (store, product_id, position, title, price, promo_label) VALUES ('ah', '1', 0, 'AH Kipfilet', 3.0, '1+1 gratis')"
+            )
+        data = run(offers.load("ah"))
         self.assertEqual([(o["id"], o["title"], o["promoLabel"]) for o in data["offers"]], [("1", "AH Kipfilet", "1+1 gratis")])
-        with closing(offers._connect()) as conn:
+        with closing(db(offers)) as conn:
             self.assertFalse(any(row["pk"] for row in conn.execute("PRAGMA table_info(offers)")))
             conn.execute("INSERT INTO offers (store, product_id, position, title) VALUES ('ah', '1', 1, 'AH Kipfilet')")
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM offers WHERE product_id = '1'").fetchone()[0], 2, "een product mag er nu twee keer in")
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM offers WHERE product_id = '1'").fetchone()[0], 2, "een product mag er nu twee keer in"
+            )
 
 
-class LinkingTest(unittest.TestCase):
+class LinkingTest(AppTestCase):
     """Een ingrediënt hoort alleen bij een aanbieding die dat product zelf is, niet bij een bereid product waar het in zit."""
 
     def match(self, ingredient, title):
@@ -398,22 +724,35 @@ class LinkingTest(unittest.TestCase):
 
 class SuggestionsTest(TempDataDirTest):
     def index(self, collected):
-        collectors = tuple((name, (lambda items=items: items)) for name, items in collected.items())
+        collectors = tuple((name, (lambda items=items: returned(items))) for name, items in collected.items())
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            return offers.sync_recipes()
+            return run(offers.sync_recipes())
 
     def test_recipes_are_ranked_by_share_of_ingredients_on_offer(self):
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: ah.bonus_products_in(BONUS_PAGE)}):
-            offers.sync("ah")
-        self.index({
-            "mealie": [
-                {"id": "r1", "title": "Kip met tomaat", "image": "", "url": "http://m/r1",
-                 "ingredients": ["400 g kipfilet", "4 tomaten", "zout", "2 el olijfolie"]},
-                {"id": "r2", "title": "Stoofpot", "image": "", "url": "", "ingredients": ["kipfilet", "wortelen", "aardappelen", "bouillon", "prei"]},
-                {"id": "r3", "title": "Taart", "image": "", "url": "", "ingredients": ["bloem", "suiker", "eieren"]},
-            ]
-        })
-        data = offers.suggest("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(ah.bonus_products_in(BONUS_PAGE))}):
+            run(offers.sync("ah"))
+        self.index(
+            {
+                "mealie": [
+                    {
+                        "id": "r1",
+                        "title": "Kip met tomaat",
+                        "image": "",
+                        "url": "http://m/r1",
+                        "ingredients": ["400 g kipfilet", "4 tomaten", "zout", "2 el olijfolie"],
+                    },
+                    {
+                        "id": "r2",
+                        "title": "Stoofpot",
+                        "image": "",
+                        "url": "",
+                        "ingredients": ["kipfilet", "wortelen", "aardappelen", "bouillon", "prei"],
+                    },
+                    {"id": "r3", "title": "Taart", "image": "", "url": "", "ingredients": ["bloem", "suiker", "eieren"]},
+                ]
+            }
+        )
+        data = run(offers.suggest("ah"))
         self.assertEqual([r["id"] for r in data["recipes"]], ["r1"], "r2 heeft maar 1 van 5, r3 niets")
         recipe = data["recipes"][0]
         self.assertEqual((recipe["matchedCount"], recipe["ingredientCount"]), (2, 2), "zout en olijfolie zijn basis en tellen niet mee")
@@ -424,20 +763,39 @@ class SuggestionsTest(TempDataDirTest):
 
     def test_the_tagliatelle_example_links_only_what_is_really_on_offer(self):
         titles = [
-            ("1", "AH Tagliatelle all' uovo 4-pack"), ("2", "AH Gehakt met ui 3-pack"),
-            ("3", "AH Champignon saus romig en vol 3-pack"), ("4", "Princes Tonijnstukken in olijfolie 3-pack"),
-            ("5", "Hak Spinazie met room 4-pack"), ("6", "AH Zalmfilet 2-pack"),
+            ("1", "AH Tagliatelle all' uovo 4-pack"),
+            ("2", "AH Gehakt met ui 3-pack"),
+            ("3", "AH Champignon saus romig en vol 3-pack"),
+            ("4", "Princes Tonijnstukken in olijfolie 3-pack"),
+            ("5", "Hak Spinazie met room 4-pack"),
+            ("6", "AH Zalmfilet 2-pack"),
             ("7", "Verstegen Kruidenmix gehakt slagersrecept 3-pack"),
         ]
         fetched = [{"id": i, "title": t, "price": 2.0, "priceBefore": 3.0, "promoLabel": "Bonus"} for i, t in titles]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        self.index({"mealie": [{
-            "id": "r1", "title": "Romige tagliatelle met zalm", "image": "", "url": "",
-            "ingredients": ["300 g tagliatelle", "1 middelgrote ui", "250 g champignons", "2 el milde olijfolie",
-                            "400 g verse spinazie", "100 g Noorse gerookte zalmfilet", "200 g zuivelspread knoflook en kruiden"],
-        }]})
-        recipe = offers.suggest("ah")["recipes"][0]
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        self.index(
+            {
+                "mealie": [
+                    {
+                        "id": "r1",
+                        "title": "Romige tagliatelle met zalm",
+                        "image": "",
+                        "url": "",
+                        "ingredients": [
+                            "300 g tagliatelle",
+                            "1 middelgrote ui",
+                            "250 g champignons",
+                            "2 el milde olijfolie",
+                            "400 g verse spinazie",
+                            "100 g Noorse gerookte zalmfilet",
+                            "200 g zuivelspread knoflook en kruiden",
+                        ],
+                    }
+                ]
+            }
+        )
+        recipe = run(offers.suggest("ah"))["recipes"][0]
         self.assertEqual((recipe["matchedCount"], recipe["ingredientCount"]), (2, 6), "de olijfolie is een basisingrediënt en telt niet mee")
         self.assertEqual(sorted(m["offer"]["id"] for m in recipe["matched"]), ["1", "6"])
         self.assertEqual(recipe["saving"], 2.0, "twee keer 1,00 goedkoper, niet 11,41")
@@ -448,72 +806,84 @@ class SuggestionsTest(TempDataDirTest):
             {"id": "2", "title": "Jumbo Kipfilet", "price": 3.5, "priceBefore": 4.0, "promoLabel": "Bonus"},
             {"id": "3", "title": "AH Tomaten rond", "price": 1.0, "priceBefore": 2.0, "promoLabel": "Bonus"},
         ]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        self.index({"mealie": [
-            {"id": "r1", "title": "Kip met tomaat", "image": "", "url": "", "ingredients": ["400 g kipfilet", "4 tomaten"]},
-            {"id": "r2", "title": "Kipsalade", "image": "", "url": "", "ingredients": ["kipfilet", "tomaten", "sla", "komkommer", "ui"]},
-        ]})
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        self.index(
+            {
+                "mealie": [
+                    {"id": "r1", "title": "Kip met tomaat", "image": "", "url": "", "ingredients": ["400 g kipfilet", "4 tomaten"]},
+                    {"id": "r2", "title": "Kipsalade", "image": "", "url": "", "ingredients": ["kipfilet", "tomaten", "sla", "komkommer", "ui"]},
+                ]
+            }
+        )
 
     def matched_ids(self, recipe_id):
-        recipe = next(r for r in offers.suggest("ah")["recipes"] if r["id"] == recipe_id)
+        recipe = next(r for r in run(offers.suggest("ah"))["recipes"] if r["id"] == recipe_id)
         return {m["ingredient"]: m["offer"]["id"] for m in recipe["matched"]}
 
     def test_a_reported_match_does_not_come_back_and_the_next_best_product_takes_its_place(self):
         self.reported_setup()
         self.assertEqual(self.matched_ids("r1")["400 g kipfilet"], "1")
-        reported = offers.report_mismatch("ah", "400 g kipfilet", "1")
+        reported = run(offers.report_mismatch("ah", "400 g kipfilet", "1"))
         self.assertEqual((reported["offerId"], reported["head"]), ("1", offers.head_of("400 g kipfilet")))
         self.assertEqual(self.matched_ids("r1")["400 g kipfilet"], "2", "het andere kipfilet-product blijft over")
         self.assertEqual(self.matched_ids("r1")["4 tomaten"], "3", "andere koppelingen blijven staan")
 
     def test_a_report_counts_for_every_recipe_with_the_same_main_word_but_only_in_that_store(self):
         self.reported_setup()
-        offers.report_mismatch("ah", "400 g kipfilet", "1")
+        run(offers.report_mismatch("ah", "400 g kipfilet", "1"))
         self.assertEqual(self.matched_ids("r2")["kipfilet"], "2", "ook in een ander recept met kipfilet")
-        with mock.patch.dict(offers.FETCHERS, {"jumbo": lambda: [{"id": "1", "title": "Jumbo Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"}]}):
-            offers.sync("jumbo")
-        recipe = next(r for r in offers.suggest("jumbo")["recipes"] if r["id"] == "r1")
+        with mock.patch.dict(
+            offers.FETCHERS,
+            {"jumbo": lambda: returned([{"id": "1", "title": "Jumbo Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"}])},
+        ):
+            run(offers.sync("jumbo"))
+        recipe = next(r for r in run(offers.suggest("jumbo"))["recipes"] if r["id"] == "r1")
         self.assertEqual({m["offer"]["id"] for m in recipe["matched"]}, {"1"}, "product 1 bij Jumbo is een ander product dan product 1 bij AH")
 
     def test_a_report_can_be_undone_and_survives_a_new_sync(self):
         self.reported_setup()
-        offers.report_mismatch("ah", "400 g kipfilet", "1")
-        fetched = [{"id": "1", "title": "AH Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"},
-                   {"id": "3", "title": "AH Tomaten rond", "price": 1.0, "priceBefore": 2.0, "promoLabel": "Bonus"}]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
+        run(offers.report_mismatch("ah", "400 g kipfilet", "1"))
+        fetched = [
+            {"id": "1", "title": "AH Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"},
+            {"id": "3", "title": "AH Tomaten rond", "price": 1.0, "priceBefore": 2.0, "promoLabel": "Bonus"},
+        ]
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
         self.assertNotIn("400 g kipfilet", self.matched_ids("r1"), "na een nieuwe synchronisatie blijft de melding gelden")
-        offers.undo_mismatch("ah", "400 g kipfilet", "1")
+        run(offers.undo_mismatch("ah", "400 g kipfilet", "1"))
         self.assertEqual(self.matched_ids("r1")["400 g kipfilet"], "1")
 
     def test_reporting_validates_store_ingredient_and_product(self):
         self.reported_setup()
         with self.assertRaises(ValueError):
-            offers.report_mismatch("lidl", "kipfilet", "1")
+            run(offers.report_mismatch("nope", "kipfilet", "1"))
         with self.assertRaises(ValueError):
-            offers.report_mismatch("ah", "zout", "1")  # een basisingrediënt koppelt niet, dus valt er niets te melden
+            run(offers.report_mismatch("ah", "zout", "1"))  # een basisingrediënt koppelt niet, dus valt er niets te melden
         with self.assertRaises(ValueError):
-            offers.report_mismatch("ah", "kipfilet", "999")
+            run(offers.report_mismatch("ah", "kipfilet", "999"))
         self.assertEqual(self.matched_ids("r1")["400 g kipfilet"], "1")
 
     def test_reports_from_before_reason_and_source_still_work(self):
         self.reported_setup()
-        with closing(offers._connect()) as conn, conn:
+        with closing(db(offers)) as conn, conn:
             conn.execute("DROP TABLE offer_rejections")
-            conn.execute("CREATE TABLE offer_rejections (store TEXT NOT NULL, product_id TEXT NOT NULL, head TEXT NOT NULL, ingredient TEXT NOT NULL, "
-                         "title TEXT NOT NULL, reported_at TEXT NOT NULL, PRIMARY KEY (store, product_id, head))")
+            conn.execute(
+                "CREATE TABLE offer_rejections (store TEXT NOT NULL, product_id TEXT NOT NULL, head TEXT NOT NULL, ingredient TEXT NOT NULL, "
+                "title TEXT NOT NULL, reported_at TEXT NOT NULL, PRIMARY KEY (store, product_id, head))"
+            )
             conn.execute("INSERT INTO offer_rejections VALUES ('ah', '1', 'kipfilet', '400 g kipfilet', 'AH Kipfilet', '2026-10-22T20:00:00+00:00')")
-        listed = offers.list_mismatches("ah")
+        auth.forget_runtime_state()  # de migratie loopt bij de start van de app, een keer per proces
+        listed = run(offers.list_mismatches("ah"))
         self.assertEqual((listed["total"], listed["reports"][0]["source"], listed["reports"][0]["reason"]), (1, "app", ""))
-        offers.report_mismatch("ah", "4 tomaten", "3", "geen tomaat", source="assistant")
-        self.assertEqual(offers.list_mismatches("ah")["total"], 2)
+        run(offers.report_mismatch("ah", "4 tomaten", "3", "geen tomaat", source="assistant"))
+        self.assertEqual(run(offers.list_mismatches("ah"))["total"], 2)
 
     def test_an_english_line_is_reported_under_its_dutch_main_word(self):
         self.reported_setup()
         self.index({"mealie": [{"id": "e1", "title": "Chicken", "image": "", "url": "", "ingredients": ["400 g chicken breast", "4 tomatoes"]}]})
         self.assertEqual(self.matched_ids("e1")["400 g chicken breast"], "1")
-        offers.report_mismatch("ah", "400 g chicken breast", "1")
+        run(offers.report_mismatch("ah", "400 g chicken breast", "1"))
         self.assertEqual(self.matched_ids("e1")["400 g chicken breast"], "2")
 
     def course_setup(self):
@@ -522,75 +892,122 @@ class SuggestionsTest(TempDataDirTest):
             {"id": "2", "title": "AH Tomaten rond", "price": 1.0, "priceBefore": 2.0, "promoLabel": "Bonus"},
             {"id": "3", "title": "AH Eieren 10 stuks", "price": 2.0, "priceBefore": 3.0, "promoLabel": "Bonus"},
         ]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        self.index({
-            "mealie": [
-                {"id": "a", "title": "Kip met tomaat", "image": "", "url": "", "course": "hoofdgerecht",
-                 "ingredients": ["400 g kipfilet", "4 tomaten", "2 el olijfolie", "zout", "1 courgette"]},
-                {"id": "b", "title": "Roerei", "image": "", "url": "", "course": "ontbijt",
-                 "ingredients": ["6 eieren", "2 tomaten", "30 g roomboter"]},
-                {"id": "c", "title": "Tomatensalade", "image": "", "url": "", "course": "overig",
-                 "ingredients": ["4 tomaten", "1 komkommer", "2 el azijn"]},
-            ]
-        })
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        self.index(
+            {
+                "mealie": [
+                    {
+                        "id": "a",
+                        "title": "Kip met tomaat",
+                        "image": "",
+                        "url": "",
+                        "course": "hoofdgerecht",
+                        "ingredients": ["400 g kipfilet", "4 tomaten", "2 el olijfolie", "zout", "1 courgette"],
+                    },
+                    {
+                        "id": "b",
+                        "title": "Roerei",
+                        "image": "",
+                        "url": "",
+                        "course": "ontbijt",
+                        "ingredients": ["6 eieren", "2 tomaten", "30 g roomboter"],
+                    },
+                    {
+                        "id": "c",
+                        "title": "Tomatensalade",
+                        "image": "",
+                        "url": "",
+                        "course": "overig",
+                        "ingredients": ["4 tomaten", "1 komkommer", "2 el azijn"],
+                    },
+                ]
+            }
+        )
 
     def test_basics_do_not_count_and_missing_ingredients_are_listed(self):
         self.course_setup()
-        recipe = {r["id"]: r for r in offers.suggest("ah")["recipes"]}["a"]
+        recipe = {r["id"]: r for r in run(offers.suggest("ah"))["recipes"]}["a"]
         self.assertEqual((recipe["matchedCount"], recipe["ingredientCount"]), (2, 3), "olijfolie en zout zijn basis")
         self.assertEqual(recipe["missing"], ["1 courgette"])
-        roerei = {r["id"]: r for r in offers.suggest("ah")["recipes"]}["b"]
+        roerei = {r["id"]: r for r in run(offers.suggest("ah"))["recipes"]}["b"]
         self.assertEqual((roerei["matchedCount"], roerei["ingredientCount"], roerei["missing"]), (2, 2, []), "roomboter is basis")
 
     def test_the_most_complete_recipe_comes_first(self):
         self.course_setup()
-        self.assertEqual([r["id"] for r in offers.suggest("ah")["recipes"]], ["b", "a", "c"])
+        self.assertEqual([r["id"] for r in run(offers.suggest("ah"))["recipes"]], ["b", "a", "c"])
 
     def test_courses_are_counted_over_all_suggestions_and_the_filter_applies_before_the_limit(self):
         self.course_setup()
-        data = offers.suggest("ah")
+        data = run(offers.suggest("ah"))
         self.assertEqual(data["courses"], [{"id": "ontbijt", "count": 1}, {"id": "hoofdgerecht", "count": 1}, {"id": "overig", "count": 1}])
         self.assertEqual(data["course"], "all")
-        main = offers.suggest("ah", limit=1, course="hoofdgerecht")
+        main = run(offers.suggest("ah", limit=1, course="hoofdgerecht"))
         self.assertEqual([r["id"] for r in main["recipes"]], ["a"], "het filter geldt vóór de limiet")
         self.assertEqual((main["total"], main["course"]), (1, "hoofdgerecht"))
         self.assertEqual(main["courses"], data["courses"], "de aantallen blijven die van alle voorstellen")
-        self.assertEqual(offers.suggest("ah", course="dessert")["recipes"], [])
-        self.assertEqual(len(offers.suggest("ah", course="all")["recipes"]), 3)
+        self.assertEqual(run(offers.suggest("ah", course="dessert"))["recipes"], [])
+        self.assertEqual(len(run(offers.suggest("ah", course="all"))["recipes"]), 3)
 
     def test_an_unknown_course_is_refused(self):
         self.course_setup()
         with self.assertRaises(ValueError):
-            offers.suggest("ah", course="pannenkoek")
+            run(offers.suggest("ah", course="pannenkoek"))
 
     def test_recipes_without_a_course_are_other(self):
         self.course_setup()
         self.index({"mealie": [{"id": "z", "title": "Oud", "image": "", "url": "", "ingredients": ["4 tomaten", "400 g kipfilet"]}]})
-        self.assertEqual(offers.suggest("ah")["recipes"][0]["course"], "overig")
+        self.assertEqual(run(offers.suggest("ah"))["recipes"][0]["course"], "overig")
 
     def test_an_index_from_before_the_courses_gets_the_column(self):
-        import sqlite3
         from contextlib import closing
 
-        with closing(offers._connect()) as conn:
+        with closing(db(offers)) as conn:
             conn.execute("DROP TABLE offer_recipes")
-            conn.execute("CREATE TABLE offer_recipes (source TEXT NOT NULL, recipe_id TEXT NOT NULL, title TEXT NOT NULL, image TEXT, url TEXT, ingredients TEXT NOT NULL, PRIMARY KEY (source, recipe_id))")
+            conn.execute(
+                "CREATE TABLE offer_recipes (source TEXT NOT NULL, recipe_id TEXT NOT NULL, title TEXT NOT NULL, image TEXT, url TEXT, ingredients TEXT NOT NULL, PRIMARY KEY (source, recipe_id))"
+            )
             conn.execute("INSERT INTO offer_recipes VALUES ('mealie', 'old', 'Oud recept', '', '', '[\"4 tomaten\"]')")
             conn.commit()
-        with closing(offers._connect()) as conn:
+        auth.forget_runtime_state()  # de migratie loopt bij de start van de app, een keer per proces
+        with closing(db(offers)) as conn:
             self.assertIn("course", {row["name"] for row in conn.execute("PRAGMA table_info(offer_recipes)")})
             self.assertIsNone(conn.execute("SELECT course FROM offer_recipes").fetchone()["course"])
+
+    def test_a_picnic_recipe_photo_from_before_3_7_2_gets_the_size_in_pixels(self):
+        # #236: een nieuwer recept van Picnic heeft geen `large.png`, wel `1000x1000.png`. De index wordt alleen op verzoek opnieuw
+        # ingelezen, dus de adressen die er al staan zetten we een keer per proces om.
+        base = "https://storefront-prod.nl.picnicinternational.com/static/images"
+        rows = {
+            ("picnic", "new"): f"{base}/recipes/ac1b02/large.png",
+            ("picnic", "done"): f"{base}/recipes/c09b4e/1000x1000.png",
+            ("picnic", "none"): "",
+            ("jumbo", "other"): "https://www.jumbo.com/dam-images/recipes/large.png",
+        }
+        with closing(db(offers)) as conn, conn:
+            conn.executemany(
+                "INSERT INTO offer_recipes (source, recipe_id, title, image, url, ingredients) VALUES (?, ?, 'R', ?, '', '[\"kip\"]')",
+                [(source, recipe_id, image) for (source, recipe_id), image in rows.items()],
+            )
+        auth.forget_runtime_state()  # zoals een nieuwe start van de app
+        with closing(db(offers)) as conn:
+            images = {(row["source"], row["recipe_id"]): row["image"] for row in conn.execute("SELECT source, recipe_id, image FROM offer_recipes")}
+        self.assertEqual(images, {**rows, ("picnic", "new"): f"{base}/recipes/ac1b02/1000x1000.png"})
+        with closing(db(offers)) as conn, conn:
+            conn.execute("UPDATE offer_recipes SET image = ? WHERE recipe_id = 'new'", (f"{base}/recipes/ac1b02/large.png",))
+        with closing(db(offers)) as conn:
+            image = conn.execute("SELECT image FROM offer_recipes WHERE recipe_id = 'new'").fetchone()["image"]
+        self.assertEqual(image, f"{base}/recipes/ac1b02/large.png", "niet bij elke verbinding opnieuw")
 
     def test_the_best_fitting_offer_wins_over_the_first_one(self):
         fetched = [
             {"id": "1", "title": "AH Kipfilet Mediterraan gekruid", "price": 4.0, "priceBefore": 5.0, "promoLabel": "Bonus"},
             {"id": "2", "title": "AH Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"},
         ]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
         self.index({"mealie": [{"id": "r1", "title": "Kip", "image": "", "url": "", "ingredients": ["400 g kipfilet"]}]})
-        self.assertEqual(offers.suggest("ah")["recipes"][0]["matched"][0]["offer"]["id"], "2")
+        self.assertEqual(run(offers.suggest("ah"))["recipes"][0]["matched"][0]["offer"]["id"], "2")
 
     def test_a_failing_source_does_not_block_the_others(self):
         def broken():
@@ -599,10 +1016,13 @@ class SuggestionsTest(TempDataDirTest):
         def unlinked():
             raise LookupError("niet gekoppeld")
 
-        collectors = (("mealie", lambda: [{"id": "r1", "title": "A", "image": "", "url": "", "ingredients": ["kip"]}]),
-                      ("jumbo", broken), ("picnic", unlinked))
+        collectors = (
+            ("mealie", lambda: returned([{"id": "r1", "title": "A", "image": "", "url": "", "ingredients": ["kip"]}])),
+            ("jumbo", broken),
+            ("picnic", unlinked),
+        )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            result = offers.sync_recipes()
+            result = run(offers.sync_recipes())
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["sources"]["jumbo"]["error"], "Jumbo kapot")
         self.assertEqual(result["sources"]["picnic"]["skipped"], "niet gekoppeld")
@@ -616,36 +1036,77 @@ class SuggestionsTest(TempDataDirTest):
             calls.append(recipe_id)
             return {"recipeIngredient": ["kip"]}
 
-        with mock.patch.object(ah_recipes, "load", return_value=saved), \
-                mock.patch.object(ah, "get_recipe_jsonld", side_effect=jsonld), \
-                mock.patch.object(offers, "AH_NEW_RECIPES_PER_SYNC", 2):
-            self.assertEqual(len(offers._collect_ah()), 2)
+        with (
+            mock.patch.object(ah_recipes, "load", new_callable=mock.AsyncMock, return_value=saved),
+            mock.patch.object(ah, "get_recipe_jsonld", side_effect=jsonld),
+            mock.patch.object(offers, "AH_NEW_RECIPES_PER_SYNC", 2),
+        ):
+            self.assertEqual(len(run(offers._collect_ah())), 2)
         self.assertEqual(calls, [1, 2])
 
 
 class CourseCollectorsTest(TempDataDirTest):
     def test_each_source_gives_its_course(self):
-        recipe = {"id": "m1", "name": "Pasta", "slug": "pasta", "recipeIngredient": [{"food": {"name": "pasta"}}],
-                  "recipeCategory": [{"name": "Avondeten"}], "tags": [{"name": "Snel"}]}
-        with mock.patch.object(offers.mealie, "list_recipes", return_value=[{"slug": "pasta"}]), \
-                mock.patch.object(offers.mealie, "get_recipe", return_value=recipe), \
-                mock.patch.object(offers.mealie, "recipe_page_url", return_value="http://m/pasta"), \
-                mock.patch.object(offers.mealie_images, "image_path", return_value=""):
-            self.assertEqual(offers._collect_mealie()[0]["course"], "hoofdgerecht")
+        recipe = {
+            "id": "m1",
+            "name": "Pasta",
+            "slug": "pasta",
+            "recipeIngredient": [{"food": {"name": "pasta"}}],
+            "recipeCategory": [{"name": "Avondeten"}],
+            "tags": [{"name": "Snel"}],
+        }
+        with (
+            mock.patch.object(offers.mealie, "list_recipes", new_callable=mock.AsyncMock, return_value=[{"slug": "pasta"}]),
+            mock.patch.object(offers.mealie, "get_recipe", new_callable=mock.AsyncMock, return_value=recipe),
+            mock.patch.object(offers.mealie, "recipe_page_url", new_callable=mock.AsyncMock, return_value="http://m/pasta"),
+            mock.patch.object(offers.mealie_images, "image_path", return_value=""),
+        ):
+            self.assertEqual(run(offers._collect_mealie())[0]["course"], "hoofdgerecht")
 
         jumbo_recipe = {"id": "j1", "name": "Ontbijtbowl", "ingredients": [{"name": "yoghurt"}], "course": "Ontbijt"}
-        with mock.patch.object(offers.jumbo, "configured_refresh_token", return_value="x"), \
-                mock.patch.object(offers.jumbo_recipes, "get_favorites", return_value={"recipes": [{"id": "j1"}]}), \
-                mock.patch.object(offers.jumbo_recipes, "get_recipe", return_value=jumbo_recipe), \
-                mock.patch.object(offers.jumbo_recipes, "source_url", return_value=""):
-            self.assertEqual(offers._collect_jumbo()[0]["course"], "ontbijt")
+        with (
+            mock.patch.object(offers.jumbo, "configured_refresh_token", return_value="x"),
+            mock.patch.object(offers.jumbo_recipes, "get_favorites", new_callable=mock.AsyncMock, return_value={"recipes": [{"id": "j1"}]}),
+            mock.patch.object(offers.jumbo_recipes, "get_recipe", new_callable=mock.AsyncMock, return_value=jumbo_recipe),
+            mock.patch.object(offers.jumbo_recipes, "source_url", return_value=""),
+        ):
+            self.assertEqual(run(offers._collect_jumbo())[0]["course"], "ontbijt")
 
         picnic_recipe = {"id": "p1", "name": "Soep", "ingredients": [{"name": "prei"}]}
-        with mock.patch.object(offers.picnic, "configured_auth_key", return_value="x"), \
-                mock.patch.object(offers.picnic_recipes, "get_recipes", return_value=[{"id": "p1", "tags": ["Soepen"]}]), \
-                mock.patch.object(offers.picnic_recipes, "get_recipe", return_value=picnic_recipe), \
-                mock.patch.object(offers.picnic_recipes, "source_url", return_value=""):
-            self.assertEqual(offers._collect_picnic()[0]["course"], "soep")
+        with (
+            mock.patch.object(offers.picnic, "configured_auth_key", return_value="x"),
+            mock.patch.object(offers.picnic_recipes, "get_recipes", new_callable=mock.AsyncMock, return_value=[{"id": "p1", "tags": ["Soepen"]}]),
+            mock.patch.object(offers.picnic_recipes, "get_recipe", new_callable=mock.AsyncMock, return_value=picnic_recipe),
+            mock.patch.object(offers.picnic_recipes, "source_url", return_value=""),
+        ):
+            self.assertEqual(run(offers._collect_picnic())[0]["course"], "soep")
+
+        crisp_recipe = {
+            "id": "55",
+            "name": "Curry",
+            "image": "",
+            "url": None,
+            "ingredients": [{"line": "150 g rijst", "name": "rijst"}, {"line": "olie", "name": ""}, {"line": "", "name": ""}],
+        }
+        with (
+            mock.patch.object(offers.crisp, "configured_client_id", return_value="x"),
+            mock.patch.object(offers.crisp, "get_saved_recipes", return_value={"recipes": [{"id": "55", "tags": ["Soep"]}], "total": 1}),
+            mock.patch.object(offers.crisp, "get_recipe", return_value=crisp_recipe),
+        ):
+            found = run(offers._collect_crisp())[0]
+        self.assertEqual((found["course"], found["ingredients"], found["url"]), ("soep", ["rijst", "olie"], "https://crisp.nl/#recipe-55"))
+        with (
+            mock.patch.object(offers.crisp, "get_recipe", return_value={**crisp_recipe, "url": "https://crisp.nl/r/abc"}),
+            mock.patch.object(offers.crisp, "configured_client_id", return_value="x"),
+            mock.patch.object(offers.crisp, "get_saved_recipes", return_value={"recipes": [{"id": "55", "tags": []}], "total": 1}),
+        ):
+            self.assertEqual(run(offers._collect_crisp())[0]["url"], "https://crisp.nl/r/abc", "de deellink van Crisp als die er is")
+        with (
+            mock.patch.object(offers.crisp, "configured_client_id", return_value=""),
+            mock.patch.object(offers.crisp, "get_saved_recipes", side_effect=AssertionError("niet ophalen")),
+            self.assertRaises(LookupError),
+        ):
+            run(offers._collect_crisp())
 
     def test_ah_reads_the_category_and_refetches_recipes_indexed_without_one(self):
         saved = {"recipes": [{"id": str(i), "title": f"R{i}", "image": "", "url": ""} for i in (1, 2)]}
@@ -655,26 +1116,164 @@ class CourseCollectorsTest(TempDataDirTest):
             calls.append(recipe_id)
             return {"recipeIngredient": ["kip"], "recipeCategory": "Hoofdgerecht" if recipe_id == 1 else ["Dessert"]}
 
-        with mock.patch.object(ah_recipes, "load", return_value=saved), mock.patch.object(ah, "get_recipe_jsonld", side_effect=jsonld):
-            first = offers._collect_ah()
+        with (
+            mock.patch.object(ah_recipes, "load", new_callable=mock.AsyncMock, return_value=saved),
+            mock.patch.object(ah, "get_recipe_jsonld", side_effect=jsonld),
+        ):
+            first = run(offers._collect_ah())
             self.assertEqual([item["course"] for item in first], ["hoofdgerecht", "dessert"])
         # In de index, recept 1 mét soort en recept 2 zonder (ingelezen vóór de soorten): alleen 2 wordt opnieuw opgehaald.
         from contextlib import closing
 
-        with closing(offers._connect()) as conn, conn:
+        with closing(db(offers)) as conn, conn:
             for recipe_id, course in (("1", "hoofdgerecht"), ("2", None)):
                 conn.execute(
                     "INSERT OR REPLACE INTO offer_recipes (source, recipe_id, title, image, url, ingredients, course) VALUES ('ah', ?, 'R', '', '', '[\"kip\"]', ?)",
                     (recipe_id, course),
                 )
         calls.clear()
-        with mock.patch.object(ah_recipes, "load", return_value=saved), mock.patch.object(ah, "get_recipe_jsonld", side_effect=jsonld):
-            again = offers._collect_ah()
+        with (
+            mock.patch.object(ah_recipes, "load", new_callable=mock.AsyncMock, return_value=saved),
+            mock.patch.object(ah, "get_recipe_jsonld", side_effect=jsonld),
+        ):
+            again = run(offers._collect_ah())
         self.assertEqual(calls, [2])
         self.assertEqual([item["course"] for item in again], ["hoofdgerecht", "dessert"])
 
 
-class OffersTabMarkupTest(unittest.TestCase):
+class CollectorPoolTest(TempDataDirTest):
+    """De vier pools van de receptenindex (Mealie, Jumbo, Picnic, Crisp): een semafoor van `WORKERS` met gather, de volgorde van de
+    kaarten, en een recept dat niet lukt valt weg."""
+
+    def test_each_runs_at_most_workers_at_once_keeps_the_order_and_drops_an_empty_item(self) -> None:
+        running: list[int] = [0]
+        most: list[int] = [0]
+
+        async def one(item: int) -> dict[str, Any] | None:
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+            await asyncio.sleep(0.001 * (item % 4))  # door elkaar klaar: de volgorde komt uit de invoer, niet uit wie het eerst klaar is
+            running[0] -= 1
+            return None if item == 5 else {"id": item}
+
+        items = list(range(offers.WORKERS * 3))
+        found = run(offers._each(one, items))
+        self.assertEqual(most[0], offers.WORKERS)
+        self.assertEqual([item["id"] for item in found], [item for item in items if item != 5])
+
+    def test_each_waits_for_the_rest_and_raises_the_first_failure_in_order(self) -> None:
+        finished: list[int] = []
+
+        async def one(item: int) -> dict[str, Any] | None:
+            await asyncio.sleep(0.001 * (10 - item))
+            if item in (3, 7):
+                raise RuntimeError(f"kapot {item}")
+            finished.append(item)
+            return {"id": item}
+
+        with self.assertRaisesRegex(RuntimeError, "kapot 3"):
+            run(offers._each(one, range(10)))
+        self.assertEqual(sorted(finished), [0, 1, 2, 4, 5, 6, 8, 9], "zoals de threadpool: de rest liep nog af")
+
+    def cards(self) -> list[dict[str, Any]]:
+        return [{"id": str(n), "slug": str(n), "tags": []} for n in range(12)]
+
+    def counting(self, make: Callable[[str], dict[str, Any]]) -> tuple[Callable[[str], Awaitable[dict[str, Any]]], list[int]]:
+        """Een async callee die telt hoeveel er tegelijk lopen, de loop een paar keer vrijgeeft (zoals een echte aanvraag bij
+        de winkel) en voor recept 4 faalt."""
+        state: list[int] = [0, 0]  # nu, hoogste
+
+        async def fetch(recipe_id: str) -> dict[str, Any]:
+            state[0] += 1
+            state[1] = max(state[1], state[0])
+            try:
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                if recipe_id == "4":
+                    raise RuntimeError("recept 4 lukt niet")
+                return make(recipe_id)
+            finally:
+                state[0] -= 1
+
+        return fetch, state
+
+    def assert_pool(self, found: list[dict[str, Any]], state: list[int]) -> None:
+        self.assertEqual(
+            [item["id"] for item in found], [str(n) for n in range(12) if n != 4], "de volgorde van de kaarten, zonder het mislukte recept"
+        )
+        self.assertEqual(state[1], offers.WORKERS)
+
+    def test_the_mealie_pool(self) -> None:
+        # Mealie is async: de pool laat echt WORKERS recepten tegelijk ophalen, niet meer en niet minder.
+        state: list[int] = [0, 0]  # nu, hoogste
+
+        async def recipe(request: httpx.Request) -> httpx.Response:
+            slug = request.url.path.rsplit("/", 1)[1]
+            state[0] += 1
+            state[1] = max(state[1], state[0])
+            try:
+                for _ in range(30):  # hooguit 0,3 s wachten tot de pool vol is
+                    if state[0] >= offers.WORKERS:
+                        break
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.01)
+            finally:
+                state[0] -= 1
+            if slug == "4":
+                return httpx.Response(500, json={"detail": "recept 4 lukt niet"})
+            return httpx.Response(200, json={"id": slug, "name": f"R{slug}", "recipeIngredient": [{"food": {"name": "kip"}}]})
+
+        with (
+            mock.patch.object(offers.mealie, "list_recipes", new_callable=mock.AsyncMock, return_value=self.cards()),
+            mock.patch.object(offers.mealie, "_endpoint", new_callable=mock.AsyncMock, return_value=("http://mealie.test", "t")),
+            mock.patch.object(offers.mealie, "recipe_page_url", new_callable=mock.AsyncMock, return_value=""),
+            mock.patch.object(offers.mealie_images, "image_path", return_value=""),
+            routes() as api,
+        ):
+            fetched = api.get(url__regex=r"^http://mealie\.test/api/recipes/\d+$").mock(side_effect=recipe)
+            found = run(offers._collect_mealie())
+        self.assertEqual(fetched.call_count, 12)
+        self.assertEqual(
+            [item["id"] for item in found], [str(n) for n in range(12) if n != 4], "de volgorde van de kaarten, zonder het mislukte recept"
+        )
+        self.assertEqual(state[1], offers.WORKERS)
+
+    def test_the_jumbo_pool(self) -> None:
+        fetch, state = self.counting(lambda recipe_id: {"id": recipe_id, "name": f"R{recipe_id}", "ingredients": [{"name": "kip"}]})
+        with (
+            mock.patch.object(offers.jumbo, "configured_refresh_token", return_value="x"),
+            mock.patch.object(offers.jumbo_recipes, "get_favorites", new_callable=mock.AsyncMock, return_value={"recipes": self.cards()}),
+            mock.patch.object(offers.jumbo_recipes, "get_recipe", new_callable=mock.AsyncMock, side_effect=fetch),
+            mock.patch.object(offers.jumbo_recipes, "source_url", return_value=""),
+        ):
+            self.assert_pool(run(offers._collect_jumbo()), state)
+
+    def test_the_picnic_pool(self) -> None:
+        fetch, state = self.counting(lambda recipe_id: {"id": recipe_id, "name": f"R{recipe_id}", "ingredients": [{"name": "kip"}]})
+        with (
+            mock.patch.object(offers.picnic, "configured_auth_key", return_value="x"),
+            mock.patch.object(
+                offers.picnic_recipes,
+                "get_recipes",
+                new_callable=mock.AsyncMock,
+                side_effect=lambda source: self.cards() if source == "saved" else [],
+            ),
+            mock.patch.object(offers.picnic_recipes, "get_recipe", new_callable=mock.AsyncMock, side_effect=fetch),
+            mock.patch.object(offers.picnic_recipes, "source_url", return_value=""),
+        ):
+            self.assert_pool(run(offers._collect_picnic()), state)
+
+    def test_the_crisp_pool(self) -> None:
+        fetch, state = self.counting(lambda recipe_id: {"id": recipe_id, "name": f"R{recipe_id}", "ingredients": [{"name": "kip"}], "url": "u"})
+        with (
+            mock.patch.object(offers.crisp, "configured_client_id", return_value="x"),
+            mock.patch.object(offers.crisp, "get_saved_recipes", new_callable=mock.AsyncMock, return_value={"recipes": self.cards(), "total": 12}),
+            mock.patch.object(offers.crisp, "get_recipe", new_callable=mock.AsyncMock, side_effect=fetch),
+        ):
+            self.assert_pool(run(offers._collect_crisp()), state)
+
+
+class OffersTabMarkupTest(AppTestCase):
     def test_switching_store_shows_a_spinning_icon_while_the_offers_load(self):
         from pathlib import Path
 
@@ -685,16 +1284,26 @@ class OffersTabMarkupTest(unittest.TestCase):
         app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn('const MDI_LOADING = "M12,4V2A10,10 0 0,0 2,12H4A8,8 0 0,1 12,4Z";', app_js, "het officiële MDI-icoon, geen eigen tekening")
         self.assertIn('<div id="offers-loading" class="offers-loading" role="status" aria-live="polite" hidden></div>', html)
-        body = script[script.index("async function showOffers()"):script.index("function offerRecipeCard")]
-        self.assertLess(body.index("renderOffersLoading()"), body.index("await jsonFetch"), "de laadstand staat er al voordat er iets wordt opgehaald")
-        self.assertEqual(body.count("loadId !== offersLoadId"), 2, "een traag antwoord van de vorige winkel wordt genegeerd, ook bij een fout")
+        body = script[script.index("async function showOffers()") : script.index("function offerRecipeCard")]
+        self.assertLess(
+            body.index("renderOffersLoading()"), body.index("await offersRequest"), "de laadstand staat er al voordat er iets wordt opgehaald"
+        )
+        # Een traag antwoord van de vorige winkel wordt genegeerd, ook bij een fout; en wisselt renderOffersStore naar de
+        # voorkeurssupermarkt, dan laadt die zelf en stopt deze aanvraag.
+        self.assertEqual(body.count("loadId !== offersLoadId"), 3)
         self.assertIn("mdiIcon(MDI_LOADING", script)
         self.assertIn("const offersCache = {};", script, "de laatst geladen lijst per winkel staat er bij terugkeren meteen")
-        self.assertIn("if (cached) renderOffers(cached);\n  else renderOffersLoading();", body.replace(body[:0], ""), "met een lijst in de cache geen spinner")
+        self.assertIn(
+            "if (cached) renderOffers(cached);\n  else renderOffersLoading();", body.replace(body[:0], ""), "met een lijst in de cache geen spinner"
+        )
         self.assertIn("JSON.stringify(cached) !== JSON.stringify(data)", script, "alleen bij een andere lijst wordt het scherm vernieuwd")
         self.assertIn('t("offers.loading", { store:', script)
         self.assertRegex(css, r"\.offers-loading__icon \{[^}]*animation: spin 1s linear infinite;")
-        self.assertRegex(css, r"@media \(prefers-reduced-motion: reduce\) \{\s*\.offers-loading__icon \{\s*animation: none;", "zonder bewegingsvoorkeur draait het icoon niet; de tekst blijft")
+        self.assertRegex(
+            css,
+            r"@media \(prefers-reduced-motion: reduce\) \{\s*\.offers-loading__icon \{\s*animation: none;",
+            "zonder bewegingsvoorkeur draait het icoon niet; de tekst blijft",
+        )
 
     def test_a_wrong_match_can_be_reported_from_the_card_and_from_the_dialog_with_an_mdi_icon(self):
         from pathlib import Path
@@ -716,13 +1325,17 @@ class OffersTabMarkupTest(unittest.TestCase):
         from pathlib import Path
 
         html = (Path(__file__).resolve().parent.parent / "templates" / "index.html").read_text(encoding="utf-8")
-        section = html[html.index('<section id="offers"'):html.index('<section id="url"')]
+        section = html[html.index('<section id="offers"') : html.index('<section id="url"')]
         self.assertIn('<div class="subtab-menu" id="offers-store-menu" hidden>', section)
         self.assertLess(section.index("offers-store-menu"), section.index('data-subtab="offers-items"'))
-        self.assertEqual(re.findall(r'<button class="subtab[^"]*" data-subtab="([\w-]+)"', section), ["offers-items", "offers-suggestions", "offers-history"])
+        self.assertEqual(
+            re.findall(r'<a class="subtab[^"]*" data-subtab="([\w-]+)"', section),
+            ["offers-items", "offers-suggestions", "offers-history", "offers-watched"],
+        )
         self.assertIn('<div id="offers-items" class="subpanel is-active">', section)
         self.assertIn('<div id="offers-suggestions" class="subpanel">', section)
         self.assertIn('<div id="offers-history" class="subpanel">', section)
+        self.assertIn('<div id="offers-watched" class="subpanel">', section)  # Gevolgde producten (4.27.0)
         self.assertNotIn("offers-store-slot", section)
 
     def test_the_price_history_tab_is_wired_to_the_history_route(self):
@@ -733,7 +1346,7 @@ class OffersTabMarkupTest(unittest.TestCase):
         script = (root / "static" / "offers_history.js").read_text(encoding="utf-8")
         offers_js = (root / "static" / "offers.js").read_text(encoding="utf-8")
         self.assertLess(html.index("offers.js"), html.index("offers_history.js"))
-        self.assertIn("/api/offers/history?", script)
+        self.assertIn("/api/prices/history?", script)
         self.assertIn("offersState.store", script)
         self.assertIn('data-subtab="offers-history"', script)
         self.assertIn("offerHistoryStoreChanged", offers_js, "wisselen van winkel ververst de geschiedenis")
@@ -749,31 +1362,32 @@ class OffersTabMarkupTest(unittest.TestCase):
         script = (root / "static" / "offers.js").read_text(encoding="utf-8")
         html = (root / "templates" / "index.html").read_text(encoding="utf-8")
         app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
-        section = html[html.index('<section id="offers"'):html.index('<section id="url"')]
+        section = html[html.index('<section id="offers"') : html.index('<section id="url"')]
         self.assertEqual(section.count('<div class="toolbar offers-week"'), 2, "een weekkeuze bij Aanbiedingen en bij Recepten")
         self.assertEqual(section.count('data-offers-week="-1"'), 2)
         self.assertIn('id="offers-later-show"', section)
         self.assertIn("&week=${encodeURIComponent(week)}", script, "de aanbiedingen worden per week opgehaald")
-        self.assertIn("const week = `&week=${encodeURIComponent(offersWeek().start)}`;", script, "de receptvoorstellen ook")
+        self.assertIn("new URLSearchParams({ store: offersState.store, week: offersWeek().start })", script, "de receptvoorstellen ook")
         self.assertIn("const key = `${store}|${week}`;", script, "de cache houdt de weken uit elkaar")
         self.assertIn("return Math.max(0, state.weekOffset);", script, "dezelfde week als het weekmenu, en nooit een eerdere dan deze")
         self.assertIn("setPlanWeek(offset);", script, "een andere week hier zet het weekmenu op dezelfde week")
         self.assertIn("function setPlanWeek(offset) {\n  state.weekOffset = offset;", app_js)
-        self.assertIn("$(\"#week-offset\").textContent = weekOffsetText(state.weekOffset);", app_js, "dezelfde tekst als in het weekmenu")
+        self.assertIn('$("#week-offset").textContent = weekOffsetText(state.weekOffset);', app_js, "dezelfde tekst als in het weekmenu")
 
     def test_recipes_have_a_heading_and_a_course_filter_above_them(self):
         from pathlib import Path
 
         root = Path(__file__).resolve().parent.parent
         html = (root / "templates" / "index.html").read_text(encoding="utf-8")
-        panel = html[html.index('<div id="offers-suggestions"'):html.index('<section id="url"')]
+        panel = html[html.index('<div id="offers-suggestions"') : html.index('<section id="url"')]
         order = ["offers-recipes-heading", "offers.recipes.explain", 'id="offers-courses"', 'id="offers-recipes-status"', 'id="offers-recipes"']
         positions = [panel.index(marker) for marker in order]
         self.assertEqual(positions, sorted(positions), "kop, uitleg, soortfilter, status, recepten")
         script = (root / "static" / "offers.js").read_text(encoding="utf-8")
-        self.assertIn("&course=", script, "de gekozen soort gaat mee naar de server")
-        self.assertIn('"#offers-courses").addEventListener("click"', script)
-        self.assertIn("offersState.course = \"all\";\n  try {", script, "een andere winkel zet het filter terug op alles")
+        self.assertIn('params.append("course_in", course)', script, "de gekozen soorten gaan mee naar de server")
+        self.assertIn('"#offers-course-facets").addEventListener("click"', script)
+        switch = script[script.index("function offersSwitchStore(") : script.index("// De voorwaarden van een aanbieding")]
+        self.assertIn("offersState.courses = facetSelection();\n  showOffers();", switch, "een andere winkel zet het filter terug op alles")
 
     def test_a_matched_product_opens_a_dialog_with_a_link_to_the_store(self):
         import re
@@ -781,9 +1395,16 @@ class OffersTabMarkupTest(unittest.TestCase):
 
         root = Path(__file__).resolve().parent.parent
         html = (root / "templates" / "index.html").read_text(encoding="utf-8")
-        dialog = html[html.index('<dialog id="offer-product-dialog"'):html.index("</dialog>")]
-        for marker in ("offer-product-title", "offer-product-image", "offer-product-price", "offer-product-match", "offer-product-open",
-                       "offer-product-close", "offer-product-nopage"):
+        dialog = html[html.index('<dialog id="offer-product-dialog"') : html.index("</dialog>")]
+        for marker in (
+            "offer-product-title",
+            "offer-product-image",
+            "offer-product-price",
+            "offer-product-match",
+            "offer-product-open",
+            "offer-product-close",
+            "offer-product-nopage",
+        ):
             self.assertIn(f'id="{marker}"', dialog)
         self.assertIn('aria-labelledby="offer-product-title"', dialog, "het venster heeft een naam voor schermlezers")
         self.assertEqual(html.count('id="offer-product-dialog"'), 1, "er is maar één productvenster")
@@ -791,7 +1412,7 @@ class OffersTabMarkupTest(unittest.TestCase):
         self.assertNotIn("data-hide-on-error", dialog)
 
         script = (root / "static" / "offers.js").read_text(encoding="utf-8")
-        card = script[script.index("function offerRecipeCard"):script.index("function renderOfferCourses")]
+        card = script[script.index("function offerRecipeCard") : script.index("function renderOfferCourses")]
         self.assertIn('class="offer-match"', card, "het gekoppelde product is een knop")
         self.assertIn('data-recipe="${index}" data-match="${at}"', card)
         self.assertNotIn('<span class="muted">→', card, "geen kale tekst meer")
@@ -802,13 +1423,13 @@ class OffersTabMarkupTest(unittest.TestCase):
         self.assertIn("offersState.recipes = data.recipes", script)
         self.assertIn('t("offers.also_in"', script, "staat het recept ook in een andere bron, dan staat dat op de kaart")
         self.assertIsNotNone(re.search(r"hidden = !offer\.url", script), "zonder adres (Picnic) geen knop naar de winkel")
-        self.assertIn('hidden = Boolean(offer.url)', script, "zonder adres staat er waarom")
+        self.assertIn("hidden = Boolean(offer.url)", script, "zonder adres staat er waarom")
 
     def test_the_dialog_follows_the_theme_and_fits_a_phone(self):
         from pathlib import Path
 
         css = (Path(__file__).resolve().parent.parent / "static" / "styles.css").read_text(encoding="utf-8")
-        block = css[css.index(".product-dialog {"):css.index(".product-dialog::backdrop")]
+        block = css[css.index(".product-dialog {") : css.index(".product-dialog::backdrop")]
         for token in ("var(--surface)", "var(--text)", "var(--border)"):
             self.assertIn(token, block)
         self.assertIn("calc(100vw - 32px)", block, "past op een smal scherm")
@@ -818,25 +1439,47 @@ class OffersTabMarkupTest(unittest.TestCase):
         from pathlib import Path
 
         script = (Path(__file__).resolve().parent.parent / "static" / "offers.js").read_text(encoding="utf-8")
-        card = script[script.index("function offerRecipeCard"):script.index("function offerIndexSummary")]
+        card = script[script.index("function offerRecipeCard") : script.index("function offerIndexSummary")]
         self.assertIn('t("offers.recipe_from"', card)
         self.assertNotIn("· ${escapeHtml(t(`offers.source", card, "de bron mag niet als winkel van de aanbieding lezen")
-        status = script[script.index("async function showOfferRecipes"):script.index("async function offersIndexRecipes")]
+        status = script[script.index("async function showOfferRecipes") : script.index("async function offersIndexRecipes")]
         self.assertIn('t("offers.recipes.heading"', status, "boven de recepten staat van welke winkel de aanbiedingen zijn")
-        self.assertIn("STORES[offersState.store].name", status)
+        self.assertIn("storeDisplayName(offersState.store)", status)
         self.assertNotIn("offers.recipes.using", script)
 
 
 GRILLWORST = [
-    "Bread roll", "6 tbsp mayo", "1 tbsp curry sauce", "1 tsp paprika", "2 tbsp paprika",
-    "800 gr chicken thighs (or/and pork/bacon)", "Spice mixture (below)", "Cornstarch", "Old mature cheese", "1 shallot",
-    "1 tbsp ketchup", "2 tsp curry", "1 tsp salt", "½ tsp cayenne", "½ tsp turmeric", "2 tsp salt", "1 tbsp onion powder",
-    "1 tsp coriander", "1 tsp ginger", "½ / 1 tsp foelie or ½ tsp nutmeg",
+    "Bread roll",
+    "6 tbsp mayo",
+    "1 tbsp curry sauce",
+    "1 tsp paprika",
+    "2 tbsp paprika",
+    "800 gr chicken thighs (or/and pork/bacon)",
+    "Spice mixture (below)",
+    "Cornstarch",
+    "Old mature cheese",
+    "1 shallot",
+    "1 tbsp ketchup",
+    "2 tsp curry",
+    "1 tsp salt",
+    "½ tsp cayenne",
+    "½ tsp turmeric",
+    "2 tsp salt",
+    "1 tbsp onion powder",
+    "1 tsp coriander",
+    "1 tsp ginger",
+    "½ / 1 tsp foelie or ½ tsp nutmeg",
 ]
 SUSHIBOWL = ["zalmfilets zonder huid", "Ketjap manis", "Mayonaise", "komkommer", "avocado’s", "Bloemkoolrijst", "Taugé", "grillpan"]
 REAL_TITLES = [
-    "Bifi Roll XXL 2-pack", "Hellmann's Real mayonaise430 3-pack", "Go-Tan Sweet chilli sauce", "Lay's Paprika",
-    "AH Focaccia paprika olijf 3-pack", "AH Zalmfilet 2-pack", "Conimex Ketjap manis 2pack", "AH Tomaat komkommer M",
+    "Bifi Roll XXL 2-pack",
+    "Hellmann's Real mayonaise430 3-pack",
+    "Go-Tan Sweet chilli sauce",
+    "Lay's Paprika",
+    "AH Focaccia paprika olijf 3-pack",
+    "AH Zalmfilet 2-pack",
+    "Conimex Ketjap manis 2pack",
+    "AH Tomaat komkommer M",
     "Loving Blends Avocado olie shampoo 4-pack",
 ]
 
@@ -844,8 +1487,14 @@ REAL_TITLES = [
 def real_offer(title, offer_id):
     from mealieshopper import offer_categories
 
-    return {"id": str(offer_id), "title": title, "price": 2.0, "priceBefore": 3.0, "promoLabel": "Bonus",
-            "category": offer_categories.categorize(title)}
+    return {
+        "id": str(offer_id),
+        "title": title,
+        "price": 2.0,
+        "priceBefore": 3.0,
+        "promoLabel": "Bonus",
+        "category": offer_categories.categorize(title),
+    }
 
 
 class RealRecipesTest(TempDataDirTest):
@@ -960,8 +1609,19 @@ class RealRecipesTest(TempDataDirTest):
         self.assertIsNone(self.link("bread roll", "Bifi Roll XXL"))
 
     def test_seasonings_basics_and_headings_are_not_ingredients(self):
-        for line in ("1 tsp salt", "½ tsp cayenne", "½ tsp turmeric", "1 tsp paprika", "2 tl kurkuma", "1 snuf nootmuskaat",
-                     "1 tbsp onion powder", "1 el knoflookpoeder", "Cornstarch", "Spice mixture (below)", "Kruidenmix (hieronder)"):
+        for line in (
+            "1 tsp salt",
+            "½ tsp cayenne",
+            "½ tsp turmeric",
+            "1 tsp paprika",
+            "2 tl kurkuma",
+            "1 snuf nootmuskaat",
+            "1 tbsp onion powder",
+            "1 el knoflookpoeder",
+            "Cornstarch",
+            "Spice mixture (below)",
+            "Kruidenmix (hieronder)",
+        ):
             self.assertIsNone(offers.head_of(line), line)
         for line in ("1 tbsp curry sauce", "1 tbsp ketjap", "6 tbsp mayo", "2 rode paprika", "1 paprika"):
             self.assertIsNotNone(offers.head_of(line), line)
@@ -975,15 +1635,22 @@ class RealRecipesTest(TempDataDirTest):
 
     def test_grillworst_is_not_suggested_and_the_sushi_bowl_has_no_shampoo(self):
         fetched = [real_offer(title, index) for index, title in enumerate(REAL_TITLES, 1)]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        collectors = (("mealie", lambda: [
-            {"id": "g", "title": "Grillworst", "image": "", "url": "", "ingredients": GRILLWORST},
-            {"id": "s", "title": "Warme sushibowl", "image": "", "url": "", "ingredients": SUSHIBOWL},
-        ]),)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        collectors = (
+            (
+                "mealie",
+                lambda: returned(
+                    [
+                        {"id": "g", "title": "Grillworst", "image": "", "url": "", "ingredients": GRILLWORST},
+                        {"id": "s", "title": "Warme sushibowl", "image": "", "url": "", "ingredients": SUSHIBOWL},
+                    ]
+                ),
+            ),
+        )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        recipes = {recipe["id"]: recipe for recipe in offers.suggest("ah")["recipes"]}
+            run(offers.sync_recipes())
+        recipes = {recipe["id"]: recipe for recipe in run(offers.suggest("ah"))["recipes"]}
         self.assertNotIn("g", recipes, "één koppeling (mayo) is te weinig voor een recept met zoveel ingrediënten")
         bowl = recipes["s"]
         matched = {item["ingredient"]: item["offer"]["title"] for item in bowl["matched"]}
@@ -994,67 +1661,113 @@ class RealRecipesTest(TempDataDirTest):
         self.assertFalse(any("shampoo" in title for title in matched.values()))
 
     def test_pasta_with_salmon_and_broccoli_is_no_longer_suggested_on_three_wrong_links(self):
-        titles = ["AH Terra Groenteburger broccoli paprika 4-pack", "AH Pie runderstoof ui 3-pack", "AH Gerookte zalmsnippers 2-pack",
-                  "AH Mascarpone roomkaas chili dip 4-pack"]
+        titles = [
+            "AH Terra Groenteburger broccoli paprika 4-pack",
+            "AH Pie runderstoof ui 3-pack",
+            "AH Gerookte zalmsnippers 2-pack",
+            "AH Mascarpone roomkaas chili dip 4-pack",
+        ]
         fetched = [real_offer(title, index) for index, title in enumerate(titles, 1)]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        collectors = (("mealie", lambda: [{"id": "p", "title": "Pasta met zalm en broccoli", "image": "", "url": "", "ingredients": [
-            "500 g broccoli", "2 middelgrote uien", "200 g gerookte zalmsnippers", "150 g koelverse roomkaas met bieslook", "300 g fusilli"]}]),)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        collectors = (
+            (
+                "mealie",
+                lambda: returned(
+                    [
+                        {
+                            "id": "p",
+                            "title": "Pasta met zalm en broccoli",
+                            "image": "",
+                            "url": "",
+                            "ingredients": [
+                                "500 g broccoli",
+                                "2 middelgrote uien",
+                                "200 g gerookte zalmsnippers",
+                                "150 g koelverse roomkaas met bieslook",
+                                "300 g fusilli",
+                            ],
+                        }
+                    ]
+                ),
+            ),
+        )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        self.assertEqual(offers.suggest("ah")["recipes"], [], "nog maar één koppeling (de zalm) van vijf: onder de ondergrens")
+            run(offers.sync_recipes())
+        self.assertEqual(run(offers.suggest("ah"))["recipes"], [], "nog maar één koppeling (de zalm) van vijf: onder de ondergrens")
 
     def test_mealie_links_in_an_old_index_are_rebuilt_with_the_group(self):
         fetched = [real_offer("AH Kipfilet", 1), real_offer("AH Tomaten rond", 2)]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
         lines = ["400 g kipfilet", "4 tomaten"]
         collectors = (
-            ("mealie", lambda: [{"id": "a", "title": "A", "image": "", "url": "https://mealie.example/recipe/witlof-met-ham", "ingredients": lines},
-                                {"id": "b", "title": "B", "image": "", "url": "https://mealie.example/g/zb/r/al-goed", "ingredients": lines}]),
-            ("jumbo", lambda: [{"id": "c", "title": "C", "image": "", "url": "https://www.jumbo.com/recepten/recipe/xyz", "ingredients": lines}]),
+            (
+                "mealie",
+                lambda: returned(
+                    [
+                        {"id": "a", "title": "A", "image": "", "url": "https://mealie.example/recipe/witlof-met-ham", "ingredients": lines},
+                        {"id": "b", "title": "B", "image": "", "url": "https://mealie.example/g/zb/r/al-goed", "ingredients": lines},
+                    ]
+                ),
+            ),
+            (
+                "jumbo",
+                lambda: returned([{"id": "c", "title": "C", "image": "", "url": "https://www.jumbo.com/recepten/recipe/xyz", "ingredients": lines}]),
+            ),
         )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        with mock.patch.object(offers.mealie, "mealie_url", return_value="https://mealie.example"), \
-                mock.patch.object(offers.mealie, "group_slug", return_value="zb"):
-            urls = {recipe["id"]: recipe["url"] for recipe in offers.suggest("ah")["recipes"]}
+            run(offers.sync_recipes())
+        with (
+            mock.patch.object(offers.mealie, "mealie_url", new_callable=mock.AsyncMock, return_value="https://mealie.example"),
+            mock.patch.object(offers.mealie, "group_slug", new_callable=mock.AsyncMock, return_value="zb"),
+        ):
+            urls = {recipe["id"]: recipe["url"] for recipe in run(offers.suggest("ah"))["recipes"]}
         self.assertEqual(urls["a"], "https://mealie.example/g/zb/r/witlof-met-ham", "het oude adres is gecorrigeerd")
         self.assertEqual(urls["b"], "https://mealie.example/g/zb/r/al-goed", "een goed adres blijft goed")
         self.assertEqual(urls["c"], "https://www.jumbo.com/recepten/recipe/xyz", "alleen Mealie-adressen worden aangepast")
         # Zonder koppeling met Mealie blijft het bewaarde adres staan.
-        with mock.patch.object(offers.mealie, "mealie_url", return_value=""):
-            urls = {recipe["id"]: recipe["url"] for recipe in offers.suggest("ah")["recipes"]}
+        with mock.patch.object(offers.mealie, "mealie_url", new_callable=mock.AsyncMock, return_value=""):
+            urls = {recipe["id"]: recipe["url"] for recipe in run(offers.suggest("ah"))["recipes"]}
         self.assertEqual(urls["a"], "https://mealie.example/recipe/witlof-met-ham")
 
     def test_a_mealie_that_cannot_be_reached_does_not_block_the_suggestions(self):
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: [real_offer("AH Kipfilet", 1), real_offer("AH Tomaten rond", 2)]}):
-            offers.sync("ah")
-        collectors = (("mealie", lambda: [{"id": "a", "title": "A", "image": "", "url": "https://mealie.example/recipe/x",
-                                           "ingredients": ["400 g kipfilet", "4 tomaten"]}]),)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned([real_offer("AH Kipfilet", 1), real_offer("AH Tomaten rond", 2)])}):
+            run(offers.sync("ah"))
+        collectors = (
+            (
+                "mealie",
+                lambda: returned(
+                    [{"id": "a", "title": "A", "image": "", "url": "https://mealie.example/recipe/x", "ingredients": ["400 g kipfilet", "4 tomaten"]}]
+                ),
+            ),
+        )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        with mock.patch.object(offers.mealie, "mealie_url", return_value="https://mealie.example"), \
-                mock.patch.object(offers.mealie, "recipe_page_url", side_effect=RuntimeError("weg")):
-            recipes = offers.suggest("ah")["recipes"]
+            run(offers.sync_recipes())
+        with (
+            mock.patch.object(offers.mealie, "mealie_url", new_callable=mock.AsyncMock, return_value="https://mealie.example"),
+            mock.patch.object(offers.mealie, "recipe_page_url", new_callable=mock.AsyncMock, side_effect=RuntimeError("weg")),
+        ):
+            recipes = run(offers.suggest("ah"))["recipes"]
         self.assertEqual(recipes[0]["url"], "https://mealie.example/recipe/x")
 
     def duplicate_setup(self, recipes):
         fetched = [real_offer("AH Kipfilet", 1), real_offer("AH Tomaten rond", 2), real_offer("AH Rijst basmati", 3)]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        collectors = tuple((name, (lambda items=items: items)) for name, items in recipes.items())
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        collectors = tuple((name, (lambda items=items: returned(items))) for name, items in recipes.items())
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        return offers.suggest("ah")
+            run(offers.sync_recipes())
+        return run(offers.suggest("ah"))
 
     def test_the_same_recipe_from_two_sources_is_one_card(self):
         lines = ["400 g kipfilet", "4 tomaten", "200 g rijst"]
-        data = self.duplicate_setup({
-            "mealie": [{"id": "m", "title": "Supersnelle spaghetti met runderballetjes", "image": "", "url": "http://m/x", "ingredients": lines}],
-            "ah": [{"id": "a", "title": "Supersnelle  spaghetti met Runderballetjes!", "image": "", "url": "http://ah/x", "ingredients": lines}],
-        })
+        data = self.duplicate_setup(
+            {
+                "mealie": [{"id": "m", "title": "Supersnelle spaghetti met runderballetjes", "image": "", "url": "http://m/x", "ingredients": lines}],
+                "ah": [{"id": "a", "title": "Supersnelle  spaghetti met Runderballetjes!", "image": "", "url": "http://ah/x", "ingredients": lines}],
+            }
+        )
         self.assertEqual(len(data["recipes"]), 1)
         recipe = data["recipes"][0]
         self.assertEqual((recipe["source"], recipe["alsoIn"]), ("mealie", ["ah"]), "bij gelijke dekking staat het eigen recept bovenaan")
@@ -1062,55 +1775,97 @@ class RealRecipesTest(TempDataDirTest):
         self.assertEqual(data["courses"], [{"id": "overig", "count": 1}], "ook de aantallen per soort tellen het recept één keer")
 
     def test_the_better_covered_copy_is_the_one_that_stays(self):
-        data = self.duplicate_setup({
-            "mealie": [{"id": "m", "title": "Kip en rijst", "image": "", "url": "", "ingredients": ["400 g kipfilet", "200 g rijst", "1 grillpan", "1 wokpan"]}],
-            "ah": [{"id": "a", "title": "Kip en rijst", "image": "", "url": "", "ingredients": ["400 g kipfilet", "200 g rijst"]}],
-        })
+        data = self.duplicate_setup(
+            {
+                "mealie": [
+                    {
+                        "id": "m",
+                        "title": "Kip en rijst",
+                        "image": "",
+                        "url": "",
+                        "ingredients": ["400 g kipfilet", "200 g rijst", "1 grillpan", "1 wokpan"],
+                    }
+                ],
+                "ah": [{"id": "a", "title": "Kip en rijst", "image": "", "url": "", "ingredients": ["400 g kipfilet", "200 g rijst"]}],
+            }
+        )
         recipe = data["recipes"][0]
         self.assertEqual((recipe["source"], recipe["alsoIn"], recipe["matchedCount"], recipe["ingredientCount"]), ("ah", ["mealie"], 2, 2))
 
     def test_two_recipes_with_the_same_title_from_the_same_source_stay_two(self):
         lines = ["400 g kipfilet", "4 tomaten"]
-        data = self.duplicate_setup({"mealie": [
-            {"id": "1", "title": "Pasta", "image": "", "url": "", "ingredients": lines},
-            {"id": "2", "title": "Pasta", "image": "", "url": "", "ingredients": lines},
-        ]})
+        data = self.duplicate_setup(
+            {
+                "mealie": [
+                    {"id": "1", "title": "Pasta", "image": "", "url": "", "ingredients": lines},
+                    {"id": "2", "title": "Pasta", "image": "", "url": "", "ingredients": lines},
+                ]
+            }
+        )
         self.assertEqual(len(data["recipes"]), 2)
         self.assertTrue(all(recipe["alsoIn"] == [] for recipe in data["recipes"]))
 
     def test_different_titles_are_not_merged_and_three_sources_list_both_others(self):
         lines = ["400 g kipfilet", "4 tomaten"]
-        data = self.duplicate_setup({
-            "mealie": [{"id": "1", "title": "Kip met tomaat", "image": "", "url": "", "ingredients": lines},
-                       {"id": "2", "title": "Kip met tomaat en rijst", "image": "", "url": "", "ingredients": lines}],
-            "ah": [{"id": "3", "title": "Kip met tomaat", "image": "", "url": "", "ingredients": lines}],
-            "jumbo": [{"id": "4", "title": "kip met tomaat", "image": "", "url": "", "ingredients": lines}],
-        })
+        data = self.duplicate_setup(
+            {
+                "mealie": [
+                    {"id": "1", "title": "Kip met tomaat", "image": "", "url": "", "ingredients": lines},
+                    {"id": "2", "title": "Kip met tomaat en rijst", "image": "", "url": "", "ingredients": lines},
+                ],
+                "ah": [{"id": "3", "title": "Kip met tomaat", "image": "", "url": "", "ingredients": lines}],
+                "jumbo": [{"id": "4", "title": "kip met tomaat", "image": "", "url": "", "ingredients": lines}],
+            }
+        )
         by_title = {recipe["title"]: recipe for recipe in data["recipes"]}
         self.assertEqual(set(by_title), {"Kip met tomaat", "Kip met tomaat en rijst"})
         self.assertEqual(by_title["Kip met tomaat"]["alsoIn"], ["ah", "jumbo"])
 
     def test_the_same_ingredient_twice_counts_once(self):
         fetched = [real_offer("AH Paprika rood", 1), real_offer("AH Tomaten rond", 2)]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        collectors = (("mealie", lambda: [
-            {"id": "p", "title": "Paprikaschotel", "image": "", "url": "", "ingredients": ["1 paprika", "2 paprika", "4 tomaten"]}]),)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        collectors = (
+            (
+                "mealie",
+                lambda: returned(
+                    [{"id": "p", "title": "Paprikaschotel", "image": "", "url": "", "ingredients": ["1 paprika", "2 paprika", "4 tomaten"]}]
+                ),
+            ),
+        )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        recipe = offers.suggest("ah")["recipes"][0]
+            run(offers.sync_recipes())
+        recipe = run(offers.suggest("ah"))["recipes"][0]
         self.assertEqual((recipe["matchedCount"], recipe["ingredientCount"]), (2, 2))
 
     def test_offers_that_are_never_ingredients_are_left_out(self):
-        for title in ("Loving Blends Avocado olie shampoo 4-pack", "Pampers luiers maat 3", "Whiskas kattenvoer met kip", "Glorix allesreiniger citroen"):
+        for title in (
+            "Loving Blends Avocado olie shampoo 4-pack",
+            "Pampers luiers maat 3",
+            "Whiskas kattenvoer met kip",
+            "Glorix allesreiniger citroen",
+        ):
             self.assertIsNone(self.link("avocado" if "Avocado" in title else "kip", title), title)
 
 
-
 DUTCH_OFFERS = [
-    "AH Kippendijfilet 600 g", "AH Rundergehakt 500 g", "Hellmann's Real mayonaise430 3-pack", "Heinz Tomaat ketchup", "AH Oude kaas plakken",
-    "AH Sjalot 250 g", "AH Broodjes 6-pack", "Lay's Paprika", "Go-Tan Sweet chilli sauce", "AH Kipfilet", "AH Rijst basmati", "AH Tomaten rond",
-    "AH Rode paprika 3-pack", "AH Zalmfilet 2-pack", "AH Spinazie", "Jumbo Sojasaus", "AH Bosui bos",
+    "AH Kippendijfilet 600 g",
+    "AH Rundergehakt 500 g",
+    "Hellmann's Real mayonaise430 3-pack",
+    "Heinz Tomaat ketchup",
+    "AH Oude kaas plakken",
+    "AH Sjalot 250 g",
+    "AH Broodjes 6-pack",
+    "Lay's Paprika",
+    "Go-Tan Sweet chilli sauce",
+    "AH Kipfilet",
+    "AH Rijst basmati",
+    "AH Tomaten rond",
+    "AH Rode paprika 3-pack",
+    "AH Zalmfilet 2-pack",
+    "AH Spinazie",
+    "Jumbo Sojasaus",
+    "AH Bosui bos",
     "Loving Blends Avocado olie shampoo 4-pack",
 ]
 
@@ -1120,18 +1875,31 @@ class EnglishRecipesTest(TempDataDirTest):
 
     def suggestions(self, recipes):
         fetched = [real_offer(title, index) for index, title in enumerate(DUTCH_OFFERS, 1)]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        collectors = (("mealie", lambda: [
-            {"id": key, "title": key, "image": "", "url": "", "ingredients": lines} for key, lines in recipes.items()]),)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            run(offers.sync("ah"))
+        collectors = (
+            ("mealie", lambda: returned([{"id": key, "title": key, "image": "", "url": "", "ingredients": lines} for key, lines in recipes.items()])),
+        )
         with mock.patch.object(offers, "COLLECTORS", collectors):
-            offers.sync_recipes()
-        return {recipe["id"]: recipe for recipe in offers.suggest("ah")["recipes"]}
+            run(offers.sync_recipes())
+        return {recipe["id"]: recipe for recipe in run(offers.suggest("ah"))["recipes"]}
 
     def test_english_ingredients_match_dutch_offers(self):
-        recipes = self.suggestions({"rice": [
-            "400 g chicken breast", "2 cups rice", "3 tomatoes", "1 red bell pepper", "2 tbsp olive oil", "2 tbsp soy sauce",
-            "1 bunch spring onions", "salt and pepper", "200 g spinach"]})
+        recipes = self.suggestions(
+            {
+                "rice": [
+                    "400 g chicken breast",
+                    "2 cups rice",
+                    "3 tomatoes",
+                    "1 red bell pepper",
+                    "2 tbsp olive oil",
+                    "2 tbsp soy sauce",
+                    "1 bunch spring onions",
+                    "salt and pepper",
+                    "200 g spinach",
+                ]
+            }
+        )
         recipe = recipes["rice"]
         self.assertEqual((recipe["matchedCount"], recipe["ingredientCount"]), (7, 7), "olijfolie, zout en peper zijn basis")
         matched = {item["ingredient"]: item["offer"]["title"] for item in recipe["matched"]}
@@ -1148,9 +1916,23 @@ class EnglishRecipesTest(TempDataDirTest):
         self.assertEqual(titles, {"AH Kippendijfilet 600 g", "AH Sjalot 250 g"}, "de tweede Nederlandse naam (kipdijfilet) wordt ook geprobeerd")
 
     def test_grillworst_in_english_matches_what_is_really_on_offer(self):
-        grill = ["Bread roll", "6 tbsp mayo", "1 tbsp curry sauce", "1 tsp paprika", "2 tbsp paprika", "800 gr chicken thighs (or/and pork/bacon)",
-                 "Spice mixture (below)", "Cornstarch", "Old mature cheese", "1 shallot", "1 tbsp ketchup", "2 tsp curry", "1 tsp salt",
-                 "½ tsp cayenne", "1 tbsp onion powder"]
+        grill = [
+            "Bread roll",
+            "6 tbsp mayo",
+            "1 tbsp curry sauce",
+            "1 tsp paprika",
+            "2 tbsp paprika",
+            "800 gr chicken thighs (or/and pork/bacon)",
+            "Spice mixture (below)",
+            "Cornstarch",
+            "Old mature cheese",
+            "1 shallot",
+            "1 tbsp ketchup",
+            "2 tsp curry",
+            "1 tsp salt",
+            "½ tsp cayenne",
+            "1 tbsp onion powder",
+        ]
         recipe = self.suggestions({"grill": grill})["grill"]
         matched = {item["ingredient"]: item["offer"]["title"] for item in recipe["matched"]}
         self.assertEqual(matched["6 tbsp mayo"], "Hellmann's Real mayonaise430 3-pack")
@@ -1170,88 +1952,141 @@ class EnglishRecipesTest(TempDataDirTest):
 class OffersRoutesTest(TempDataDirTest):
     def setUp(self):
         super().setUp()
-        self.client = create_app().test_client()
+        self.app = create_app()
+        self.client = self.client_for(self.app)
 
-    def test_routes_load_sync_and_suggest(self):
-        self.assertEqual(self.client.get("/api/offers?store=ah").get_json()["syncedAt"], None)
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: ah.bonus_products_in(BONUS_PAGE)}):
-            synced = self.client.post("/api/offers/sync", json={"store": "ah"})
+    async def test_routes_load_sync_and_suggest(self):
+        self.assertEqual((await self.client.get("/api/offers?store=ah")).get_json()["syncedAt"], None)
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(ah.bonus_products_in(BONUS_PAGE))}):
+            synced = await self.client.post("/api/offers/sync", json={"store": "ah"})
         self.assertEqual((synced.status_code, synced.get_json()["total"]), (200, 3))
-        with mock.patch.object(offers, "COLLECTORS", (("mealie", lambda: [
-                {"id": "r1", "title": "Kip", "image": "", "url": "", "ingredients": ["kipfilet", "tomaten"], "course": "hoofdgerecht"}]),)):
-            self.assertEqual(self.client.post("/api/offers/recipes/sync").status_code, 200)
-        suggestions = self.client.get("/api/offers/recipes?store=ah").get_json()
+        with mock.patch.object(
+            offers,
+            "COLLECTORS",
+            (
+                (
+                    "mealie",
+                    lambda: returned(
+                        [{"id": "r1", "title": "Kip", "image": "", "url": "", "ingredients": ["kipfilet", "tomaten"], "course": "hoofdgerecht"}]
+                    ),
+                ),
+            ),
+        ):
+            self.assertEqual((await self.client.post("/api/offers/recipes/sync")).status_code, 200)
+        suggestions = (await self.client.get("/api/offers/recipes?store=ah")).get_json()
         self.assertEqual([r["id"] for r in suggestions["recipes"]], ["r1"])
         self.assertEqual(suggestions["courses"], [{"id": "hoofdgerecht", "count": 1}])
-        self.assertEqual([r["id"] for r in self.client.get("/api/offers/recipes?store=ah&course=hoofdgerecht").get_json()["recipes"]], ["r1"])
-        self.assertEqual(self.client.get("/api/offers/recipes?store=ah&course=dessert").get_json()["recipes"], [])
-        self.assertEqual(self.client.get("/api/offers/recipes?store=ah&course=pannenkoek").status_code, 400)
+        self.assertEqual([r["id"] for r in (await self.client.get("/api/offers/recipes?store=ah&course=hoofdgerecht")).get_json()["recipes"]], ["r1"])
+        self.assertEqual((await self.client.get("/api/offers/recipes?store=ah&course=dessert")).get_json()["recipes"], [])
+        self.assertEqual((await self.client.get("/api/offers/recipes?store=ah&course=pannenkoek")).status_code, 400)
 
-    def test_reporting_a_match_over_the_api(self):
+    async def test_reporting_a_match_over_the_api(self):
         fetched = [{"id": "1", "title": "AH Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"}]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            self.client.post("/api/offers/sync", json={"store": "ah"})
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            await self.client.post("/api/offers/sync", json={"store": "ah"})
         body = {"store": "ah", "ingredient": "400 g kipfilet", "offerId": "1"}
-        response = self.client.post("/api/offers/rejections", json=body)
+        response = await self.client.post("/api/offers/rejections", json=body)
         self.assertEqual((response.status_code, response.get_json()["offerId"]), (200, "1"))
-        self.assertEqual(self.client.delete("/api/offers/rejections", json=body).status_code, 200)
-        self.assertEqual(self.client.post("/api/offers/rejections", json={**body, "offerId": "nope"}).status_code, 400)
-        self.assertEqual(self.client.post("/api/offers/rejections", json={**body, "ingredient": ""}).status_code, 400)
+        self.assertEqual((await self.client.delete("/api/offers/rejections", json=body)).status_code, 200)
+        self.assertEqual((await self.client.post("/api/offers/rejections", json={**body, "offerId": "nope"})).status_code, 400)
+        self.assertEqual((await self.client.post("/api/offers/rejections", json={**body, "ingredient": ""})).status_code, 400)
 
-    def test_the_offers_are_cached_by_the_browser_and_only_resent_when_they_changed(self):
+    async def test_the_offers_are_cached_by_the_browser_and_only_resent_when_they_changed(self):
         fetched = [{"id": "1", "title": "AH Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"}]
-        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            self.client.post("/api/offers/sync", json={"store": "ah"})
-        first = self.client.get("/api/offers?store=ah")
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            await self.client.post("/api/offers/sync", json={"store": "ah"})
+        first = await self.client.get("/api/offers?store=ah")
         etag = first.headers["ETag"]
         self.assertEqual((first.status_code, first.headers["Cache-Control"]), (200, "private, no-cache"))
         self.assertEqual(first.get_json()["total"], 1)
-        again = self.client.get("/api/offers?store=ah", headers={"If-None-Match": etag})
+        again = await self.client.get("/api/offers?store=ah", headers={"If-None-Match": etag})
         self.assertEqual((again.status_code, again.get_data()), (304, b""), "ongewijzigd: geen lijst opnieuw versturen")
         self.assertEqual(again.headers["ETag"], etag)
-        self.assertEqual(self.client.get("/api/offers?store=ah", headers={"If-None-Match": '"iets-anders"'}).status_code, 200)
-        self.assertNotEqual(self.client.get("/api/offers?store=jumbo").headers["ETag"], etag, "elke winkel heeft een eigen ETag")
+        self.assertEqual((await self.client.get("/api/offers?store=ah", headers={"If-None-Match": '"iets-anders"'})).status_code, 200)
+        self.assertNotEqual((await self.client.get("/api/offers?store=jumbo")).headers["ETag"], etag, "elke winkel heeft een eigen ETag")
         # Een nieuwe synchronisatie, een nieuwe dag en een nieuwe versie geven een andere ETag.
-        with mock.patch.object(offers, "_now", return_value="2030-01-01T05:00:00+00:00"), mock.patch.dict(offers.FETCHERS, {"ah": lambda: fetched}):
-            offers.sync("ah")
-        self.assertNotEqual(self.client.get("/api/offers?store=ah").headers["ETag"], etag)
+        with (
+            mock.patch.object(offers, "_now", return_value="2030-01-01T05:00:00+00:00"),
+            mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}),
+        ):
+            await offers.sync("ah")
+        self.assertNotEqual((await self.client.get("/api/offers?store=ah")).headers["ETag"], etag)
         with mock.patch.object(offers, "date") as fake_date:
             fake_date.today.return_value.isoformat.return_value = "2031-02-03"
             self.assertNotIn("2031-02-03", etag)
-            self.assertIn("2031-02-03", offers.signature("ah"))
-        with mock.patch.object(offers.about, "read_version", return_value="9.9.9"):
-            self.assertTrue(offers.signature("ah").endswith("9.9.9"))
-        self.assertEqual(self.client.get("/api/offers?store=lidl", headers={"If-None-Match": etag}).status_code, 400)
+            self.assertIn("2031-02-03", await offers.signature("ah"))
+        with mock.patch.object(offers.about, "version", return_value="9.9.9"):
+            self.assertIn("9.9.9", await offers.signature("ah"))
+        # Ook een andere build van dezelfde versie (een deploy van een commit) geeft een andere ETag: anders houdt de browser na een
+        # deploy de oude lijst vast, zonder de velden die de nieuwe build erbij zet.
+        with mock.patch.object(offers.about, "build_commit", return_value="abc1234"):
+            self.assertIn("abc1234", await offers.signature("ah"))
+        self.assertNotEqual(await offers.signature("ah"), etag)
+        self.assertEqual((await self.client.get("/api/offers?store=nope", headers={"If-None-Match": etag})).status_code, 400)
 
-    def test_the_recipes_subtab_is_hidden_unless_switched_on(self):
+    async def test_the_server_keeps_the_list_per_etag_and_computes_concurrent_requests_once(self):
+        # Het prijsoordeel is het dure deel: met dezelfde ETag rekent de server het niet opnieuw uit, ook niet voor een tweede
+        # browser zonder If-None-Match of voor aanvragen die tegelijk binnenkomen.
+        fetched = [{"id": "1", "title": "AH Kipfilet", "price": 3.0, "priceBefore": 4.0, "promoLabel": "Bonus"}]
+        self.app.extensions["mealieshopper_warm_offers"] = mock.AsyncMock()  # de opwarmer na de knop zou hier de telling vertekenen
+        with mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}):
+            await self.client.post("/api/offers/sync", json={"store": "ah"})
+        real_annotate = prices.annotate
+        with mock.patch.object(prices, "annotate", side_effect=real_annotate) as annotate:
+            first, second, third = await asyncio.gather(*(self.client.get("/api/offers?store=ah") for _ in range(3)))
+            self.assertEqual({first.status_code, second.status_code, third.status_code}, {200})
+            self.assertEqual(first.get_json(), second.get_json())
+            self.assertEqual(annotate.call_count, 1, "drie aanvragen tegelijk: een berekening")
+            later = await self.client.get("/api/offers?store=ah")
+            self.assertEqual((later.get_json(), later.headers["ETag"]), (first.get_json(), first.headers["ETag"]))
+            self.assertEqual(annotate.call_count, 1, "dezelfde ETag: de bewaarde lijst")
+            await self.client.get("/api/offers?store=jumbo")
+            self.assertEqual(annotate.call_count, 2, "een andere winkel is een andere sleutel")
+            with (
+                mock.patch.object(offers, "_now", return_value="2030-01-01T05:00:00+00:00"),
+                mock.patch.dict(offers.FETCHERS, {"ah": lambda: returned(fetched)}),
+            ):
+                await offers.sync("ah")
+            renewed = await self.client.get("/api/offers?store=ah")
+            self.assertNotEqual(renewed.headers["ETag"], first.headers["ETag"])
+            self.assertEqual(annotate.call_count, 3, "een nieuwe synchronisatie: opnieuw uitrekenen")
+
+    async def test_a_failed_offers_load_is_not_kept(self):
+        with mock.patch.object(offers, "load", new_callable=mock.AsyncMock, side_effect=RuntimeError("stuk")) as load:
+            self.assertEqual((await self.client.get("/api/offers?store=ah")).status_code, 424)
+            self.assertEqual((await self.client.get("/api/offers?store=ah")).status_code, 424)
+            self.assertEqual(load.call_count, 2, "een fout wordt niet bewaard: de volgende aanvraag probeert het opnieuw")
+        self.assertEqual((await self.client.get("/api/offers?store=ah")).status_code, 200)
+
+    async def test_the_recipes_subtab_is_hidden_unless_switched_on(self):
         import re
 
-        def subtab(client):
-            html = client.get("/").get_data(as_text=True)
-            return re.search(r'<button class="subtab"[^>]*data-subtab="offers-suggestions"[^>]*>', html).group(0)
+        async def subtab(client):
+            html = (await client.get("/")).get_data(as_text=True)
+            return re.search(r'<a class="subtab"[^>]*data-subtab="offers-suggestions"[^>]*>', html).group(0)
 
-        self.assertIn(" hidden", subtab(self.client))
+        self.assertIn(" hidden", await subtab(self.client))
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test-0123456789abcdef"}):
-            self.assertNotIn(" hidden", subtab(self.client), "met een AI-sleutel verschijnt het tabblad ook zonder de variabele")
+            self.assertNotIn(" hidden", await subtab(self.client), "met een AI-sleutel verschijnt het tabblad ook zonder de variabele")
         with mock.patch.dict(os.environ, {"MEALIESHOPPER_OFFERS_RECIPES": "true"}):
-            self.assertNotIn(" hidden", subtab(create_app().test_client()))
-        self.assertEqual(self.client.get("/api/offers/recipes?store=ah").status_code, 200, "de API blijft werken")
+            self.assertNotIn(" hidden", await subtab(self.client_for(create_app())))
+        self.assertEqual((await self.client.get("/api/offers/recipes?store=ah")).status_code, 200, "de API blijft werken")
 
-    def test_unknown_store_is_a_400_and_a_store_failure_a_424(self):
-        self.assertEqual(self.client.get("/api/offers?store=lidl").status_code, 400)
-        self.assertEqual(self.client.post("/api/offers/sync", json={"store": "lidl"}).status_code, 400)
+    async def test_unknown_store_is_a_400_and_a_store_failure_a_424(self):
+        self.assertEqual((await self.client.get("/api/offers?store=nope")).status_code, 400)
+        self.assertEqual((await self.client.post("/api/offers/sync", json={"store": "nope"})).status_code, 400)
 
         def not_linked():
             raise RuntimeError("Jumbo account niet gekoppeld")
 
         with mock.patch.dict(offers.FETCHERS, {"jumbo": not_linked}):
-            self.assertEqual(self.client.post("/api/offers/sync", json={"store": "jumbo"}).status_code, 424)
+            self.assertEqual((await self.client.post("/api/offers/sync", json={"store": "jumbo"})).status_code, 424)
 
         def boom():
             raise RuntimeError("AH is stuk")
 
         with mock.patch.dict(offers.FETCHERS, {"ah": boom}):
-            response = self.client.post("/api/offers/sync", json={"store": "ah"})
+            response = await self.client.post("/api/offers/sync", json={"store": "ah"})
         self.assertEqual((response.status_code, response.get_json()["error"]), (424, "AH is stuk"))
 
 

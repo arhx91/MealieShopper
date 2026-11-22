@@ -1,5 +1,6 @@
-// Profiel en het avatar-menu: de avatar met een uitklapmenu (Profiel, Instellingen, Uitloggen) en de profielpagina
-// (displaynaam en avatar). Op een groot scherm staat de avatar in de kop, op een klein scherm in de tabbalk.
+// Profiel en het avatar-menu: de avatar met een uitklapmenu (Profiel, Instellingen, Over, Uitloggen) en de profielpagina
+// (displaynaam en avatar). Op een groot scherm staat de avatar in de kop, op een klein scherm de knop Meer in de tabbalk;
+// daar staat ook het Mandje in het menu (de tab Mandje is er dan niet, zie styles.css).
 // Laadt na app.js en gebruikt daar de hulpfuncties van ($, message, jsonFetch, setBusy, t, showPanel, ...).
 
 const AVATAR_SIZE = 256;
@@ -43,15 +44,28 @@ function renderUserMenu() {
   const auth = state.auth || {};
   const visible = profileSignedIn();
   $("#user-menu").hidden = !visible;
-  $("#tab-avatar").hidden = !visible;
+  $("#tab-more").hidden = !visible;
   if (!visible) profileMenuClose();
   const name = profileName();
   $("#user-menu-name").textContent = name;
   $("#user-menu-who-name").textContent = name;
   $("#user-menu-who-user").textContent = auth.username && auth.username !== name ? auth.username : "";
   $("#auth-logout").hidden = !auth.enabled;
+  $("#auth-logout-separator").hidden = !auth.enabled;
+  renderUserMenuSwitches();
   renderProfileAvatars();
   renderProfilePage();
+}
+
+// Thema en taal in het menu (sinds 4.7.0 niet meer in de kop): het item zegt wat een tik doet. Donker staat aan, dan "Lichte
+// modus"; de taal noemt de andere taal, in die taal zelf ("English" als Nederlands aan staat).
+function renderUserMenuSwitches() {
+  const dark = window.THEME?.current() === "dark";
+  $("#user-menu-theme").textContent = t(dark ? "theme.light" : "theme.dark");
+  const other = I18N.lang() === "nl" ? "en" : "nl";
+  const lang = $("#user-menu-lang");
+  lang.textContent = other === "en" ? "English" : "Nederlands";
+  lang.lang = other;
 }
 
 // ---- Het menu
@@ -79,7 +93,8 @@ function profileMenuOpen(trigger) {
   const alignLeft = rect.left + rect.width / 2 < window.innerWidth / 2;
   list.style.left = alignLeft ? `${Math.max(8, Math.round(rect.left))}px` : "auto";
   list.style.right = alignLeft ? "auto" : `${Math.max(8, Math.round(window.innerWidth - rect.right))}px`;
-  list.querySelector("button:not([hidden])")?.focus();
+  // De focus op het eerste zichtbare item (Mandje staat alleen op een klein scherm in het menu), niet op Uitloggen.
+  [...list.querySelectorAll('[role="menuitem"]')].find((item) => item.getClientRects().length)?.focus();
 }
 
 document.querySelectorAll("[data-user-menu-trigger]").forEach((trigger) => {
@@ -103,12 +118,18 @@ document.addEventListener("keydown", (event) => {
 });
 window.addEventListener("resize", profileMenuClose);
 $("#user-menu-list").addEventListener("click", (event) => {
-  const item = event.target.closest("button");
+  const item = event.target.closest(".user-menu__item");
   if (!item) return;
   profileMenuClose();
+  if (item.dataset.userAction) event.preventDefault();
+  if (item.dataset.userAction === "basket") showPanel("basket", document.querySelector('.tab[data-tab="basket"]'));
   if (item.dataset.userAction === "profile") openProfile();
   if (item.dataset.userAction === "settings") openSettings();
   if (item.dataset.userAction === "about") showPanel("about");
+  if (item.dataset.userAction === "theme") THEME.choose(THEME.current() === "dark" ? "light" : "dark");
+  if (item.dataset.userAction === "lang") I18N.setLang(I18N.lang() === "nl" ? "en" : "nl");
+  // Alleen in de geïnstalleerde app: daar is geen knop Vernieuwen van de browser, en omlaag slepen ververst er niet (styles.css).
+  if (item.dataset.userAction === "reload") window.location.reload();
 });
 
 // ---- De profielpagina
@@ -204,3 +225,4 @@ $("#profile-avatar-remove").addEventListener("click", async () => {
 });
 
 window.addEventListener("ms:languagechange", renderUserMenu);
+window.addEventListener("ms:appearancepaint", renderUserMenuSwitches);

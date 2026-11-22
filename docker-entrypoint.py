@@ -1,10 +1,11 @@
 """Startpunt van de container: zet de opties van de Home Assistant-add-on om in omgevingsvariabelen en start de server.
 
 Buiten Home Assistant verandert er niets: zonder `/data/options.json` (het bestand waarin de Supervisor de opties van een
-add-on zet) start dit direct het commando uit de Dockerfile (gunicorn) of het commando dat je zelf meegeeft.
+add-on zet) start dit direct het commando uit de Dockerfile (hypercorn) of het commando dat je zelf meegeeft.
 
 Alleen de standaardbibliotheek, zodat dit ook werkt voordat de app is geladen.
 """
+
 from __future__ import annotations
 
 import json
@@ -25,10 +26,11 @@ OPTION_ENV = {
     "auth_secret": "MEALIESHOPPER_AUTH_SECRET",
     "anthropic_api_key": "ANTHROPIC_API_KEY",
     "openai_api_key": "OPENAI_API_KEY",
+    "anthropic_base_url": "ANTHROPIC_BASE_URL",
+    "openai_base_url": "OPENAI_BASE_URL",
     "picnic_country_code": "PICNIC_COUNTRY_CODE",
     "offers_schedule": "MEALIESHOPPER_OFFERS_SCHEDULE",
     "offers_sync_hour": "MEALIESHOPPER_OFFERS_SYNC_HOUR",
-    "default_portions": "MEALIESHOPPER_DEFAULT_PORTIONS",
     "mcp": "MEALIESHOPPER_MCP",
     "update_check": "MEALIESHOPPER_UPDATE_CHECK",
     "audit_log": "MEALIESHOPPER_AUDIT_LOG",

@@ -7,32 +7,33 @@ leidt de app de gebruiker langs de beveiliging en de uitleg voor Mealie, Albert 
 De status wordt uit de aanwezige gegevens afgeleid; alleen "bezig" en "klaar" staan als vlag
 in de database. Zo blijft een bestaande installatie (met passkey of wachtwoord) buiten beeld.
 """
+
 from __future__ import annotations
 
 import ipaddress
 from typing import Any
 
-from flask import Flask, jsonify, request
+from quart import Quart, jsonify
 
-from . import ah, auth, jumbo, mealie, picnic
+from . import ah, auth, crisp, jumbo, mealie, picnic, urls
 from .i18n import tr
 
 SETTING_ACTIVE = "ONBOARDING_ACTIVE"
 SETTING_DONE = "ONBOARDING_DONE"
 
-# Adressen die alleen binnen je eigen netwerk bestaan: daar werkt geen passkey en is geen echt domein.
-PRIVATE_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain", ".intranet", ".private")
+# Adressen die alleen binnen je eigen netwerk bestaan: daar werkt geen passkey en is geen echt domein (de lijst staat in urls.py).
+PRIVATE_SUFFIXES = urls.PRIVATE_SUFFIXES
 
 
-def _flag(key: str) -> bool:
-    return auth.get_setting(key) == "1"
+async def _flag(key: str) -> bool:
+    return await auth.get_setting(key) == "1"
 
 
 def hostname_info(host: str) -> dict[str, Any]:
     """Is dit een echte domeinnaam (waarmee een passkey kan werken)?"""
     host = (host or "").strip().lower().rstrip(".")
     if host.startswith("[") and "]" in host:  # IPv6 in een URL
-        host = host[1:host.index("]")]
+        host = host[1 : host.index("]")]
     try:
         ipaddress.ip_address(host)
         return {"host": host, "isIp": True, "isDomain": False, "reason": tr("een IP-adres", "an IP address")}
@@ -43,7 +44,12 @@ def hostname_info(host: str) -> dict[str, Any]:
     if "." not in host:
         return {"host": host, "isIp": False, "isDomain": False, "reason": tr("een naam zonder domein", "a name without a domain")}
     if host.endswith(PRIVATE_SUFFIXES):
-        return {"host": host, "isIp": False, "isDomain": False, "reason": tr("een naam die alleen in je eigen netwerk bestaat", "a name that only exists on your own network")}
+        return {
+            "host": host,
+            "isIp": False,
+            "isDomain": False,
+            "reason": tr("een naam die alleen in je eigen netwerk bestaat", "a name that only exists on your own network"),
+        }
     return {"host": host, "isIp": False, "isDomain": True, "reason": ""}
 
 
@@ -74,68 +80,80 @@ def environment() -> dict[str, Any]:
     }
 
 
-def _integrations_configured() -> bool:
+async def _integrations_configured() -> bool:
     try:
         return (
-            bool(mealie.mealie_url() and mealie.mealie_token())
-            or bool(ah.configured_refresh_token())
-            or bool(jumbo.configured_refresh_token())
-            or bool(picnic.configured_auth_key())
+            bool(await mealie.mealie_url() and await mealie.mealie_token())
+            or bool(await ah.configured_refresh_token())
+            or bool(await jumbo.configured_refresh_token())
+            or bool(await picnic.configured_auth_key())
+            or bool(await crisp.configured_client_id())
         )
     except Exception:  # noqa: BLE001 - een onleesbare database telt niet als "al ingesteld"
         return False
 
 
-def is_fresh() -> bool:
-    if auth.credentials_exist() or auth.auth_mode():
+async def is_fresh() -> bool:
+    if await auth.credentials_exist() or await auth.auth_mode():
         return False
-    if not auth.auth_enabled() and _integrations_configured():
+    if not auth.auth_enabled() and await _integrations_configured():
         return False  # bestaande installatie met inloggen uit en al gekoppeld
     return True
 
 
-def needed() -> bool:
-    if _flag(SETTING_DONE):
+async def needed() -> bool:
+    if await _flag(SETTING_DONE):
         return False
-    return _flag(SETTING_ACTIVE) or is_fresh()
+    return await _flag(SETTING_ACTIVE) or await is_fresh()
 
 
-def begin() -> None:
+async def begin() -> None:
     """Onthoud dat de onboarding is begonnen, ook als er daarna een inlogmethode bijkomt."""
-    if not _flag(SETTING_DONE) and not _flag(SETTING_ACTIVE) and is_fresh():
-        auth.set_setting(SETTING_ACTIVE, "1")
+    if not await _flag(SETTING_DONE) and not await _flag(SETTING_ACTIVE) and await is_fresh():
+        await auth.set_setting(SETTING_ACTIVE, "1")
 
 
-def complete() -> None:
-    auth.set_setting(SETTING_DONE, "1")
-    auth.set_setting(SETTING_ACTIVE, "0")
+async def complete() -> None:
+    await auth.set_setting(SETTING_DONE, "1")
+    await auth.set_setting(SETTING_ACTIVE, "0")
 
 
-def register_routes(app: Flask) -> None:
+def register_routes(app: Quart) -> None:
     @app.get("/api/onboarding/status")
-    def onboarding_status():
+    async def onboarding_status():
         env = environment()
-        required = auth.auth_required()
+        required = await auth.auth_required()
+        mode = await auth.auth_mode()
+        if not auth.auth_enabled():
+            auth_mode = "off"
+        elif mode:
+            auth_mode = mode
+        elif await auth.passkey_count():
+            auth_mode = "passkey"
+        elif await auth.password_configured():
+            auth_mode = "password"
+        else:
+            auth_mode = ""
         return jsonify(
             {
-                "needed": needed(),
+                "needed": await needed(),
                 **env,
                 "authEnabled": auth.auth_enabled(),
                 "authRequired": required,
-                "authDone": auth.credentials_exist() or auth.auth_mode() == "none" or not auth.auth_enabled(),
-                "authMode": "off" if not auth.auth_enabled() else (auth.auth_mode() or ("passkey" if auth.passkey_count() else "password" if auth.password_configured() else "")),
-                "authenticated": bool(auth.current_user()) or not required,
+                "authDone": await auth.credentials_exist() or mode == "none" or not auth.auth_enabled(),
+                "authMode": auth_mode,
+                "authenticated": bool(await auth.current_user()) or not required,
                 "minPasswordLength": 10,
             }
         )
 
     @app.post("/api/onboarding/start")
-    def onboarding_start():
-        begin()
-        return jsonify({"needed": needed()})
+    async def onboarding_start():
+        await begin()
+        return jsonify({"needed": await needed()})
 
     @app.post("/api/onboarding/complete")
-    def onboarding_complete():
+    async def onboarding_complete():
         # Valt onder de gewone inlogcontrole: zonder sessie (als inloggen aan staat) komt dit er niet door.
-        complete()
+        await complete()
         return jsonify({"needed": False})

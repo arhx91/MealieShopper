@@ -6,12 +6,13 @@ via `jumbo._persisted_query`. Een recept (`getRecipe`) kennen we uit een echt an
 zoekresultaten) lezen we aan hun vorm: een receptkaart is een object met een `id`, een `title` en een `link` naar
 `/recepten/...`, waar ook in het antwoord het staat. Zo breekt een andere nesting van Jumbo er niets aan af.
 """
+
 from __future__ import annotations
 
 import re
 from typing import Any
 
-from . import jumbo
+from . import jumbo, nutrition, recipe_diet
 from .ah_lists import _fold
 from .i18n import tr
 
@@ -22,6 +23,8 @@ MAX_ID_LENGTH = 30
 # Een receptnummer is meestal een getal (`504898`), bij recepten van Smulweb en anderen `1416890-7`.
 _RECIPE_ID = re.compile(r"^[0-9A-Za-z_-]{1,%d}$" % MAX_ID_LENGTH)
 _URL_ID = re.compile(r"^https?://(?:www\.)?jumbo\.com/recepten/[^?#/]*?-(\d{1,20}(?:-\d{1,3})?)/?(?:[?#].*)?$", re.I)
+# De naam van een voedingswaarde bij Jumbo -> het veld van schema.org en Mealie (zie nutrition.py). Zout staat er niet bij:
+# dat is geen natrium, het wordt omgerekend (`_SALT`).
 _NUTRITION = {
     "energie": "calories",
     "koolhydraten": "carbohydrateContent",
@@ -29,10 +32,14 @@ _NUTRITION = {
     "eiwit": "proteinContent",
     "vet": "fatContent",
     "verzadigd vet": "saturatedFatContent",
+    "waarvan verzadigd": "saturatedFatContent",
     "vezels": "fiberContent",
+    "voedingsvezel": "fiberContent",
     "suikers": "sugarContent",
-    "zout": "sodiumContent",
+    "waarvan suikers": "sugarContent",
+    "natrium": "sodiumContent",
 }
+_SALT = "zout"
 
 
 def recipe_id_from_url(url: Any) -> str | None:
@@ -97,6 +104,7 @@ def summaries(data: Any) -> list[dict[str, Any]]:
         persons = node.get("numberOfPersons")
         author = node.get("author")
         count = node.get("numberOfIngredients")
+        calories = node.get("calories")  # per portie, zoals "Energie" in het recept zelf; 0 is onbekend
         recipes.append(
             {
                 "id": recipe_id,
@@ -104,8 +112,11 @@ def summaries(data: Any) -> list[dict[str, Any]]:
                 "image": _image(node),
                 "minutes": _minutes(node.get("time")),
                 "portions": persons if isinstance(persons, int) and persons > 0 else None,
-                "rating": rating.get("value") if isinstance(rating, dict) and isinstance(rating.get("value"), (int, float)) and rating.get("value") else None,
+                "rating": rating.get("value")
+                if isinstance(rating, dict) and isinstance(rating.get("value"), (int, float)) and rating.get("value")
+                else None,
                 "ingredientCount": count if isinstance(count, int) and count > 0 else None,
+                "kcal": round(calories) if isinstance(calories, (int, float)) and not isinstance(calories, bool) and calories > 0 else None,
                 "course": node.get("course") or None,
                 "author": author.get("name") if isinstance(author, dict) and author.get("name") else None,
                 "url": _site(node.get("link")),
@@ -114,13 +125,13 @@ def summaries(data: Any) -> list[dict[str, Any]]:
     return [recipe for recipe in recipes if recipe["name"]]
 
 
-def get_lists() -> list[dict[str, Any]]:
+async def get_lists() -> list[dict[str, Any]]:
     """Je receptenlijsten (*Mijn recepten*): `[{id, name, kind, count}]`, Favorieten eerst. Zonder de recepten zelf.
 
     Het overzicht van de site (`getRecipeLists`) toont per lijst alleen titel en plaatje van een paar recepten; de
     recepten van een lijst komen uit een andere aanvraag.
     """
-    data = jumbo._persisted_query(
+    data = await jumbo._persisted_query(
         "getRecipeLists",
         {"includeHasRecipe": False, "itemsInput": {"size": 1}, "listsSize": MAX_RECIPE_LISTS, "listsPage": 1},
     )
@@ -159,33 +170,33 @@ def _list_page(data: Any, number: int) -> dict[str, Any]:
     }
 
 
-def get_favorites(page: Any = 1) -> dict[str, Any]:
+async def get_favorites(page: Any = 1) -> dict[str, Any]:
     """Je favoriete recepten (de lijst *Favorieten* onder *Mijn recepten*), per pagina van `RECIPE_PAGE`.
 
     `{recipes, total, page, hasNext}`; `page` begint bij 1, zoals bij de website.
     """
     number = _page_number(page)
-    return _list_page(jumbo._persisted_query("FavoriteRecipes", {"size": RECIPE_PAGE, "page": number}), number)
+    return _list_page(await jumbo._persisted_query("FavoriteRecipes", {"size": RECIPE_PAGE, "page": number}), number)
 
 
-def get_list_recipes(list_id: Any, page: Any = 1) -> dict[str, Any]:
+async def get_list_recipes(list_id: Any, page: Any = 1) -> dict[str, Any]:
     """De recepten van een eigen receptenlijst (zoals *Kerst*), per pagina; dezelfde vorm als `get_favorites`."""
     list_id = str(list_id or "").strip()
     if not _LIST_ID.match(list_id):
         raise ValueError(tr("Onbekend lijstje", "Unknown list"))
     number = _page_number(page)
-    data = jumbo._persisted_query("getRecipeListById", {"listId": list_id, "itemsInput": {"page": number, "size": RECIPE_PAGE}})
+    data = await jumbo._persisted_query("getRecipeListById", {"listId": list_id, "itemsInput": {"page": number, "size": RECIPE_PAGE}})
     return _list_page(data, number)
 
 
-def get_recipes_of(info: dict[str, Any], page: Any = 1) -> dict[str, Any]:
+async def get_recipes_of(info: dict[str, Any], page: Any = 1) -> dict[str, Any]:
     """De recepten van een lijst uit `get_lists()`: Favorieten via zijn eigen aanvraag, de rest op lijst-id."""
-    return get_favorites(page) if info.get("kind") == "favorites" else get_list_recipes(info["id"], page)
+    return await get_favorites(page) if info.get("kind") == "favorites" else await get_list_recipes(info["id"], page)
 
 
-def resolve_list(wanted: Any) -> dict[str, Any]:
+async def resolve_list(wanted: Any) -> dict[str, Any]:
     """Een lijst op id of (deel van de) naam; zonder opgave Favorieten."""
-    lists = get_lists()
+    lists = await get_lists()
     text = " ".join(str(wanted or "").split())
     if not text:
         favourites = next((item for item in lists if item["kind"] == "favorites"), None)
@@ -207,11 +218,35 @@ def resolve_list(wanted: Any) -> dict[str, Any]:
     )
 
 
-def search(query: Any, offset: Any = 0) -> dict[str, Any]:
+SCAN_PAGES = 3  # met filters (4.22.0): zoveel pagina's per keer bekijken als er te weinig recepten door de filter komen
+SCAN_ENOUGH = 12  # zoveel recepten na de filter is genoeg voor één keer
+
+
+async def search(query: Any, offset: Any = 0, wanted: Any = None) -> dict[str, Any]:
     """Zoek in alle recepten van Jumbo; per pagina `RECIPE_PAGE` stuks, vanaf `offset`.
 
     `{recipes, total}`: `total` is het aantal recepten dat bij de zoekterm past (de website toont "820 recepten").
+
+    Met `wanted` (recipe_diet.Wanted: menugang en tijd) filteren we de kaarten zelf, tot `SCAN_PAGES` pagina's per keer. Dan is het
+    totaal na de filter niet bekend (`total` None): `scanned` zegt hoeveel treffers we bekeken en `nextOffset` waar de volgende
+    keer verder gaat.
     """
+    if wanted is not None and wanted.active():
+        try:
+            start = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            start = 0
+        kept: list[dict[str, Any]] = []
+        total = 0
+        for _ in range(SCAN_PAGES):
+            page = await search(query, start)
+            total = page["total"]
+            start += RECIPE_PAGE
+            kept += recipe_diet.filter_cards("jumbo", page["recipes"], wanted)
+            if len(kept) >= SCAN_ENOUGH or not page["recipes"] or start >= total:
+                break
+        scanned = min(start, total)
+        return {"recipes": kept, "total": None, "scanned": scanned, "nextOffset": start, "more": start < total}
     query = " ".join(str(query or "").split())[:100]
     if not query:
         raise ValueError(tr("Zoekterm ontbreekt", "Search term missing"))
@@ -219,7 +254,7 @@ def search(query: Any, offset: Any = 0) -> dict[str, Any]:
         start = max(0, int(offset or 0))
     except (TypeError, ValueError):
         start = 0
-    data = jumbo._persisted_query(
+    data = await jumbo._persisted_query(
         "getRecipesListers",
         {"input": {"searchTerms": query, "friendlyUrl": f"?searchTerms={query}", "offSet": start, "limit": RECIPE_PAGE}},
     )
@@ -231,10 +266,10 @@ def search(query: Any, offset: Any = 0) -> dict[str, Any]:
     return {"recipes": recipes, "total": total if isinstance(total, int) and total >= 0 else len(recipes)}
 
 
-def get_by_ids(ids: list[str]) -> list[dict[str, Any]]:
+async def get_by_ids(ids: list[str]) -> list[dict[str, Any]]:
     """Recepten op id (zoals de pagina's met een categorie die vragen)."""
     wanted = [_valid_id(recipe_id) for recipe_id in ids][:RECIPE_PAGE]
-    data = jumbo._persisted_query("getRecipesByIds", {"ids": wanted, "limit": len(wanted), "offset": 0})
+    data = await jumbo._persisted_query("getRecipesByIds", {"ids": wanted, "limit": len(wanted), "offset": 0})
     return summaries(data)
 
 
@@ -247,10 +282,19 @@ def _ingredient_line(raw: dict[str, Any]) -> str:
     return " ".join(part for part in (amount, name) if part)
 
 
+class RecipeUnavailable(RuntimeError):
+    """Jumbo kent het recept niet (meer), of het heeft geen ingrediënten en geen bereiding: opnieuw proberen helpt niet."""
+
+
+def valid_id(recipe_id: Any) -> str:
+    """Het receptnummer als tekst; een `ValueError` als het geen geldig nummer is."""
+    return _valid_id(recipe_id)
+
+
 def parse_recipe(raw: Any, recipe_id: str) -> dict[str, Any]:
     """Een recept uit het antwoord van `getRecipe`: tekst, tijden, ingrediënten (met het Jumbo-product) en stappen."""
     if not isinstance(raw, dict) or not isinstance(raw.get("title"), str):
-        raise RuntimeError(tr("Jumbo kent dit recept niet (meer)", "Jumbo doesn't know this recipe (any more)"))
+        raise RecipeUnavailable(tr("Jumbo kent dit recept niet (meer)", "Jumbo doesn't know this recipe (any more)"))
     ingredients = []
     for item in raw.get("ingredients") or []:
         if not isinstance(item, dict) or not str(item.get("name") or "").strip():
@@ -265,11 +309,7 @@ def parse_recipe(raw: Any, recipe_id: str) -> dict[str, Any]:
                 "product": str(product["title"]) if product and product.get("title") else None,
             }
         )
-    nutrition = [
-        {"name": str(n["name"]), "quantity": n.get("quantity"), "unit": n.get("unit") or ""}
-        for n in raw.get("nutritions") or []
-        if isinstance(n, dict) and n.get("name")
-    ]
+    found = nutrition_values(raw.get("nutritions"))
     author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
     rating = raw.get("rating") if isinstance(raw.get("rating"), dict) else {}
     persons = raw.get("numberOfPersons")
@@ -284,7 +324,7 @@ def parse_recipe(raw: Any, recipe_id: str) -> dict[str, Any]:
         "ingredients": ingredients,
         "steps": [str(step).strip() for step in raw.get("instructions") or [] if str(step).strip()],
         "tip": tip or None,
-        "nutrition": nutrition,
+        "nutrition": nutrition.items(found),
         "course": raw.get("course") or None,
         "dishType": raw.get("dishType") or None,
         "author": author.get("name") or None,
@@ -294,9 +334,9 @@ def parse_recipe(raw: Any, recipe_id: str) -> dict[str, Any]:
     }
 
 
-def get_recipe(recipe_id: Any) -> dict[str, Any]:
+async def get_recipe(recipe_id: Any) -> dict[str, Any]:
     recipe_id = _valid_id(recipe_id)
-    data = jumbo._persisted_query("getRecipe", {"id": recipe_id})
+    data = await jumbo._persisted_query("getRecipe", {"id": recipe_id})
     return parse_recipe(data.get("recipe"), recipe_id)
 
 
@@ -308,13 +348,26 @@ def source_url(recipe: dict[str, Any]) -> str:
     return recipe.get("url") or f"{jumbo.SITE_URL}/recepten/{recipe['id']}"
 
 
-def _nutrition(items: list[dict[str, Any]]) -> dict[str, str]:
-    data: dict[str, str] = {}
-    for item in items:
-        key = _NUTRITION.get(str(item["name"]).strip().casefold())
-        if key and item.get("quantity") is not None:
-            data[key] = f"{item['quantity']} {item.get('unit') or ''}".strip()
-    return data
+def nutrition_values(raw: Any) -> dict[str, float]:
+    """De voedingswaarden van een Jumbo-recept (`nutritions`: `[{name, quantity, unit}]`, per portie) als getallen in de
+    eenheden van nutrition.py. Zout wordt natrium (1 g zout = 400 mg natrium), tenzij Jumbo natrium zelf ook geeft."""
+    found: dict[str, float] = {}
+    salt: float | None = None
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().casefold()
+        if name == _SALT:
+            salt = nutrition.sodium_from_salt(item.get("quantity"), item.get("unit") or "g")
+            continue
+        key = _NUTRITION.get(name)
+        if key and key not in found:
+            amount = nutrition.convert(key, item.get("quantity"), item.get("unit"))
+            if amount is not None and not (key == "calories" and amount <= 0):
+                found[key] = amount
+    if salt is not None and "sodiumContent" not in found:
+        found["sodiumContent"] = salt
+    return found
 
 
 def jsonld(recipe: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +375,7 @@ def jsonld(recipe: dict[str, Any]) -> dict[str, Any]:
     lines = [item["line"] for item in recipe["ingredients"]]
     steps = [{"@type": "HowToStep", "text": text} for text in recipe["steps"]]
     if not lines and not steps:
-        raise RuntimeError(tr("Dit Jumbo-recept heeft geen ingrediënten of bereiding", "This Jumbo recipe has no ingredients or steps"))
+        raise RecipeUnavailable(tr("Dit Jumbo-recept heeft geen ingrediënten of bereiding", "This Jumbo recipe has no ingredients or steps"))
     description = recipe.get("description") or ""
     if recipe.get("tip"):
         description = f"{description}\n\nTip: {recipe['tip']}".strip()
@@ -350,7 +403,7 @@ def jsonld(recipe: dict[str, Any]) -> dict[str, Any]:
         data["author"] = {"@type": "Organization", "name": recipe["author"]}
     if recipe.get("rating") and recipe.get("ratingCount"):
         data["aggregateRating"] = {"@type": "AggregateRating", "ratingValue": recipe["rating"], "ratingCount": recipe["ratingCount"]}
-    nutrition = _nutrition(recipe.get("nutrition") or [])
-    if nutrition:
-        data["nutrition"] = {"@type": "NutritionInformation", **nutrition}
+    found = {item["key"]: item["quantity"] for item in recipe.get("nutrition") or [] if isinstance(item, dict) and item.get("key") in nutrition.UNITS}
+    if block := nutrition.schema(found):
+        data["nutrition"] = block
     return data

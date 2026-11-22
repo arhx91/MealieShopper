@@ -26,6 +26,17 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(numbers, sorted(numbers, reverse=True))
         self.assertEqual(numbers[0], tuple(int(p) for p in release_notes.current_version()[1:].split(".")))
 
+    def test_every_block_has_at_most_one_english_summary(self):
+        # Komt het kopje van een nieuwe versie midden in de sectie van de vorige terecht (een merge die misging, zoals
+        # 4.10.1 in #300), dan blijft die sectie leeg en staat haar tekst onder de nieuwe versie, en daarmee in de
+        # releasetekst van een versie die hem niet bracht. Te zien aan twee Engelse samenvattingen in één blok.
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        for section in re.split(r"^## (?=v\d+\.\d+\.\d+\s*$)", text, flags=re.M)[1:]:
+            version = section.split("\n", 1)[0].strip()
+            for block in re.split(r"^#{3,4} ", section, flags=re.M):
+                count = len(re.findall(r"^\*English summary:", block, re.M))
+                self.assertLessEqual(count, 1, f"{version}: {count} Engelse samenvattingen in één blok: {block.split(chr(10), 1)[0][:60]}")
+
     def test_section_ends_at_the_next_heading(self):
         notes = release_notes.notes_for("v1.2.0")
         self.assertNotIn("## v1.0.0", notes)
@@ -38,13 +49,7 @@ class ReleaseTest(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
-    SAMPLE = (
-        "# Changelog\n\nIntro.\n\n"
-        "## v2.10.0\n\nTien.\n\n"
-        "## v2.9.1\n\nNegen-een.\n\n"
-        "## v2.9.0\n\nNegen.\n\n"
-        "## v2.8.0\n\nAcht.\n"
-    )
+    SAMPLE = "# Changelog\n\nIntro.\n\n## v2.10.0\n\nTien.\n\n## v2.9.1\n\nNegen-een.\n\n## v2.9.0\n\nNegen.\n\n## v2.8.0\n\nAcht.\n"
 
     def test_stable_release_collects_every_version_since_the_previous_one(self):
         changelog = self._changelog(self.SAMPLE)
@@ -90,6 +95,23 @@ class ReleaseTest(unittest.TestCase):
     def test_only_beta_may_open_a_pull_request_to_main(self):
         guard = (ROOT / ".github" / "workflows" / "pr-target.yml").read_text(encoding="utf-8")
         self.assertIn("- main", guard)
+        self.assertIn('"$HEAD_REF" != "beta"', guard)
+
+    def test_a_dependabot_pull_request_to_main_moves_to_beta_instead_of_failing(self):
+        # Beveiligingsupdates van Dependabot gaan altijd naar de standaardbranch (main); de check zet ze over naar beta.
+        text = (ROOT / ".github" / "workflows" / "pr-target.yml").read_text(encoding="utf-8")
+        steps = {block.split("\n", 1)[0].strip(): block for block in text.split("      - name: ")[1:]}
+        move = steps["Move a Dependabot pull request to beta"]
+        guard = steps["Require beta as the source branch"]
+        self.assertIn("pull-requests: write", text)
+        self.assertIn("id: dependabot", move)
+        self.assertIn("github.event.pull_request.user.login == 'dependabot[bot]'", move)
+        self.assertIn("head.repo.full_name == github.repository", move)  # geen pull request uit een fork
+        self.assertIn("-f base=beta", move)
+        self.assertIn("git apply --check -R -C0", move)  # staat de update al in beta, dan sluiten
+        self.assertIn("-f state=closed", move)
+        # De gewone check valt alleen weg als het verzetten of sluiten lukte; anders faalt hij zoals altijd.
+        self.assertIn("if: steps.dependabot.outcome != 'success'", guard)
         self.assertIn('"$HEAD_REF" != "beta"', guard)
 
     def test_branch_rule_is_written_down(self):

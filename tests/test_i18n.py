@@ -8,7 +8,9 @@ from unittest import mock
 
 os.environ["PASSKEY_AUTH_ENABLED"] = "false"
 
-from mealieshopper import auth, auth_password, i18n, onboarding  # noqa: E402
+from helpers import AppTestCase, run  # noqa: E402
+
+from mealieshopper import auth_password, i18n  # noqa: E402
 from mealieshopper.app import create_app  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -16,23 +18,47 @@ STATIC = ROOT / "static"
 HTML = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
 SOURCES = {
     "app.js": (STATIC / "app.js").read_text(encoding="utf-8"),
+    "recipe_view.js": (STATIC / "recipe_view.js").read_text(encoding="utf-8"),
+    "recipe_nav.js": (STATIC / "recipe_nav.js").read_text(encoding="utf-8"),
+    "plan_drag.js": (STATIC / "plan_drag.js").read_text(encoding="utf-8"),
+    "cook_timers.js": (STATIC / "cook_timers.js").read_text(encoding="utf-8"),
+    "categories.js": (STATIC / "categories.js").read_text(encoding="utf-8"),
     "onboarding.js": (STATIC / "onboarding.js").read_text(encoding="utf-8"),
     "users.js": (STATIC / "users.js").read_text(encoding="utf-8"),
     "ai.js": (STATIC / "ai.js").read_text(encoding="utf-8"),
     "orders.js": (STATIC / "orders.js").read_text(encoding="utf-8"),
+    "purchase_views.js": (STATIC / "purchase_views.js").read_text(encoding="utf-8"),
+    "order_views.js": (STATIC / "order_views.js").read_text(encoding="utf-8"),
+    "popover.js": (STATIC / "popover.js").read_text(encoding="utf-8"),
+    "linking.js": (STATIC / "linking.js").read_text(encoding="utf-8"),
     "picnic.js": (STATIC / "picnic.js").read_text(encoding="utf-8"),
     "recipe_search.js": (STATIC / "recipe_search.js").read_text(encoding="utf-8"),
     "jumbo.js": (STATIC / "jumbo.js").read_text(encoding="utf-8"),
+    "recipe_bulk.js": (STATIC / "recipe_bulk.js").read_text(encoding="utf-8"),
+    "crisp.js": (STATIC / "crisp.js").read_text(encoding="utf-8"),
+    "product_links.js": (STATIC / "product_links.js").read_text(encoding="utf-8"),
     "mealkits.js": (STATIC / "mealkits.js").read_text(encoding="utf-8"),
+    "ah_planner.js": (STATIC / "ah_planner.js").read_text(encoding="utf-8"),
     "basket.js": (STATIC / "basket.js").read_text(encoding="utf-8"),
     "updates.js": (STATIC / "updates.js").read_text(encoding="utf-8"),
     "system.js": (STATIC / "system.js").read_text(encoding="utf-8"),
+    "upload.js": (STATIC / "upload.js").read_text(encoding="utf-8"),
     "backup.js": (STATIC / "backup.js").read_text(encoding="utf-8"),
+    "price_archive.js": (STATIC / "price_archive.js").read_text(encoding="utf-8"),
     "audit.js": (STATIC / "audit.js").read_text(encoding="utf-8"),
     "offers.js": (STATIC / "offers.js").read_text(encoding="utf-8"),
+    "offers_cart.js": (STATIC / "offers_cart.js").read_text(encoding="utf-8"),
+    "facets.js": (STATIC / "facets.js").read_text(encoding="utf-8"),
+    "offers_facets.js": (STATIC / "offers_facets.js").read_text(encoding="utf-8"),
     "ai_review.js": (STATIC / "ai_review.js").read_text(encoding="utf-8"),
     "offers_history.js": (STATIC / "offers_history.js").read_text(encoding="utf-8"),
+    "watched.js": (STATIC / "watched.js").read_text(encoding="utf-8"),
     "profile.js": (STATIC / "profile.js").read_text(encoding="utf-8"),
+    "theme.js": (STATIC / "theme.js").read_text(encoding="utf-8"),
+    "appearance.js": (STATIC / "appearance.js").read_text(encoding="utf-8"),
+    "shopping.js": (STATIC / "shopping.js").read_text(encoding="utf-8"),
+    "loose_names.js": (STATIC / "loose_names.js").read_text(encoding="utf-8"),
+    "shared_links_export.js": (STATIC / "shared_links_export.js").read_text(encoding="utf-8"),
 }
 JS = "\n".join(SOURCES.values())
 ENTRY = re.compile(r'^  "([^"]+)": "((?:[^"\\]|\\.)*)",$', re.M)
@@ -54,7 +80,7 @@ def norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-class DictionaryTest(unittest.TestCase):
+class DictionaryTest(AppTestCase):
     def test_every_line_of_both_files_is_read(self):
         for lang in ("nl", "en"):
             source = (STATIC / "i18n" / f"{lang}.js").read_text(encoding="utf-8")
@@ -95,7 +121,7 @@ class DictionaryTest(unittest.TestCase):
             self.assertNotRegex(text, r"<script|javascript:|on\w+=", key)
 
 
-class UsageTest(unittest.TestCase):
+class UsageTest(AppTestCase):
     CALL = re.compile(r'\b(?:t|th|tn|thn)\(\s*["`]([\w.]+)["`]')
 
     def test_every_key_used_in_the_scripts_exists(self):
@@ -140,7 +166,19 @@ class UsageTest(unittest.TestCase):
         html_keys = set(re.findall(r'data-i18n(?:-html)?="([\w.]+)"', HTML))
         for spec in re.findall(r'data-i18n-attr="([^"]+)"', HTML):
             html_keys |= {pair.split(":")[1] for pair in spec.split(";")}
-        prefixes = {"ob.step.", "ob.title.", "meal.", "about.group.", "about.desc.", "offers.source.", "offers.cat.", "offers.course.", "backup.count.", "backup.link."}
+        prefixes = {
+            "ob.step.",
+            "ob.title.",
+            "meal.",
+            "about.group.",
+            "about.desc.",
+            "offers.source.",
+            "offers.cat.",
+            "offers.course.",
+            "offers.regular.source.",
+            "backup.link.",
+            "backup.part.",
+        }
         for key in NL:
             base = re.sub(r"\.(one|other)$", "", key)
             used = (
@@ -152,7 +190,9 @@ class UsageTest(unittest.TestCase):
 
     def test_no_dutch_literals_are_left_in_the_scripts(self):
         # Zichtbare tekst hoort in het woordenboek; zo'n zin in de code is een vergeten vertaling.
-        pattern = re.compile(r'(?:message\([^,]+,\s*|textContent\s*=\s*|<p[^>]*>|<h3[^>]*>|<button[^>]*>|<span[^>]*>)\s*["`]?([A-Z][a-z]+ [a-z]+ [a-z]+)')
+        pattern = re.compile(
+            r'(?:message\([^,]+,\s*|textContent\s*=\s*|<p[^>]*>|<h3[^>]*>|<button[^>]*>|<span[^>]*>)\s*["`]?([A-Z][a-z]+ [a-z]+ [a-z]+)'
+        )
         offenders = []
         for name, source in SOURCES.items():
             for line_number, line in enumerate(source.splitlines(), 1):
@@ -163,31 +203,51 @@ class UsageTest(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
-class PageTest(unittest.TestCase):
+class PageTest(AppTestCase):
+    def test_loose_names_texts_exist_in_both_languages_with_the_same_placeholders(self):
+        keys = [key for key in NL if key.startswith("loose.") or key.startswith("aireview.loose_")]
+        self.assertGreater(len(keys), 30)
+        for key in keys:
+            self.assertIn(key, EN, key)
+            self.assertEqual(placeholders(NL[key]), placeholders(EN[key]), key)
+        self.assertIn("'s nachts", NL["aireview.loose_nightly"])
+
     def test_scripts_load_in_the_right_order(self):
         order = [HTML.index(name) for name in ("i18n.js", "i18n/nl.js", "i18n/en.js", "app.js", "onboarding.js")]
         self.assertEqual(order, sorted(order))
 
-    def test_language_switch_in_header_login_invitation_and_onboarding(self):
-        self.assertEqual(HTML.count('class="lang-switch"'), 4)
-        self.assertEqual(HTML.count('data-lang="nl"'), 4)
-        self.assertEqual(HTML.count('data-lang="en"'), 4)
-        self.assertIn('id="flag-nl"', HTML)
-        self.assertIn('id="flag-gb"', HTML)
+    def test_language_switch_on_login_invitation_and_onboarding_not_in_the_header(self):
+        # Sinds 4.7.0 staan taal en thema in de app in het menu onder je naam en bij Voorkeuren, niet meer in de kop. De taalkiezer
+        # is tekst (NL, EN), geen vlag: een vlag staat voor een land, niet voor een taal.
+        self.assertEqual(HTML.count('class="lang-switch"'), 3)
+        self.assertEqual(HTML.count('data-lang="nl"'), 3)
+        self.assertEqual(HTML.count('data-lang="en"'), 3)
+        for gate in ('id="auth-gate"', 'id="invite-gate"', 'id="onboarding"'):
+            start = HTML.index(gate)
+            self.assertLess(HTML.index('class="lang-switch"', start), HTML.index("</section>", start), gate)
+        header = HTML[HTML.index('<header class="topbar">') : HTML.index("</header>")]
+        self.assertNotIn("lang-switch", header)
+        self.assertNotIn("data-theme-toggle", header)
+        self.assertNotIn("brand.tagline", header, "de slogan staat alleen nog op de inlogkaart")
+        self.assertNotIn('id="flag-nl"', HTML)
+        self.assertNotIn('id="flag-gb"', HTML)
+        self.assertEqual(re.findall(r'<span class="lang-switch__code" aria-hidden="true">(\w+)</span>', HTML), ["NL", "EN"] * 3)
         for button in re.findall(r"<button[^>]*data-lang=[^>]*>", HTML):
             self.assertIn("aria-label=", button)
             self.assertIn("aria-pressed=", button)
             self.assertIn("lang=", button)
 
     def test_theme_toggle_sits_next_to_every_language_switch(self):
-        self.assertEqual(HTML.count('class="switches"'), 4)
-        self.assertEqual(HTML.count("data-theme-toggle"), 4)
+        self.assertEqual(HTML.count('class="switches"'), 3)
+        self.assertEqual(HTML.count("data-theme-toggle"), 3)
         for button in re.findall(r"<button[^>]*data-theme-toggle[^>]*>", HTML):
             self.assertIn("aria-label=", button)
             self.assertIn("aria-pressed=", button)
             self.assertIn("theme.dark", button)
-        self.assertEqual(sorted({k for k in NL if k.startswith("theme.")}), ["theme.dark"])
+        # theme.light is het label van het menu-item als donker aan staat.
+        self.assertEqual(sorted({k for k in NL if k.startswith("theme.")}), ["theme.dark", "theme.light"])
         self.assertIn("theme.dark", EN)
+        self.assertIn("theme.light", EN)
 
     def test_theme_is_set_in_the_head_before_the_styles_and_the_script_loads_after_the_dictionaries(self):
         self.assertLess(HTML.index('setAttribute("data-theme"'), HTML.index("styles.css"))
@@ -202,37 +262,43 @@ class PageTest(unittest.TestCase):
         light = re.search(r":root\s*{(.*?)\n}", css, re.S).group(1)
         dark = re.search(r':root\[data-theme="dark"\]\s*{(.*?)\n}', css, re.S).group(1)
         names = lambda block: set(re.findall(r"(--[\w-]+):", block))
-        unchanged = {"--lemon", "--radius-card", "--radius-control", "--control-height", "--font-body", "--font-heading", "--ease"}
+        unchanged = {"--lemon", "--control-height", "--font-body", "--font-heading", "--ease"}
+        unchanged |= {name for name in names(light) if name.startswith(("--radius-", "--text-", "--scroll-"))}  # maten, geen kleuren
         self.assertEqual(sorted(names(light) - names(dark) - unchanged), [])
 
     def test_engine_keeps_the_language_and_tells_the_server(self):
         engine = (STATIC / "i18n.js").read_text(encoding="utf-8")
-        for needle in ('"ms-lang"', 'ms_lang', "SameSite=Lax", "document.documentElement.lang", "ms:languagechange",
-                       "navigator.languages", "try {"):
+        for needle in ('"ms-lang"', "ms_lang", "SameSite=Lax", "document.documentElement.lang", "ms:languagechange", "navigator.languages", "try {"):
             self.assertIn(needle, engine, needle)
 
     def test_app_redraws_data_driven_parts_on_a_language_change(self):
-        handler = SOURCES["app.js"][SOURCES["app.js"].index('addEventListener("ms:languagechange"'):]
-        for call in ("updateWeekLabel()", "renderMealPlan(", "renderAhLists()", "renderSavedRecipes()",
-                     "renderAuthState()", "refreshSavedRecipesStatus()"):
+        handler = SOURCES["app.js"][SOURCES["app.js"].index('addEventListener("ms:languagechange"') :]
+        for call in (
+            "updateWeekLabel()",
+            "renderMealPlan(",
+            "renderAhLists()",
+            "renderSavedRecipes()",
+            "renderAuthState()",
+            "refreshSavedRecipesStatus()",
+        ):
             self.assertIn(call, handler, call)
         # Recepten zoeken tekent zijn eigen resultaten opnieuw.
         search = SOURCES["recipe_search.js"]
-        self.assertIn("SEARCH_STORES.forEach(renderSearchStore)", search[search.index('addEventListener("ms:languagechange"'):])
+        self.assertIn("SEARCH_STORES.forEach(renderSearchStore)", search[search.index('addEventListener("ms:languagechange"') :])
 
     def test_the_language_handler_only_calls_functions_that_exist(self):
         # Een aanroep van een functie die niet (meer) bestaat, breekt de rest van de handler af: zo bleven na een taalwissel
         # de inlogstatus, de lijstjes en de bewaarde recepten in de oude taal staan (renderSearchResults, weg sinds 2.8.0).
         source = SOURCES["app.js"]
         start = source.index('window.addEventListener("ms:languagechange", () => {')
-        handler = source[start:source.index("\n});", start)]
+        handler = source[start : source.index("\n});", start)]
         defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", JS, re.M))
         called = set(re.findall(r"^\s*(?:if \(.*?\) )?(\w+)\(", handler, re.M)) - {"if", "window"}
         self.assertTrue(called)
         self.assertEqual(sorted(called - defined), [])
 
     def test_changing_language_mid_mfa_setup_does_not_restart_it(self):
-        handler = SOURCES["onboarding.js"][SOURCES["onboarding.js"].index('addEventListener("ms:languagechange"'):]
+        handler = SOURCES["onboarding.js"][SOURCES["onboarding.js"].index('addEventListener("ms:languagechange"') :]
         self.assertIn("if (ob.mfaBusy)", handler)
         self.assertLess(handler.index("if (ob.mfaBusy)"), handler.index("renderOnboarding()"))
 
@@ -241,7 +307,7 @@ class PageTest(unittest.TestCase):
         self.assertIn("I18N.locale()", JS)
 
 
-class ServerLanguageTest(unittest.TestCase):
+class ServerLanguageTest(AppTestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -257,54 +323,56 @@ class ServerLanguageTest(unittest.TestCase):
         self.app = create_app()
 
     def client(self, lang=None):
-        client = self.app.test_client()
+        client = self.client_for(self.app)
         if lang:
             client.set_cookie("ms_lang", lang)
         return client
 
     def test_default_and_unknown_languages_are_dutch(self):
         self.assertEqual(i18n.tr("nl", "en"), "nl", "zonder verzoek")
-        with self.app.test_request_context("/"):
-            self.assertEqual(i18n.current_lang(), "nl")
-        with self.app.test_request_context("/", headers={"Cookie": "ms_lang=fr"}):
-            self.assertEqual(i18n.current_lang(), "nl")
-        with self.app.test_request_context("/", headers={"Cookie": "ms_lang=en"}):
-            self.assertEqual(i18n.current_lang(), "en")
 
-    def test_login_errors_follow_the_cookie(self):
-        self.client().post("/api/auth/password", json={"username": "admin", "password": "koffie-met-melk-42"})
+        async def lang(**kwargs):
+            async with self.app.test_request_context("/", **kwargs):
+                return i18n.current_lang()
+
+        self.assertEqual(run(lang()), "nl")
+        self.assertEqual(run(lang(headers={"Cookie": "ms_lang=fr"})), "nl")
+        self.assertEqual(run(lang(headers={"Cookie": "ms_lang=en"})), "en")
+
+    async def test_login_errors_follow_the_cookie(self):
+        await self.client().post("/api/auth/password", json={"username": "admin", "password": "koffie-met-melk-42"})
         wrong = {"username": "admin", "password": "verkeerd-wachtwoord"}
-        dutch = self.client("nl").post("/api/auth/password/login", json=wrong).get_json()["error"]
-        english = self.client("en").post("/api/auth/password/login", json=wrong).get_json()["error"]
+        dutch = (await self.client("nl").post("/api/auth/password/login", json=wrong)).get_json()["error"]
+        english = (await self.client("en").post("/api/auth/password/login", json=wrong)).get_json()["error"]
         self.assertEqual(dutch, "Gebruikersnaam of wachtwoord klopt niet.")
         self.assertEqual(english, "Username or password is incorrect.")
 
-    def test_password_rules_and_lockout_in_english(self):
-        weak = self.client("en").post("/api/auth/password", json={"username": "admin", "password": "short"}).get_json()["error"]
+    async def test_password_rules_and_lockout_in_english(self):
+        weak = (await self.client("en").post("/api/auth/password", json={"username": "admin", "password": "short"})).get_json()["error"]
         self.assertEqual(weak, "Choose a password of at least 10 characters.")
-        self.client().post("/api/auth/password", json={"username": "admin", "password": "koffie-met-melk-42"})
+        await self.client().post("/api/auth/password", json={"username": "admin", "password": "koffie-met-melk-42"})
         guest = self.client("en")
         for _ in range(auth_password.ATTEMPTS_PER_WINDOW):
-            guest.post("/api/auth/password/login", json={"username": "admin", "password": "nope-nope-nope"})
-        locked = guest.post("/api/auth/password/login", json={"username": "admin", "password": "nope-nope-nope"})
+            await guest.post("/api/auth/password/login", json={"username": "admin", "password": "nope-nope-nope"})
+        locked = await guest.post("/api/auth/password/login", json={"username": "admin", "password": "nope-nope-nope"})
         self.assertEqual(locked.status_code, 429)
         self.assertRegex(locked.get_json()["error"], r"^Too many failed attempts\. Try again in \d+ minutes?\.$")
 
-    def test_onboarding_explains_the_missing_passkey_in_the_chosen_language(self):
+    async def test_onboarding_explains_the_missing_passkey_in_the_chosen_language(self):
         url = "/api/onboarding/status"
 
-        def fetch(lang):
-            client = self.app.test_client()
+        async def fetch(lang):
+            client = self.client_for(self.app)
             client.set_cookie("ms_lang", lang, domain="192.168.1.20")
-            return client.get(url, base_url="http://192.168.1.20:8080").get_json()
+            return (await client.get(url, base_url="http://192.168.1.20:8080")).get_json()
 
-        english, dutch = fetch("en"), fetch("nl")
+        english, dutch = await fetch("en"), await fetch("nl")
         self.assertIn("an IP address", english["passkeyUnavailableReason"])
         self.assertIn("A passkey needs a real domain name", english["passkeyUnavailableReason"])
         self.assertIn("een IP-adres", dutch["passkeyUnavailableReason"])
 
-    def test_open_mode_messages(self):
-        res = self.client("en").post("/api/auth/open", json={})
+    async def test_open_mode_messages(self):
+        res = await self.client("en").post("/api/auth/open", json={})
         self.assertEqual(res.get_json()["error"], "Confirm that you want to continue without security.")
 
 

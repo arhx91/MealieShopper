@@ -1,0 +1,361 @@
+// Adressen per scherm: /recipes, /offers/history, /stores/ah/orders/123, /cart, ... Het scherm dat open staat bepaalt het adres
+// (routerSync) en een adres opent het scherm (routerApply): bij het laden van de pagina, bij terug en vooruit, en bij een link.
+// De server geeft op al deze adressen dezelfde pagina terug (auth.PAGE_ROOTS), dus herladen en een bladwijzer werken.
+//
+// Navigatie zijn echte links (<a href>). Een gewone klik blijft in de app; met Ctrl, Cmd, Shift, Alt of de middelste knop doet de
+// browser wat hij met elke link doet: een nieuw tabblad of venster. Laadt na alle andere scripts en gebruikt hun functies.
+
+const ROUTE_PANELS = {
+  recipes: "recipes",
+  offers: "offers",
+  import: "url",
+  stores: "ah-items",
+  "meal-kits": "meal-kits",
+  cart: "basket",
+  profile: "profile",
+  settings: "settings",
+  about: "about",
+};
+const PANEL_ROOTS = Object.fromEntries(Object.entries(ROUTE_PANELS).map(([root, panel]) => [panel, root]));
+
+// Per scherm: het stuk na de wortel -> het subtab. Het eerste subtab heeft geen eigen stuk.
+const ROUTE_SUBTABS = {
+  recipes: { "": "planner", search: "search" },
+  offers: { "": "offers-items", recipes: "offers-suggestions", history: "offers-history", watched: "offers-watched" },
+  profile: { "": "profile-general", security: "profile-security", ai: "profile-ai" },
+  // Voorkeuren heette eerder Weergave: /settings/appearance opent hem nog (de eerste naam geeft het adres).
+  settings: { "": "settings-link", users: "settings-users", audit: "settings-audit", system: "settings-system", preferences: "settings-appearance", appearance: "settings-appearance" },
+};
+
+// Winkels: de onderdelen per winkel en hun subtab staan in STORE_SECTIONS (app.js), omdat de winkelkeuze ze ook gebruikt.
+
+const router = { started: false, applying: 0, pending: "" };
+
+function routerModified(event) {
+  return event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+}
+
+function routerActivePanel() {
+  return document.querySelector(".panel.is-active")?.id || "recipes";
+}
+
+function routerActiveSubtab(panel) {
+  return document.querySelector(`#${panel} .subtab.is-active[data-subtab], #${panel} .subtab-menu__item.is-active[data-subtab]`)?.dataset.subtab || "";
+}
+
+function routerSlug(table, subtab) {
+  return Object.entries(table || {}).find(([, id]) => id === subtab)?.[0] || "";
+}
+
+function routerCurrentPath() {
+  const panel = routerActivePanel();
+  const root = PANEL_ROOTS[panel] || "recipes";
+  if (panel === "ah-items") {
+    const store = state.itemsStore || "ah";
+    const section = routerSlug(STORE_SECTIONS[store], routerActiveSubtab(panel));
+    if (section === "lists" && state.ahOpenListId) return storesPath(store, "lists", state.ahOpenListId);
+    const open = typeof ordersState !== "undefined" ? ordersState.open : null;
+    if (section === "orders" && open) return storesPath(store, { receipt: "receipts", imported: "imported" }[open.kind] || "orders", open.id);
+    return storesPath(store, section);
+  }
+  const sub = routerSlug(ROUTE_SUBTABS[root], routerActiveSubtab(panel));
+  if (panel === "offers") {
+    const store = offersState.store ? offersStoreParam(offersState.store) : "";
+    if (sub !== "history") return offersPath(sub, { store, week: weekParam() });
+    const product = (offerHistory.selected || "").split(":").slice(1).join(":");
+    return offersPath(sub, { store, q: offerHistory.query || "", product: offerHistory.pinned ? product : "" });
+  }
+  // Het weekmenu draagt de week in het adres, zolang het niet de huidige is (weekParam in app.js).
+  return `/${root}${sub ? `/${sub}` : ""}${root === "recipes" && !sub ? routerQuery({ week: weekParam() }) : ""}`;
+}
+
+// ---- adres bijwerken na een wissel van scherm
+
+function routerSync({ replace = false } = {}) {
+  if (!router.started || router.applying) return;
+  const path = routerCurrentPath();
+  const now = window.location.pathname + window.location.search;
+  if (path !== now && !(now === "/" && path === "/recipes")) {
+    if (!replace) routerRememberScroll();
+    history[replace ? "replaceState" : "pushState"]({ ms: true }, "", path);
+  }
+  routerRefreshLinks();
+}
+
+// Terug naar je plek (sinds 4.13.0). Voor je een scherm verlaat, bewaart de router waar je stond in de stap van de geschiedenis
+// (history.state.scroll); bij Terug of Vooruit zet hij die plek terug. Een lijst laadt soms nog: dan is de pagina eerst te kort,
+// dus proberen we het een paar keer, tot de pagina lang genoeg is of je zelf scrolt.
+function routerRememberScroll() {
+  history.replaceState({ ...(history.state || {}), ms: true, scroll: Math.round(window.scrollY) }, "");
+}
+
+const ROUTER_SCROLL_TRIES = [0, 120, 400, 900, 1600];
+let routerScrollTimers = [];
+
+function routerRestoreScroll(top) {
+  routerScrollTimers.forEach(clearTimeout);
+  routerScrollTimers = [];
+  if (!(top > 0)) return;
+  const stop = () => {
+    routerScrollTimers.forEach(clearTimeout);
+    routerScrollTimers = [];
+    window.removeEventListener("wheel", stop);
+    window.removeEventListener("touchstart", stop);
+  };
+  window.addEventListener("wheel", stop, { passive: true, once: true });
+  window.addEventListener("touchstart", stop, { passive: true, once: true });
+  routerScrollTimers = ROUTER_SCROLL_TRIES.map((wait) =>
+    setTimeout(() => {
+      window.scrollTo({ top });
+      if (Math.abs(window.scrollY - top) < 2) stop(); // de pagina is lang genoeg: klaar
+    }, wait)
+  );
+}
+
+// De week uit het adres (?week=2026-11-16) in het weekmenu en bij Aanbiedingen; zonder parameter is het deze week.
+function routerApplyWeek(params) {
+  const offset = weekOffsetOf(params.get("week") || "");
+  if (offset !== (state.weekOffset || 0)) setPlanWeek(offset);
+}
+
+// De titel van het tabblad volgt het scherm (sinds 4.10.4): "Weekmenu \u00b7 Recepten \u00b7 MealieShopper". Daarvoor heette elk
+// scherm MealieShopper, in de tabbladen, in de geschiedenis van de browser en voor een schermlezer. Eerst het open subtabblad,
+// dan het onderdeel: de actieve tab van het hoofdmenu, of de kop van een scherm uit het menu Meer (Instellingen, Profiel, Over).
+function routerTitle() {
+  const text = (node) => String(node?.textContent || "").trim();
+  const panel = document.querySelector(".panel.is-active");
+  const sub = text(panel?.querySelector?.(".subtabs .subtab.is-active:not(.subtab-menu__toggle)"));
+  const section = text(document.querySelector(".tabs .tab.is-active[data-tab] .tab-text")) || text(panel?.querySelector?.("h2"));
+  const parts = [sub, section].filter((part, at, all) => part && all.indexOf(part) === at);
+  if (parts.some((part) => part.includes("MealieShopper"))) return parts.find((part) => part.includes("MealieShopper")); // Over MealieShopper
+  return [...parts, "MealieShopper"].join(" \u00b7 ");
+}
+
+// De links in de subtabbalken hangen af van de gekozen winkel; dit houdt ze gelijk met wat een klik zou openen.
+function routerRefreshLinks() {
+  document.title = routerTitle();
+  const itemsStore = state.itemsStore || "ah";
+  document.querySelectorAll("#ah-items .subtab[data-subtab]").forEach((link) => {
+    const section = routerSlug(STORE_SECTIONS[itemsStore], link.dataset.subtab);
+    if (section) link.setAttribute("href", storesPath(itemsStore, section));
+  });
+  document.querySelectorAll("#items-store-list [data-store]").forEach((link) => link.setAttribute("href", itemsStorePath(link.dataset.store)));
+  const offersStore = typeof offersState !== "undefined" ? offersState.store : "";
+  document.querySelectorAll("#offers .subtab[data-subtab]").forEach((link) => {
+    const sub = routerSlug(ROUTE_SUBTABS.offers, link.dataset.subtab);
+    // Een winkel zonder koppeling is alleen in de prijsgeschiedenis te kiezen: de andere subtabs openen dan de
+    // voorkeurssupermarkt, in plaats van een adres dat op een koppeling blijft wachten.
+    const store = sub === "history" || linkedStoreKeys().includes(offersStore) ? offersStoreParam(offersStore) : "";
+    link.setAttribute("href", offersPath(sub, { store }));
+  });
+  document.querySelectorAll("#offers-store-list [data-store]").forEach((link) => {
+    const sub = routerSlug(ROUTE_SUBTABS.offers, routerActiveSubtab("offers"));
+    link.setAttribute("href", offersPath(sub, { store: offersStoreParam(link.dataset.store) }));
+  });
+}
+
+// ---- een adres openen
+
+function routerTab(panel) {
+  return document.querySelector(`.tab[data-tab="${panel}"]`);
+}
+
+function routerOpenSubtab(subtab) {
+  const link = document.querySelector(`[data-subtab="${subtab}"]`);
+  if (link && !link.hidden) link.click();
+}
+
+function routerIsOwner() {
+  const auth = state.auth || {};
+  return !auth.enabled || auth.isOwner !== false;
+}
+
+function routerApplyStores(parts) {
+  const [store, part = "", id = ""] = parts;
+  // Een winkel in het adres is een keuze; /stores zonder winkel opent de voorkeurssupermarkt (itemsFollowPreferred, bij het
+  // tonen van de pagina). Eerst dit, en dan de pagina tonen: anders laadt die eerst de voorkeurssupermarkt.
+  if (STORE_SECTIONS[store]) state.itemsStoreChosen = true;
+  else if (!store) state.itemsStoreChosen = false;
+  showPanel("ah-items", routerTab("ah-items"));
+  const section = part === "receipts" || part === "imported" ? "orders" : part;
+  if (store && STORE_SECTIONS[store] && store !== state.itemsStore) {
+    if (!itemsStores().includes(store)) {
+      router.pending = window.location.href; // de koppelingen zijn nog niet geladen: zie routerRetry
+      return;
+    }
+    // De wissel opent zelf het onderdeel uit het adres, of zonder onderdeel (/stores/jumbo) de eerste tab van de winkel.
+    switchItemsStore(store, section);
+  } else if (STORE_SECTIONS[state.itemsStore]?.[section]) {
+    routerOpenSubtab(STORE_SECTIONS[state.itemsStore][section]);
+  }
+  if (section === "lists") {
+    if (id) openAhList(id, { push: false });
+    else if (state.ahOpenListId) showAhListsOverview();
+  }
+  if (section === "orders" && typeof openPurchase === "function") {
+    if (id) openPurchase({ receipts: "receipt", imported: "imported" }[part] || "order", id);
+    else showPurchaseOverview();
+  }
+}
+
+// Zonder winkel in het adres opent Aanbiedingen met de voorkeurssupermarkt (of AH als die niet gekoppeld is); is nog niet
+// bekend of hij gekoppeld is, dan wacht het adres daarop. Met ?store=... is het een keuze, ook ?store=ah.
+// Het scherm gaat eerst open: in de prijsgeschiedenis zijn ook de winkels zonder koppeling te kiezen (offersStores), dus
+// ?store=crisp mag daar meteen.
+function routerApplyOffers(sub, params) {
+  const wanted = params.get("store") || "";
+  offersState.chosen = OFFERS_STORES.includes(wanted);
+  if (sub === "history") {
+    // Voor het openen van het subtab: dat laadt de lijst al, met het product uit het adres erin.
+    $("#offers-history-search").value = params.get("q") || "";
+    offerHistory.pin = params.get("product") || "";
+  }
+  if (sub !== "history") routerApplyWeek(params);
+  showPanel("offers", routerTab("offers"));
+  routerOpenSubtab(ROUTE_SUBTABS.offers[sub] || "offers-items");
+  if (offersState.chosen) {
+    if (wanted !== offersState.store) {
+      if (!offersStores().includes(wanted)) router.pending = window.location.href;
+      else offersSwitchStore(wanted);
+    }
+  } else {
+    if (!preferredSupermarketKnown()) router.pending = window.location.href;
+    else if (defaultStoreOf(offersStores()) !== offersState.store) offersSwitchStore(defaultStoreOf(offersStores()), { chosen: false });
+  }
+  if (sub === "history") {
+    const product = params.get("product");
+    offerHistory.pinned = Boolean(product);
+    if (product) offerHistory.selected = `${offersState.store}:${product}`;
+  }
+}
+
+function routerApply(href) {
+  const url = new URL(href, window.location.origin);
+  const parts = url.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+  const root = parts[0] || "recipes";
+  const panel = ROUTE_PANELS[root];
+  router.applying++;
+  router.pending = "";
+  try {
+    if (!panel) {
+      showPanel("recipes", routerTab("recipes"));
+      routerOpenSubtab("planner");
+    } else if (panel === "ah-items") {
+      routerApplyStores(parts.slice(1));
+    } else if (panel === "offers") {
+      routerApplyOffers(parts[1] || "", url.searchParams);
+    } else {
+      const highlighted = ["profile", "settings", "about"].includes(panel) ? null : routerTab(panel);
+      let subtab = ROUTE_SUBTABS[root]?.[parts[1] || ""];
+      // Instellingen zijn van de beheerder, op Voorkeuren na: een gewone gebruiker komt altijd daar uit.
+      if (panel === "settings" && !routerIsOwner()) {
+        subtab = "settings-appearance";
+        if (url.pathname !== "/settings/preferences") history.replaceState({ ms: true }, "", "/settings/preferences");
+      }
+      showPanel(panel, highlighted);
+      if (subtab) routerOpenSubtab(subtab);
+      if (root === "recipes" && !parts[1]) routerApplyWeek(url.searchParams);
+    }
+  } finally {
+    router.applying--;
+  }
+  routerRefreshLinks();
+}
+
+function routerNavigate(href) {
+  const url = new URL(href, window.location.origin);
+  if (typeof routerStale === "function" && routerStale()) {
+    window.location.assign(url.pathname + url.search); // nieuwe scripts: de hele pagina opnieuw
+    return;
+  }
+  if (url.pathname + url.search !== window.location.pathname + window.location.search) {
+    routerRememberScroll();
+    history.pushState({ ms: true }, "", url.pathname + url.search);
+  }
+  routerApply(url.href);
+}
+
+// Een winkel die in het adres staat maar waarvan de koppeling pas later binnenkomt: dan alsnog openen.
+function routerRetry() {
+  if (!router.pending || router.applying) return;
+  const pending = router.pending;
+  const url = new URL(pending);
+  if (url.href !== window.location.href) {
+    router.pending = "";
+    return;
+  }
+  routerApply(pending);
+}
+
+// Na het inloggen een keer: het scherm uit het adres openen.
+function routerStart() {
+  if (router.started) return;
+  router.started = true;
+  routerApply(window.location.href);
+}
+
+// Gewone klik op een navigatielink: in de app blijven. Met een toets erbij laat de browser hem in een nieuw tabblad openen;
+// dan mag de klik het scherm hier niet wisselen, dus stopt hij voordat de eigen handler van de link hem ziet.
+document.addEventListener(
+  "click",
+  (event) => {
+    const link = event.target.closest("a[data-nav], a[data-route]");
+    if (!link) return;
+    if (routerModified(event)) {
+      event.stopImmediatePropagation();
+      return;
+    }
+    event.preventDefault();
+    if (link.hasAttribute("data-route")) routerNavigate(link.href);
+  },
+  true
+);
+
+window.addEventListener("popstate", () => {
+  if (typeof routerStale === "function" && routerStale()) {
+    window.location.reload(); // het adres is al dat van de stap terug: de nieuwe scripts openen het
+    return;
+  }
+  if (!router.started) return;
+  routerApply(window.location.href);
+  // Terug of Vooruit: de focus op het scherm, en de plek waar je stond.
+  document.querySelector("#main")?.focus({ preventScroll: true });
+  routerRestoreScroll(Number(history.state?.scroll) || 0);
+});
+
+// ---- een tabblad van voor een nieuwe versie
+
+// Een tabblad dat open bleef staan, draait na een deploy nog de oude scripts: zijn links en het opvragen van gegevens gaan
+// dan zoals in de oude versie. Daarom vraagt het af en toe (bij terugkomen in het tabblad, en elke vijf minuten) aan /healthz
+// welke versie van de statische bestanden de server heeft. Is die anders, dan laadt de volgende klik of stap terug de hele
+// pagina opnieuw in plaats van alleen het scherm te wisselen.
+const ROUTER_ASSET_VERSION = document.querySelector('meta[name="ms-asset-version"]')?.content || "";
+const ROUTER_ASSET_INTERVAL = 5 * 60 * 1000;
+const routerAssets = { server: ROUTER_ASSET_VERSION, checked: 0 };
+
+async function routerCheckAssets() {
+  if (Date.now() - routerAssets.checked < 60 * 1000) return;
+  routerAssets.checked = Date.now();
+  try {
+    const response = await fetch("/healthz", { cache: "no-store", credentials: "same-origin" });
+    const data = response.ok ? await response.json() : {};
+    if (typeof data.assetVersion === "string" && data.assetVersion) routerAssets.server = data.assetVersion;
+  } catch {
+    // Geen verbinding: dan gewoon verder met wat er is.
+  }
+}
+
+function routerStale() {
+  return Boolean(ROUTER_ASSET_VERSION && routerAssets.server && routerAssets.server !== ROUTER_ASSET_VERSION);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") routerCheckAssets();
+});
+window.addEventListener("focus", routerCheckAssets);
+setInterval(routerCheckAssets, ROUTER_ASSET_INTERVAL);
+
+// Een andere taal: de titel van het tabblad volgt de vertaalde naam van het scherm.
+window.addEventListener("ms:languagechange", () => {
+  if (router.started) document.title = routerTitle();
+});

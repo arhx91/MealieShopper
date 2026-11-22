@@ -63,12 +63,12 @@ class AggregateIngredientsTest(unittest.TestCase):
         self.assertEqual([(r["quantity"], r["display"], r["note"]) for r in rows], [(800, "800 g spaghetti", "")])
 
     def test_a_single_line_keeps_its_own_text(self):
-        self.assertEqual(self.displays([meal(line(400, "spaghetti", GRAM, note="volkoren", display="400 g spaghetti, volkoren"))]),
-                         ["400 g spaghetti, volkoren"])
+        self.assertEqual(
+            self.displays([meal(line(400, "spaghetti", GRAM, note="volkoren", display="400 g spaghetti, volkoren"))]), ["400 g spaghetti, volkoren"]
+        )
 
     def test_another_unit_stays_a_separate_line(self):
-        self.assertEqual(self.displays([meal(line(1, "ui"), line(100, "ui", GRAM)), meal(line(2, "ui", pluralName="uien"))]),
-                         ["3 ui", "100 g ui"])
+        self.assertEqual(self.displays([meal(line(1, "ui"), line(100, "ui", GRAM)), meal(line(2, "ui", pluralName="uien"))]), ["3 ui", "100 g ui"])
         self.assertEqual(self.displays([meal(line(1, "ui", pluralName="uien")), meal(line(2, "ui", pluralName="uien"))]), ["3 uien"])
 
     def test_decimals_follow_the_language(self):
@@ -79,9 +79,18 @@ class AggregateIngredientsTest(unittest.TestCase):
 
     def test_lines_without_an_amount(self):
         # Zonder aantal één keer; komt het ingrediënt ook met een aantal voor, dan geldt dat.
-        self.assertEqual(self.displays([meal(line(None, "peper", display="peper")), meal(line(None, "peper", display="peper naar smaak"))]), ["peper"])
-        self.assertEqual(self.displays([meal(line(None, "peper", display="peper")), meal(line(1, "peper", {"name": "theelepel", "abbreviation": "tl", "useAbbreviation": True}))]),
-                         ["1 tl peper"])
+        self.assertEqual(
+            self.displays([meal(line(None, "peper", display="peper")), meal(line(None, "peper", display="peper naar smaak"))]), ["peper"]
+        )
+        self.assertEqual(
+            self.displays(
+                [
+                    meal(line(None, "peper", display="peper")),
+                    meal(line(1, "peper", {"name": "theelepel", "abbreviation": "tl", "useAbbreviation": True})),
+                ]
+            ),
+            ["1 tl peper"],
+        )
         self.assertEqual(self.displays([meal(line(2, "peper", GRAM)), meal(line(None, "peper", display="peper"))]), ["2 g peper"])
 
     def test_text_only_lines_are_deduplicated_as_before(self):
@@ -99,18 +108,11 @@ class WeekMenuTextTest(unittest.TestCase):
         self.assertIn('tn("plan.servings", servings.planned)', servings)
         self.assertIn('t("plan.scale"', servings)
 
-    def test_the_stepper_uses_the_planned_number_of_the_server(self):
-        # Eén regel voor afronden (die van mealie._servings): de kaart rondt zelf niet af. Min en plus gaan naar het
-        # hele getal onder en boven het getal (2,5 geeft 2 en 3; een heel getal n geeft n-1 en n+1).
-        stepper = function_source("mealPortionsHtml")
-        self.assertNotIn("Math.round", stepper)
-        self.assertIn("const count = Number(servings.planned) || 0;", stepper)
-        self.assertIn("clampPortions(Math.ceil(count) - 1)", stepper)
-        self.assertIn("clampPortions(Math.floor(count) + 1)", stepper)
-        self.assertIn('tn("plan.servings", count)', stepper, "tn toont het getal met de komma van de taal")
-
     def test_the_basket_uses_the_added_up_list(self):
-        self.assertIn("const ingredients = aggregateIngredients(state.entries);", function_source("addToCart"))
+        # Sinds 4.11.0 staat de boodschappenlijst in shopping.js: opgeteld over de dagen waarvoor je boodschappen doet.
+        shopping = (ROOT / "static" / "shopping.js").read_text(encoding="utf-8")
+        self.assertIn("items: shopItems(aggregateIngredients(chosen), shopping.pantry, shopping.picks)", shopping)
+        self.assertIn("const items = shopNow().items.filter((item) => item.checked);", shopping)
 
     def test_both_languages_have_the_texts(self):
         for source in (NL, EN):

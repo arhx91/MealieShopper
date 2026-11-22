@@ -9,28 +9,37 @@ EN = (ROOT / "static" / "i18n" / "en.js").read_text(encoding="utf-8")
 APP_JS = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 CSS = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
-PAGE = HTML[HTML.index('<div id="settings-link" class="subpanel'):HTML.index('<div id="settings-users" class="subpanel')]
-STORES = ("mealie", "ah", "jumbo", "picnic")
+PAGE = HTML[HTML.index('<div id="settings-link" class="subpanel') : HTML.index('<div id="settings-users" class="subpanel')]
+STORES = ("mealie", "ah", "jumbo", "picnic", "crisp")
+# De inklapbare blokken onder Koppelen, in volgorde, met het begin van hun id's (<prefix>-box, -toggle en -body). Sinds 4.13.0
+# eerst waar het om gaat (Mealie en de winkels), daarna de hulpmiddelen (aanbiedingen ophalen, AI).
+FOLDS = tuple((store, f"{store}-login") for store in STORES) + (("offers", "offers-sync"), ("ai", "ai-login"))
 
 
 def block(name):
-    start = PAGE.index(f'<div class="box fold" id="{name}-login-box">')
-    nxt = PAGE.find('<div class="box fold"', start + 10)
-    return PAGE[start:nxt if nxt != -1 else len(PAGE)]
+    start = PAGE.index(f'<div class="box fold fold--compact" id="{name}-login-box">')
+    nxt = PAGE.find('<div class="box fold', start + 10)
+    return PAGE[start : nxt if nxt != -1 else len(PAGE)]
 
 
 class LinkPageTest(unittest.TestCase):
     def test_koppelen_is_the_first_subtab_of_settings_and_the_dropdown_is_gone(self):
         nav = re.search(r'<nav class="subtabs" aria-label="Instellingen".*?</nav>', HTML, re.S).group(0)
-        self.assertIn('<button class="subtab is-active" data-subtab="settings-link" data-admin-only data-i18n="settings.tab.link">Koppelen</button>', nav)
-        self.assertEqual(re.findall(r'data-subtab="([\w-]+)"', nav), ["settings-link", "settings-users", "settings-audit", "settings-system"])
+        self.assertIn(
+            '<a class="subtab is-active" data-subtab="settings-link" data-admin-only data-i18n="settings.tab.link" href="/settings" data-nav>Koppelen</a>',
+            nav,
+        )
+        self.assertEqual(
+            re.findall(r'data-subtab="([\w-]+)"', nav),
+            ["settings-link", "settings-users", "settings-audit", "settings-system", "settings-appearance"],
+        )
         self.assertNotIn("subtab-menu", nav)
         for gone in ("beheer", "beheer-link-menu", "beheer-stores"):
             self.assertNotIn(f'id="{gone}', HTML, gone)
             self.assertNotIn(f'data-subtab="{gone}', HTML, gone)
 
     def test_statuses_come_first_two_next_to_each_other(self):
-        grid = PAGE[PAGE.index('<div class="link-statuses">'):PAGE.index('<div class="box fold"')]
+        grid = PAGE[PAGE.index('<div class="link-statuses">') : PAGE.index('<div class="box" id="linking-box"')]
         self.assertEqual(re.findall(r'id="(\w+)-status"', grid), list(STORES))
         rule = re.search(r"\.link-statuses\s*{(.*?)}", CSS, re.S).group(1)
         self.assertIn("repeat(2", rule)
@@ -45,10 +54,33 @@ class LinkPageTest(unittest.TestCase):
         for store in STORES:
             self.assertIn(f'id="{store}-login-toggle" aria-expanded="true" aria-controls="{store}-login-body"', block(store))
             self.assertIn(f'id="{store}-login-body"', block(store))
-        self.assertIn('for (const store of ["mealie", "ah", "picnic", "jumbo", "ai"])', APP_JS)
+        self.assertIn("for (const store of Object.keys(LINK_FOLDS))", APP_JS)
+
+    def test_every_block_has_the_compact_format_of_appearance(self):
+        boxes = re.findall(r'<div class="box fold fold--compact" id="([\w-]+)-box">', PAGE)
+        self.assertEqual(boxes, [prefix for _, prefix in FOLDS], "Aanbiedingen, AI-beoordeling, Mealie, dan de winkels")
+        self.assertNotIn('<div class="box fold" ', PAGE, "geen blok meer in het hoge formaat")
+        for name, prefix in FOLDS:
+            self.assertIn(f'  {name}: "{prefix}",', APP_JS, name)
+            toggle = re.search(rf'<button type="button" class="fold__toggle" id="{prefix}-toggle"[^>]*>', PAGE).group(0)
+            self.assertIn(f'aria-controls="{prefix}-body"', toggle, name)
+        heading = re.search(r"\.fold--compact \.fold__body h3\s*{(.*?)}", CSS, re.S).group(1)
+        self.assertIn("font-size: var(--text-base)", heading, "een tussenkop is kleiner dan de kop van het blok (18 px)")
+        self.assertIn("margin: 0 0 2px", heading)
+
+    def test_offers_fold_open_by_default(self):
+        box = PAGE[PAGE.index('id="offers-sync-box"') : PAGE.index('id="ai-login-box"')]
+        self.assertIn('id="offers-sync-toggle" aria-expanded="true" aria-controls="offers-sync-body"', box)
+        self.assertIn('<span data-i18n="offers.sync.title">Aanbiedingen</span>', box)
+        body = box[box.index('id="offers-sync-body"') :]
+        self.assertNotIn('id="offers-sync-body" hidden', box)
+        for needed in ('id="offers-sync-all"', 'id="offers-sync-message"', 'id="offers-sync-stores"', 'id="offers-sync-schedule"'):
+            self.assertIn(needed, body, f"{needed} hoort in het inklapbare deel")
+        script = (ROOT / "static" / "offers.js").read_text(encoding="utf-8")
+        self.assertIn('applyStoreFold("offers", false)', script)
 
     def test_unlink_sits_next_to_the_link_button_in_the_store_block(self):
-        for store, link in (("picnic", "picnic-login"), ("jumbo", "jumbo-link"), ("mealie", "mealie-link")):
+        for store, link in (("picnic", "picnic-login"), ("jumbo", "jumbo-link"), ("crisp", "crisp-login"), ("mealie", "mealie-link")):
             row = re.search(r'<div class="toolbar">\s*<button[^>]*id="%s".*?</div>' % link, block(store), re.S).group(0)
             self.assertIn(f'id="{store}-unlink"', row, store)
             self.assertIn("common.check_link", row, store)
@@ -56,10 +88,22 @@ class LinkPageTest(unittest.TestCase):
         self.assertIn('id="check-ah"', row)
 
     def test_blocks_are_titled_with_just_the_name(self):
-        for key, title in (("ahlogin.title", "Albert Heijn"), ("picnic.title", "Picnic"), ("jumbo.title", "Jumbo"), ("link.mealie", "Mealie")):
+        for key, title in (
+            ("ahlogin.title", "Albert Heijn"),
+            ("picnic.title", "Picnic"),
+            ("jumbo.title", "Jumbo"),
+            ("crisp.title", "Crisp"),
+            ("link.mealie", "Mealie"),
+        ):
             self.assertIn(f'"{key}": "{title}"', NL, key)
             self.assertIn(f'"{key}": "{title}"', EN, key)
-        for store, key, title in (("mealie", "link.mealie", "Mealie"), ("ah", "ahlogin.title", "Albert Heijn"), ("jumbo", "jumbo.title", "Jumbo"), ("picnic", "picnic.title", "Picnic")):
+        for store, key, title in (
+            ("mealie", "link.mealie", "Mealie"),
+            ("ah", "ahlogin.title", "Albert Heijn"),
+            ("jumbo", "jumbo.title", "Jumbo"),
+            ("picnic", "picnic.title", "Picnic"),
+            ("crisp", "crisp.title", "Crisp"),
+        ):
             self.assertIn(f'<span data-i18n="{key}">{title}</span>', block(store))
 
     def test_status_banners_have_icons_and_colours_for_small_screens(self):
@@ -69,11 +113,11 @@ class LinkPageTest(unittest.TestCase):
         self.assertIn('"link.status.linked": "linked"', EN)
         for needle in ("MDI_LINK", "MDI_LINK_OFF", "MDI_CHECK_CIRCLE", 'classes: "error"', "link-status--working"):
             self.assertIn(needle, APP_JS, needle)
-        for store, script in (("picnic", "picnic.js"), ("jumbo", "jumbo.js")):
+        for store, script in (("picnic", "picnic.js"), ("jumbo", "jumbo.js"), ("crisp", "crisp.js")):
             self.assertIn(f'renderLinkStatus("#{store}-status"', (ROOT / "static" / script).read_text(encoding="utf-8"))
         icon = re.search(r"\.link-status__icon\s*{(.*?)}", CSS, re.S).group(1)
         self.assertIn("display: none", icon, "op een groot scherm de tekst")
-        media = CSS[CSS.rindex("@media (max-width: 640px) {\n  .link-status__icon"):]
+        media = CSS[CSS.rindex("@media (max-width: 640px) {\n  .link-status__icon") :]
         self.assertIn("display: block", media)
         self.assertIn(".link-status__text {\n    position: absolute", media, "de tekst blijft voor schermlezers")
         grid = re.search(r"\.link-statuses\s*{(.*?)}", CSS, re.S).group(1)
@@ -81,32 +125,47 @@ class LinkPageTest(unittest.TestCase):
         self.assertNotRegex(CSS, r"@media \(max-width: 640px\) {\s*\.link-statuses", "ook op een klein scherm twee naast elkaar")
 
     def test_folds_close_when_linked(self):
-        self.assertIn("function applyStoreFold(store, linked)", APP_JS)
+        self.assertIn("function applyStoreFold(store, closed)", APP_JS)
         self.assertIn('applyStoreFold("ah", Boolean(data.connected))', APP_JS)
         self.assertIn('applyStoreFold("mealie", Boolean(data.configured))', APP_JS)
         self.assertIn('applyStoreFold("picnic", picnicState.connected)', (ROOT / "static" / "picnic.js").read_text(encoding="utf-8"))
         self.assertIn('applyStoreFold("jumbo", jumboState.connected)', (ROOT / "static" / "jumbo.js").read_text(encoding="utf-8"))
 
-    def test_the_ai_review_block_folds_like_the_others_and_closes_once_there_is_a_key(self):
-        box = PAGE[PAGE.index('id="ai-login-box"'):PAGE.index('id="mealie-login-box"')]
-        self.assertIn('<div class="box fold" id="ai-login-box">', PAGE)
-        self.assertIn('id="ai-login-toggle" aria-expanded="true" aria-controls="ai-login-body"', box)
-        body = box[box.index('id="ai-login-body"'):]
+    def test_the_ai_review_block_folds_like_the_others_and_is_closed_by_default(self):
+        box = PAGE[PAGE.index('id="ai-login-box"') :]  # het laatste blok onder Koppelen
+        self.assertIn('<div class="box fold fold--compact" id="ai-login-box">', PAGE)
+        self.assertIn('id="ai-login-toggle" aria-expanded="false" aria-controls="ai-login-body"', box)
+        self.assertIn('<div class="fold__body" id="ai-login-body" hidden>', box, "dicht tot je hem opent, ook zonder sleutel")
+        body = box[box.index('id="ai-login-body"') :]
         for needed in ('id="ai-review-form"', 'id="ai-key-anthropic"', 'id="ai-key-openai"', 'id="ai-save"'):
             self.assertIn(needed, body, f"{needed} hoort in het inklapbare deel")
         self.assertIn('<div id="ai-review-message"></div>', box)
-        self.assertGreater(box.index('id="ai-review-message"'), box.index("</form>\n          </div>"), "de melding staat buiten het inklapbare deel en blijft zichtbaar als het blok dicht is")
+        self.assertGreater(
+            box.index('id="ai-review-message"'),
+            box.index("</form>\n          </div>"),
+            "de melding staat buiten het inklapbare deel en blijft zichtbaar als het blok dicht is",
+        )
         self.assertEqual(PAGE.count('id="ai-review-box"'), 0)
         script = (ROOT / "static" / "ai_review.js").read_text(encoding="utf-8")
-        self.assertIn('applyStoreFold("ai", AI_REVIEW_PROVIDERS.some((provider) => status.providers[provider].configured))', script)
+        self.assertIn('applyStoreFold("ai", true)', script)
+        self.assertNotIn("status.providers[provider].configured));", script, "een sleutel opent of sluit het blok niet meer")
 
     def test_texts_point_to_the_new_place(self):
-        for path in ("mealieshopper/ah.py", "mealieshopper/jumbo.py", "mealieshopper/picnic.py", "mealieshopper/mealie.py", "static/i18n/nl.js", "README.md"):
+        for path in (
+            "mealieshopper/ah.py",
+            "mealieshopper/jumbo.py",
+            "mealieshopper/picnic.py",
+            "mealieshopper/mealie.py",
+            "static/i18n/nl.js",
+            "README.md",
+            "docs/handleiding.md",
+        ):
             text = (ROOT / path).read_text(encoding="utf-8")
             self.assertNotIn("Beheer >", text, path)
             self.assertNotIn("Beheer, Beveiliging", text, path)
         self.assertNotIn("Settings > Stores", EN)
         self.assertIn("Instellingen > Koppelen > Picnic", (ROOT / "mealieshopper" / "picnic.py").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
